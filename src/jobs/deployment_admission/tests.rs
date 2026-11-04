@@ -540,9 +540,71 @@ fn a_recovered_hold_can_never_yield_a_handoff_token() {
     drop(clock);
     let _clock = FrozenWallClock::at(100_000);
     recover(&store, &json!({"key":key,"force":true})).unwrap();
-    assert!(admitted.handoff().is_err());
+    let error = admitted.handoff().unwrap_err();
+    assert!(error.into_admitted().is_none());
     assert!(holds(&store).is_empty());
     no_deployment_or_job(&store);
+}
+
+#[test]
+fn busy_before_handoff_returns_unchanged_custody_for_compensation_or_retry() {
+    for retry in [false, true] {
+        let (_dir, store) = fixture();
+        let admitted = admit_fake(&store).unwrap();
+        let original_record = admitted.record.clone();
+        let key = admitted.key().to_owned();
+        // Deterministic lock contention, not a timing/retry/sleep test.
+        admitted.conn.busy_timeout(Duration::ZERO).unwrap();
+        let blocker = shared_ledger(&store).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let error = admitted.handoff().unwrap_err();
+        assert!(matches!(
+            error.cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
+        let admitted = error.into_admitted().expect("pre-write custody returned");
+        assert_eq!(admitted.record, original_record);
+        assert_eq!(admitted.reservation.state, "deployment-reserved");
+        assert_eq!(admitted.key(), key);
+        assert!(admitted.conn.is_autocommit());
+        blocker.execute_batch("ROLLBACK").unwrap();
+        let raw: String = blocker
+            .query_row(
+                "SELECT record FROM reservations WHERE key=?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, original_record);
+        if retry {
+            let handoff = admitted.handoff().unwrap();
+            assert_eq!(handoff.reservation.key, key);
+            assert_eq!(holds(&store)[0].state, "deployment-handoff");
+            drop(handoff);
+        } else {
+            admitted.release_unlaunched().unwrap();
+            assert!(holds(&store).is_empty());
+        }
+        no_deployment_or_job(&store);
+    }
+}
+
+#[test]
+fn dropping_custody_returned_by_begin_failure_does_not_release_capacity() {
+    let (_dir, store) = fixture();
+    let admitted = admit_fake(&store).unwrap();
+    let raw = admitted.record.clone();
+    admitted.conn.busy_timeout(Duration::ZERO).unwrap();
+    let blocker = shared_ledger(&store).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let error = admitted.handoff().unwrap_err();
+    assert!(error.admitted.is_some());
+    drop(error);
+    blocker.execute_batch("ROLLBACK").unwrap();
+    let reopened = Store::open(store.home()).unwrap();
+    assert_eq!(serde_json::to_string(&holds(&reopened)[0]).unwrap(), raw);
+    no_deployment_or_job(&reopened);
 }
 
 #[test]
@@ -555,11 +617,16 @@ fn handoff_compares_the_entire_hold_and_failed_writes_produce_no_token() {
         "timeout",
         "task",
         "update-failure",
+        "commit-failure",
     ] {
         let (_dir, store) = fixture();
         let admitted = admit_fake(&store).unwrap();
         let mut held = holds(&store).remove(0);
         let conn = shared_ledger(&store).unwrap();
+        admitted
+            .conn
+            .execute_batch("PRAGMA foreign_keys=ON")
+            .unwrap();
         match change {
             "state" => held.state = "deployment-handoff".into(),
             "payload" => held.payload = held.supervisor.clone(),
@@ -573,17 +640,27 @@ fn handoff_compares_the_entire_hold_and_failed_writes_produce_no_token() {
                 BEGIN SELECT RAISE(ABORT,'beta'); END",
                 )
                 .unwrap(),
+            "commit-failure" => conn
+                .execute_batch(
+                    "PRAGMA foreign_keys=ON;
+                     CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                     CREATE TABLE child(id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+                     CREATE TRIGGER fail_commit AFTER UPDATE ON reservations
+                     BEGIN INSERT INTO child(id) VALUES(1); END",
+                )
+                .unwrap(),
             _ => unreachable!(),
         }
         let raw = serde_json::to_string(&held).unwrap();
-        if change != "update-failure" {
+        if !matches!(change, "update-failure" | "commit-failure") {
             conn.execute(
                 "UPDATE reservations SET record=?2 WHERE key=?1",
                 params![held.key, raw],
             )
             .unwrap();
         }
-        assert!(admitted.handoff().is_err(), "{change}");
+        let error = admitted.handoff().unwrap_err();
+        assert!(error.into_admitted().is_none(), "{change}");
         let after: String = conn
             .query_row(
                 "SELECT record FROM reservations WHERE key=?1",
@@ -675,6 +752,61 @@ fn deployment_state_with_an_ordinary_id_fails_closed_in_deployment_recovery() {
             .unwrap();
         assert_eq!(after, raw);
         assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM resource_recovery_audit WHERE json_extract(record,'$.reservation.key')=?1)", [&held.key], |r| r.get::<_,bool>(0)).unwrap());
+        drop(admitted);
+        no_deployment_or_job(&store);
+    }
+}
+
+#[test]
+fn stale_deployment_handoffs_need_inspection_never_forceable_recovery() {
+    let _clock = FrozenWallClock::at(100_000);
+    for state in [
+        "deployment-handoff",
+        "deployment-unknown",
+        "deployment-reserved",
+        "starting",
+    ] {
+        let (_dir, store) = fixture();
+        let admitted = admit_fake(&store).unwrap();
+        let mut held = holds(&store).remove(0);
+        held.state = state.into();
+        held.created_ms = -100_000;
+        // An impossible start identity makes liveness independent of boot age.
+        held.supervisor.as_mut().unwrap().started = "gamma".into();
+        let raw = serde_json::to_string(&held).unwrap();
+        let conn = shared_ledger(&store).unwrap();
+        conn.execute(
+            "UPDATE reservations SET record=?2 WHERE key=?1",
+            params![held.key, raw],
+        )
+        .unwrap();
+        let stale = stale_reservations(&store).unwrap();
+        let item = stale.iter().find(|item| item["key"] == held.key).unwrap();
+        if state == "deployment-reserved" || state == "starting" {
+            let command = item["recover"].as_str().unwrap();
+            assert!(command.contains("resource.recover"));
+            assert!(command.contains("\"force\":true"));
+        } else {
+            assert!(item["recover"].is_null());
+            assert_eq!(item["outcome"], "unknown");
+            assert_eq!(item["inspection_required"], true);
+            assert_eq!(item["state"], state);
+            assert!(
+                item["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("capacity retained")
+            );
+            assert!(recover(&store, &json!({"key":held.key,"force":true})).is_err());
+        }
+        let after: String = conn
+            .query_row(
+                "SELECT record FROM reservations WHERE key=?1",
+                [&held.key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, raw, "observation must not change custody");
         drop(admitted);
         no_deployment_or_job(&store);
     }

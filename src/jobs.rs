@@ -968,6 +968,18 @@ pub(crate) fn stale_reservations(store: &Store) -> Result<Vec<Value>> {
         if supervisor || payload {
             continue;
         }
+        // Post-handoff custody can include an unrecorded/escaped adapter or
+        // unknown remote outcome. Pre-handoff recovery can never release it.
+        if r.state.starts_with("deployment-") && r.state != "deployment-reserved" {
+            stale.push(json!({
+                "key": r.key, "job_id": r.job_id, "home": r.home, "heavy": r.heavy,
+                "created_ms": r.created_ms, "payload_recorded": r.payload.is_some(),
+                "state": r.state, "outcome": "unknown", "recover": null,
+                "inspection_required": true,
+                "reason": "deployment handoff or payload custody; inspect local payload and remote outcome; capacity retained",
+            }));
+            continue;
+        }
         // Without a recorded payload no process can be proven absent, so
         // recovery needs force after the captain has checked by hand.
         let mut args = json!({"key": r.key});
