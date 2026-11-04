@@ -204,9 +204,10 @@ pub(super) fn enroll_home<G>(
     let home = Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     let _home_budget = transport::Budget::new(&home, deadline)?;
     let result = (|| -> Result<()> {
-        // Retired homes do not receive normal Store/mail startup. Apply the
-        // same additive mail columns and WAL prerequisite off-contact, without
-        // opening a Store (which could refresh registration or routing).
+        // Enrollment visits active and retired homes; retired homes may have
+        // missed normal Store/mail startup. Apply the same additive upgrades
+        // and WAL prerequisite off-contact without opening a Store (which
+        // could refresh registration or routing). Current schemas stay read-only.
         home.pragma_update(None, "journal_mode", "WAL")?;
         crate::mail::upgrade_columns(&home)?;
         source::init(&home)?;

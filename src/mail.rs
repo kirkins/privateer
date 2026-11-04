@@ -96,29 +96,39 @@ pub fn init(store: &Store) -> Result<()> {
     Ok(())
 }
 
-/// Additive mail upgrades shared with off-contact enrollment of retired homes.
+#[cfg(test)]
+mod upgrade_tests;
+
+const UPGRADE_COLUMNS: &[(&str, &str)] = &[
+    ("ended_by", "TEXT"),
+    ("ended_ms", "INTEGER"),
+    ("end_reason", "TEXT"),
+    ("delivery", "TEXT"),
+    ("delivery_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("delivery_error", "TEXT"),
+    ("refused_ms", "INTEGER"),
+    ("delivered_ms", "INTEGER"),
+    // A transport acknowledgement is not proof an old peer applied a closure.
+    ("remote_end_state", "TEXT"),
+    // The request a follow-up is raised because of; see ROUTINE_MAIL.
+    ("because_of", "TEXT"),
+    // How often a peer refused a wait notice; see `waits::refused`.
+    ("delivery_refusals", "INTEGER NOT NULL DEFAULT 0"),
+    // The linked machine that delivered the captain's mail here, so the
+    // answers to it go back there; see `answering_origin`.
+    ("origin_machine", "TEXT"),
+];
+
+/// Additive mail upgrades shared with off-contact enrollment of all homes.
 /// Unlike full startup, this does not register a home or refresh fleet routes.
 pub(crate) fn upgrade_columns(conn: &rusqlite::Connection) -> Result<()> {
+    // Enrollment also visits active homes: a current schema must not acquire
+    // (or wait for) their mail writer lock merely to run no-op DDL.
+    if upgrade_ready(conn)? {
+        return Ok(());
+    }
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    for (column, declaration) in [
-        ("ended_by", "TEXT"),
-        ("ended_ms", "INTEGER"),
-        ("end_reason", "TEXT"),
-        ("delivery", "TEXT"),
-        ("delivery_attempts", "INTEGER NOT NULL DEFAULT 0"),
-        ("delivery_error", "TEXT"),
-        ("refused_ms", "INTEGER"),
-        ("delivered_ms", "INTEGER"),
-        // A transport acknowledgement is not proof an old peer applied a closure.
-        ("remote_end_state", "TEXT"),
-        // The request a follow-up is raised because of; see ROUTINE_MAIL.
-        ("because_of", "TEXT"),
-        // How often a peer refused a wait notice; see `waits::refused`.
-        ("delivery_refusals", "INTEGER NOT NULL DEFAULT 0"),
-        // The linked machine that delivered the captain's mail here, so the
-        // answers to it go back there; see `answering_origin`.
-        ("origin_machine", "TEXT"),
-    ] {
+    for (column, declaration) in UPGRADE_COLUMNS {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mail') WHERE name=?1)",
             [column],
@@ -138,6 +148,32 @@ pub(crate) fn upgrade_columns(conn: &rusqlite::Connection) -> Result<()> {
     )?;
     tx.commit()?;
     Ok(())
+}
+
+fn upgrade_ready(conn: &rusqlite::Connection) -> Result<bool> {
+    for (column, _) in UPGRADE_COLUMNS {
+        if !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mail') WHERE name=?1)",
+            [column],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Ok(false);
+        }
+    }
+    for (kind, name) in [
+        ("index", "mail_pending"),
+        ("index", "mail_because_of"),
+        ("table", "mail_delivery_retry"),
+    ] {
+        if !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+            params![kind, name],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The one definition of a message that only informs, for every place that

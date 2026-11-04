@@ -371,8 +371,18 @@ pub(super) fn capture_ready_until(
         // Frozen history never gains later observations. Cleanup is useful
         // while receipts advance, but rescanning its pinned live prefix on
         // every quiet contact would just rewrite cursors forever. Remaining
-        // bounded baseline proofs are retained conservatively.
-        let unresolved: bool = registry.query_row("SELECT EXISTS(SELECT 1 FROM desk_home_receipt WHERE domain=?1 AND source=?2 AND json_extract(event,'$.provenance') IN ('Unresolved','Local'))", params![m.domain,source], |r| r.get(0))?;
+        // bounded baseline proofs are retained conservatively. Only this
+        // sidecar's unresolved receipts require another live-state check.
+        // The null-core lookup uses mail_source_import_local_seq instead of
+        // rescanning every pinned origin in an otherwise quiet baseline.
+        let unresolved: bool = baseline.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_source_import WHERE receipt IS NOT NULL
+             AND COALESCE(json_extract(event,'$.provenance.Origin.core'),
+                          json_extract(event,'$.provenance.Copy.core')) IS NULL
+             AND json_extract(event,'$.provenance') IN ('Unresolved','Local'))",
+            [],
+            |r| r.get(0),
+        )?;
         if imported > 0 || unresolved {
             reclaim_imports_from(
                 &baseline,

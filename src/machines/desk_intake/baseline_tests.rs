@@ -1,6 +1,8 @@
 use super::*;
 #[path = "baseline_legacy_tests.rs"]
 mod legacy_tests;
+#[path = "baseline_round2_tests.rs"]
+mod round2_tests;
 use crate::store::Store;
 use std::os::unix::fs::PermissionsExt;
 
