@@ -281,14 +281,32 @@ A first mate asks once, on a `request` or a `decision` to the captain, with
 `payload.approves` and its own open `task_id`:
 
 ```json
-{"action":"Submit build 55 to TestFlight","command_prefix":"make release","ttl_secs":86400}
+{"action":"Publish beta","command_prefix":"make release","ttl_secs":86400,"one_time":true}
 ```
 
 - `action` is one line of at most 300 characters: exactly what the ship will do.
 - `command_prefix` is optional, at most 120 characters: the plain words the
   command starts with (see the prefix rules below).
 - `ttl_secs` is optional: 1 second to 7 days, 24 h by default.
-- A ship holds at most 8 live approvals.
+- `one_time` is optional, boolean, and false by default. For one release,
+  submission or publish, set it to true and supply `command_prefix`. A hosted
+  runtime retires it, with a `permissions.approval_used` audit receipt, only
+  after observing a successful exact retry of a previously auto-mode-blocked
+  Bash call, after the grant, in a pane carrying that approval, matching the
+  frozen request, task and prefix. Pickup alone and an agent's report never
+  retire it. List/show expose `one_time`, `used_ms` and state `used`.
+  Unreadable, pruned or ambiguous evidence leaves it live; the captain can
+  revoke it. This uses the existing harness-transcript workflow boundary,
+  not OS isolation from processes that can write transcripts or the database.
+  Used approvals are not offered for reuse; expired one-time approvals need
+  a fresh ask. Removal from a running classifier waits for its usual safe
+  idle refresh, so this is not a synchronous tool-execution interlock.
+- A ship holds at most 8 live approvals. A yes at the cap records no grant
+  and sends the captain a notice naming the held IDs, short actions, expiries
+  and `privateer permissions approvals revoke ID`; revoke one or wait for
+  expiry, then ask again. The agent's send error lists the same holders.
+  Older TTL approvals are not inferred to be one-time, and standing
+  authorizations and ordinary TTL approvals retain their existing lifetime.
 - The send is refused when the action or prefix names another ship, mentions
   policy or settings words (`permission`, `.claude`, `charter`, `automode`),
   credentials (`.ssh`, `token`, `password`), reads as broad (`anything`,

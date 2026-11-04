@@ -179,7 +179,7 @@ pub(crate) fn alert(store: &Store, observed: &[(String, String, String)]) -> Res
 }
 
 /// `alert`, reading pane transcripts under Claude's `projects` folder.
-fn alert_in(
+pub(crate) fn alert_in(
     store: &Store,
     observed: &[(String, String, String)],
     projects: Option<&std::path::Path>,
@@ -190,6 +190,13 @@ fn alert_in(
         .parent()
         .map(|f| f.canonicalize().unwrap_or(f.into()));
     if let Some((projects, folder)) = projects.zip(folder.as_deref()) {
+        for (ship, _, _) in observed {
+            if let Err(error) =
+                crate::captain_approvals::observe_retries(store, ship, projects, folder)
+            {
+                eprintln!("privateer: one-time approval receipts were not read: {error:#}");
+            }
+        }
         match follow(store, projects, folder) {
             Ok(followed) => raised.extend(followed),
             Err(error) => eprintln!("privateer: watched pane blocks were not read: {error:#}"),

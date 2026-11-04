@@ -356,7 +356,7 @@ fn results<'a>(
 fn denials(records: &[Value], folder: &Path, since_ms: i64) -> Vec<Value> {
     let uses = uses(records);
     // Each successful call: its position, retry key, session and time.
-    let mut succeeded: Vec<(usize, String, Option<&str>, Option<i64>)> = vec![];
+    let mut succeeded = vec![];
     let mut found = vec![];
     for (index, record, block) in results(records, folder) {
         let at = record["timestamp"]
@@ -366,8 +366,13 @@ fn denials(records: &[Value], folder: &Path, since_ms: i64) -> Vec<Value> {
         let id = block["tool_use_id"].as_str().unwrap_or_default();
         let named = uses.get(id);
         if block["is_error"] != true {
-            if let Some(key) = named.and_then(|(name, input, _)| retry_key(name, input)) {
-                succeeded.push((index, key, session, at));
+            if let Some((name, input, position)) = named
+                && let Some(key) = retry_key(name, input)
+            {
+                let started = records[*position]["timestamp"]
+                    .as_str()
+                    .and_then(crate::routes::iso_timestamp_ms);
+                succeeded.push((index, key, session, at, started, id));
             }
             continue;
         }
@@ -401,13 +406,16 @@ fn denials(records: &[Value], folder: &Path, since_ms: i64) -> Vec<Value> {
                 &denial["tool_input"],
             );
             let session = denial["session"].as_str();
-            let retry = succeeded.iter().find(|(at, retried, in_session, _)| {
+            let retry = succeeded.iter().find(|(at, retried, in_session, _, _, _)| {
                 *at > index
                     && key.as_ref() == Some(retried)
                     && (in_session.is_none() || session.is_none() || *in_session == session)
             });
-            if let Some((_, _, _, ms)) = retry {
+            if let Some((_, _, session, ms, started, id)) = retry {
                 denial["passed_ms"] = json!(ms.unwrap_or_default());
+                denial["passed_started_ms"] = json!(started);
+                denial["passed_session"] = json!(session);
+                denial["passed_use_id"] = json!(id);
             }
             denial
         })

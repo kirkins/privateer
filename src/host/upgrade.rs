@@ -180,7 +180,7 @@ pub(crate) fn record_approvals(
     let authorized = crate::permissions::policy_authorizations(policy, ship);
     tx.execute(
         "UPDATE hosted_panes SET approvals_digest=?3, approvals_ids=?4, approvals_refresh_pid=?5,
-           authorizations_digest=?6, authorizations=?7
+           authorizations_digest=?6, authorizations=?7, approvals_loaded_ms=?8
          WHERE ship=?1 AND pid=?2",
         params![
             ship,
@@ -189,7 +189,8 @@ pub(crate) fn record_approvals(
             serde_json::to_string(&ids)?,
             refreshable.then_some(pid),
             crate::permissions::policy_digest(policy, ship),
-            serde_json::to_string(&authorized)?
+            serde_json::to_string(&authorized)?,
+            Store::now_ms()
         ],
     )?;
     tx.commit()?;

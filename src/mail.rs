@@ -1401,7 +1401,7 @@ pub(crate) fn send_door_approval(
     recheck: &dyn Fn() -> Result<(), crate::door::scoped::Denial>,
 ) -> Result<Value> {
     delegated_context_schema(store)?;
-    store.with_delegated_audit(context, || {
+    let result = store.with_delegated_audit(context, || {
         send_with_bound(
             store,
             reply,
@@ -1413,7 +1413,9 @@ pub(crate) fn send_door_approval(
                 link: None,
             }),
         )
-    })
+    });
+    approval_failure_notice(store, reply, context, approves, recheck, &result)?;
+    result
 }
 
 /// Only the linked approval gateway supplies this binding. No mail payload can
@@ -1428,7 +1430,7 @@ pub(crate) fn send_linked_door_approval(
     recheck: &dyn Fn() -> Result<(), crate::door::scoped::Denial>,
 ) -> Result<Value> {
     delegated_context_schema(store)?;
-    store.with_delegated_audit(context, || {
+    let result = store.with_delegated_audit(context, || {
         send_with_bound(
             store,
             reply,
@@ -1440,7 +1442,36 @@ pub(crate) fn send_linked_door_approval(
                 link: Some(link),
             }),
         )
-    })
+    });
+    approval_failure_notice(store, reply, context, approves, recheck, &result)?;
+    result
+}
+
+fn approval_failure_notice(
+    store: &Store,
+    reply: &Value,
+    context: &crate::door::scoped::DelegatedContext,
+    approves: bool,
+    recheck: &dyn Fn() -> Result<(), crate::door::scoped::Denial>,
+    result: &Result<Value>,
+) -> Result<()> {
+    if approves
+        && context.has("approval:answer")
+        && reply["to"]
+            .as_str()
+            .is_some_and(|ship| context.allows(ship))
+        && result
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<crate::door::scoped::Denial>())
+            == Some(&crate::door::scoped::Denial::ApprovalUnavailable)
+    {
+        recheck()?;
+        store.with_delegated_audit(context, || {
+            crate::captain_approvals::door_failure_notice(store, reply)
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

@@ -11,6 +11,9 @@
 //! Every ship runs as the same OS user, so this is a workflow control that
 //! keeps a confused agent from approving itself, not isolation: an agent that
 //! writes the database directly is not stopped here.
+mod once;
+pub(crate) use once::observe_retries;
+
 use crate::store::{Caller, Store, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -361,10 +364,11 @@ pub(crate) fn declare(
     );
     let fields = approves.as_object().context("approves must be an object")?;
     ensure!(
-        fields
-            .keys()
-            .all(|k| matches!(k.as_str(), "action" | "command_prefix" | "ttl_secs")),
-        "approves takes only action, command_prefix and ttl_secs"
+        fields.keys().all(|k| matches!(
+            k.as_str(),
+            "action" | "command_prefix" | "ttl_secs" | "one_time"
+        )),
+        "approves takes only action, command_prefix, ttl_secs and one_time"
     );
     let action = line(
         fields
@@ -383,6 +387,16 @@ pub(crate) fn declare(
         }
         None => None,
     };
+    let one_time = match fields.get("one_time") {
+        Some(value) => value
+            .as_bool()
+            .context("approves.one_time must be true or false")?,
+        None => false,
+    };
+    ensure!(
+        !one_time || prefix.is_some(),
+        "approves.one_time requires command_prefix"
+    );
     let ttl_secs = match fields.get("ttl_secs").filter(|v| !v.is_null()) {
         Some(value) => value
             .as_u64()
@@ -400,18 +414,20 @@ pub(crate) fn declare(
     store
         .active_charter(task)
         .with_context(|| format!("approves needs an open task; {task} is not"))?;
-    ensure!(
-        live(store, from, Store::now_ms())?.len() < MAX_LIVE,
-        "{from} already holds {MAX_LIVE} live captain approvals; finish or let one expire first"
-    );
-    let worst = sentence(
-        &"r".repeat(MINTED_REPLY_CHARS),
-        id,
-        from,
-        task,
-        LONGEST_UTC,
-        &action,
-        prefix.as_deref(),
+    if let Some(why) = capacity_notice(store, from, Store::now_ms())? {
+        bail!(why);
+    }
+    let worst = scope_sentence(
+        sentence(
+            &"r".repeat(MINTED_REPLY_CHARS),
+            id,
+            from,
+            task,
+            LONGEST_UTC,
+            &action,
+            prefix.as_deref(),
+        ),
+        one_time,
     );
     ensure!(
         worst.chars().count() <= MAX_SENTENCE_CHARS,
@@ -419,11 +435,18 @@ pub(crate) fn declare(
          {MAX_SENTENCE_CHARS} characters; shorten the action or the request id"
     );
     let mut normalized = json!({"action": action, "ttl_secs": ttl_secs});
+    if one_time {
+        normalized["one_time"] = json!(true);
+    }
     if let Some(prefix) = prefix {
         normalized["command_prefix"] = json!(prefix);
     }
     payload["approves"] = normalized;
-    let grants = format!("{from} do this for {}: {action}", hours(ttl_secs));
+    let grants = format!(
+        "{from} do this{} for {}: {action}",
+        if one_time { " once" } else { "" },
+        hours(ttl_secs)
+    );
     if kind == "decision" {
         let labels: Vec<&str> = payload["decision"]["options"]
             .as_array()
@@ -848,6 +871,60 @@ struct Grant<'a> {
     renews: Option<&'a str>,
 }
 
+/// Shared, bounded explanation for both the captain and an asking agent.
+fn capacity_notice(store: &Store, ship: &str, now: i64) -> Result<Option<String>> {
+    let rows = live(store, ship, now)?;
+    if rows.len() < MAX_LIVE {
+        return Ok(None);
+    }
+    let held = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{}: {} (expires {})",
+                row.id,
+                row.action.chars().take(90).collect::<String>(),
+                crate::routes::utc_time(row.expires_ms)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Ok(Some(format!(
+        "Nothing was approved. {ship} already holds {} live captain approvals; the cap is {MAX_LIVE}. \
+         Holding slots: {held}. Revoke one with privateer permissions approvals revoke ID, \
+         or wait for one to expire, then ask again.",
+        rows.len()
+    )))
+}
+
+/// A scoped answer rolls its native transaction back if capacity changed.
+/// Keep its captain-facing notice outside that rollback; grant/challenge
+/// state remains untouched. This never turns a failed answer into consent.
+pub(crate) fn door_failure_notice(store: &Store, reply: &Value) -> Result<()> {
+    let ship = reply["to"].as_str().unwrap_or_default();
+    let Some(why) = capacity_notice(store, ship, Store::now_ms())? else {
+        return Ok(());
+    };
+    let Some(request) =
+        crate::mail::find(store, reply["correlation"].as_str().unwrap_or_default())?
+    else {
+        return Ok(());
+    };
+    if request["from"] != ship || request["to"] != crate::mail::CAPTAIN {
+        return Ok(());
+    }
+    crate::mail::record_runtime(
+        store,
+        &json!({
+            "id":format!("approval-unavailable-{}", reply["id"].as_str().unwrap_or_default()),
+            "from":ship,"to":crate::mail::CAPTAIN,"kind":"notice","correlation":request["id"],
+            "task_id":request["task_id"],"body":why,"urgency":"normal",
+            "payload":{"type":"approval_unavailable","reply_id":reply["id"]}
+        }),
+    )?;
+    Ok(())
+}
+
 /// Native admission checks shared with door preparation. Call again in the
 /// answer's write transaction: capacity may change after preparation.
 pub(crate) fn admission(
@@ -856,10 +933,8 @@ pub(crate) fn admission(
     sentence: &str,
     now: i64,
 ) -> Result<Option<String>> {
-    if live(store, ship, now)?.len() >= MAX_LIVE {
-        return Ok(Some(format!(
-            "{ship} already holds {MAX_LIVE} live captain approvals, so nothing was approved"
-        )));
+    if let Some(why) = capacity_notice(store, ship, now)? {
+        return Ok(Some(why));
     }
     if sentence.chars().count() > MAX_SENTENCE_CHARS {
         return Ok(Some(
@@ -898,16 +973,36 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
     } else {
         sentence
     };
-    let told = render(
-        reply_id,
-        request_id,
-        ship,
-        task,
-        &crate::routes::utc_time(expires_ms),
-        action,
-        prefix,
+    let one_time = request["payload"]["approves"]["one_time"] == true
+        || renews
+            .map(|id| once::is_once(store.connection(), id))
+            .transpose()?
+            .unwrap_or(false);
+    let told = scope_sentence(
+        render(
+            reply_id,
+            request_id,
+            ship,
+            task,
+            &crate::routes::utc_time(expires_ms),
+            action,
+            prefix,
+        ),
+        one_time,
     );
     if let Some(why) = admission(store, ship, &told, now)? {
+        // The reply payload is for the asking ship. Also tell the captain in
+        // their mailbox, transactionally with the reply and its skipped audit.
+        crate::mail::record_runtime(
+            store,
+            &json!({
+                "id": format!("approval-unavailable-{reply_id}"),
+                "from": ship, "to": crate::mail::CAPTAIN, "kind": "notice",
+                "correlation": request["id"], "task_id": task,
+                "body": why, "urgency": "normal",
+                "payload": {"type": "approval_unavailable", "reply_id": reply_id}
+            }),
+        )?;
         return skip(&why);
     }
     // Where the ship's session picks the approval up, as the ship is now.
@@ -919,7 +1014,13 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
             id, ship, task, request_id, reply_id, action, prefix, now, expires_ms, source, applies
         ],
     )?;
-    let mut audit = json!({"id": id, "ship": ship, "task": task, "request": request["id"],
+    if one_time {
+        store.connection().execute(
+            "INSERT INTO captain_approval_once(approval_id) VALUES(?1)",
+            [&id],
+        )?;
+    }
+    let mut audit = json!({"one_time": one_time, "id": id, "ship": ship, "task": task, "request": request["id"],
         "reply": reply_id, "action": action, "expires_ms": expires_ms, "source": source,
         "applies": applies});
     if chat_door {
@@ -937,7 +1038,7 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
         audit["renews"] = json!(old);
     }
     store.audit("permissions.approval_recorded", &audit)?;
-    let mut result = json!({"recorded": true, "id": id, "action": action,
+    let mut result = json!({"recorded": true, "one_time": one_time, "id": id, "action": action,
         "expires_ms": expires_ms, "applies": applies, "note": note(applies, action)});
     if chat_door {
         result["sentence"] = json!(told);
@@ -1047,12 +1148,18 @@ fn record_block(
     if revoked.is_some() {
         return skip("the approval the ask offered was revoked, so nothing was approved");
     }
+    if once::used(store.connection(), id)? {
+        return skip("the one-time approval was already used, so nothing was approved; ask again");
+    }
     if !open_task(store, ship, &task) {
         return skip("the approval's task is no longer open, so nothing was approved");
     }
     // Live or lapsed, an approval given more than 24 h ago is asked again.
     if now - created_ms >= ONE_TAP_MS {
         return skip("the approval is older than 24 h, so nothing was approved; ask again");
+    }
+    if expires_ms <= now && once::is_once(store.connection(), id)? {
+        return skip("the one-time approval expired, so nothing was approved; ask again");
     }
     if expires_ms > now {
         // A legacy row may still be live but unsafe to tell auto mode. Never
@@ -1378,6 +1485,8 @@ pub(crate) struct Row {
     pub(crate) expires_ms: i64,
     revoked_ms: Option<i64>,
     pub(crate) source: String,
+    one_time: bool,
+    used_ms: Option<i64>,
 }
 
 /// Whether `ship` owns `task` and it is open under an active charter.
@@ -1438,11 +1547,14 @@ fn task_open(conn: &Connection, ship: &str, task: &str) -> bool {
 
 /// Where an approval stands at `now`. This is the one rule launches, list,
 /// show and the dashboard read: `revoked` once the captain revokes it,
+/// `used` after the runtime records a one-time receipt,
 /// `closed` once its task is done, cancelled or handed to another owner or
 /// its charter is inactive, `expired` past its expiry, and otherwise `live`.
 pub(crate) fn state(conn: &Connection, row: &Row, now: i64) -> &'static str {
     if row.revoked_ms.is_some() {
         "revoked"
+    } else if row.used_ms.is_some() {
+        "used"
     } else if !task_open(conn, &row.ship, &row.task) {
         "closed"
     } else if row.expires_ms <= now {
@@ -1460,9 +1572,20 @@ fn select(
     args: impl rusqlite::Params,
     order: &str,
 ) -> Result<Vec<Row>> {
+    // Read-only dashboards may open an older home without migrating it.
+    let once: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approval_once')",
+        [], |r| r.get(0),
+    )?;
+    let extra = if once {
+        "EXISTS(SELECT 1 FROM captain_approval_once WHERE approval_id=id),
+         (SELECT used_ms FROM captain_approval_once WHERE approval_id=id)"
+    } else {
+        "0,NULL"
+    };
     let mut statement = conn.prepare(&format!(
         "SELECT id,ship,task_id,request_id,reply_id,action,command_prefix,created_ms,expires_ms,
-           revoked_ms,source
+           revoked_ms,source,{extra}
          FROM captain_approvals WHERE {condition} ORDER BY {order}"
     ))?;
     let rows = statement
@@ -1479,6 +1602,8 @@ fn select(
                 expires_ms: r.get(8)?,
                 revoked_ms: r.get(9)?,
                 source: r.get(10)?,
+                one_time: r.get(11)?,
+                used_ms: r.get(12)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1520,8 +1645,9 @@ pub(crate) fn live_read(conn: &Connection, ship: &str, now: i64) -> Result<Vec<R
 }
 
 /// The approvals a block card may offer to use again in one tap: created in
-/// the last 24 h, not revoked, on a task the ship still owns and is open,
-/// newest first. An expired one is renewed by the tap.
+/// the last 24 h, not revoked or used, on a task the ship still owns and is
+/// open, newest first. Expired TTL approvals may be renewed by the tap;
+/// one-time approvals need a fresh ask after expiry.
 pub(crate) fn recent(store: &Store, ship: &str, now: i64) -> Result<Vec<Row>> {
     let conn = store.connection();
     Ok(select(
@@ -1531,8 +1657,18 @@ pub(crate) fn recent(store: &Store, ship: &str, now: i64) -> Result<Vec<Row>> {
         "created_ms DESC, id",
     )?
     .into_iter()
-    .filter(|row| matches!(state(conn, row, now), "live" | "expired"))
+    .filter(|row| {
+        state(conn, row, now) == "live" || (!row.one_time && state(conn, row, now) == "expired")
+    })
     .collect())
+}
+
+pub(crate) fn scope_sentence(text: String, one_time: bool) -> String {
+    if one_time {
+        format!("{text} One successful retry only.")
+    } else {
+        text
+    }
 }
 
 /// The one sentence the classifier reads for an approval. Never omit a command
@@ -1649,24 +1785,30 @@ fn told(store: &Store, ship: &str, now: i64, audit: bool) -> Result<Vec<(String,
                 // an unscoped grant: the exact stored text must be safe as-is.
                 if row.prefix.is_some()
                     && text
-                        != chat_sentence(
-                            &row.reply,
-                            &row.request,
-                            ship,
-                            &row.task,
-                            &crate::routes::utc_time(row.expires_ms),
-                            &row.action,
-                            row.prefix.as_deref(),
+                        != scope_sentence(
+                            chat_sentence(
+                                &row.reply,
+                                &row.request,
+                                ship,
+                                &row.task,
+                                &crate::routes::utc_time(row.expires_ms),
+                                &row.action,
+                                row.prefix.as_deref(),
+                            ),
+                            row.one_time,
                         )
                     && text
-                        != linked_chat_sentence(
-                            &row.reply,
-                            &row.request,
-                            ship,
-                            &row.task,
-                            &crate::routes::utc_time(row.expires_ms),
-                            &row.action,
-                            row.prefix.as_deref(),
+                        != scope_sentence(
+                            linked_chat_sentence(
+                                &row.reply,
+                                &row.request,
+                                ship,
+                                &row.task,
+                                &crate::routes::utc_time(row.expires_ms),
+                                &row.action,
+                                row.prefix.as_deref(),
+                            ),
+                            row.one_time,
                         )
                 {
                     if audit {
@@ -1679,14 +1821,17 @@ fn told(store: &Store, ship: &str, now: i64, audit: bool) -> Result<Vec<(String,
                 }
                 text
             }
-            None => sentence(
-                &row.reply,
-                &row.request,
-                ship,
-                &row.task,
-                &crate::routes::utc_time(row.expires_ms),
-                &row.action,
-                row.prefix.as_deref(),
+            None => scope_sentence(
+                sentence(
+                    &row.reply,
+                    &row.request,
+                    ship,
+                    &row.task,
+                    &crate::routes::utc_time(row.expires_ms),
+                    &row.action,
+                    row.prefix.as_deref(),
+                ),
+                row.one_time,
             ),
         };
         if text.chars().count() > MAX_SENTENCE_CHARS {
@@ -1817,6 +1962,7 @@ fn described(store: &Store, rows: &[Row], now: i64) -> Result<Vec<Value>> {
             "request_id": row.request, "reply_id": row.reply, "action": row.action,
             "command_prefix": row.prefix, "created_ms": row.created_ms,
             "expires_ms": row.expires_ms, "revoked_ms": row.revoked_ms, "source": row.source,
+            "one_time": row.one_time, "used_ms": row.used_ms,
             "live": state == "live", "state": state, "sentence": sentence}));
         // A companion native row retains core-owned provenance even after
         // reply/history pruning.

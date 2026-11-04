@@ -247,12 +247,12 @@ fn prepare_bound(
     let grant_expires = now + ttl as i64 * 1000;
     let grant = json!({"reply_id":reply_id,"command_prefix":ask["payload"]["approves"]["command_prefix"],
         "ttl_secs":ttl,"expires_ms":grant_expires,
-        "sentence":(if link.is_some() { crate::captain_approvals::linked_chat_sentence }
+        "sentence":crate::captain_approvals::scope_sentence((if link.is_some() { crate::captain_approvals::linked_chat_sentence }
             else { crate::captain_approvals::chat_sentence })(&reply_id,
             ask["id"].as_str().unwrap_or_default(), ask["from"].as_str().unwrap_or_default(),
             ask["task_id"].as_str().unwrap_or_default(), &crate::routes::utc_time(grant_expires),
             ask["payload"]["approves"]["action"].as_str().unwrap_or_default(),
-            ask["payload"]["approves"]["command_prefix"].as_str())});
+            ask["payload"]["approves"]["command_prefix"].as_str()), ask["payload"]["approves"]["one_time"] == true)});
     // Admission blocks only an approving answer, never denial/holding. This
     // is advisory at prepare time; native insertion rechecks in the answer's
     // transaction, so newly filled capacity cannot create a false approval.
@@ -1354,6 +1354,24 @@ mod tests {
             })
             .unwrap();
         assert_eq!(replies, 0);
+        let notice: String = store
+            .connection()
+            .query_row(
+                "SELECT body FROM mail WHERE recipient='captain' AND kind='notice'
+             AND json_extract(payload,'$.type')='approval_unavailable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            notice.contains("cap is 8")
+                && notice.contains("expires")
+                && notice.contains("privateer permissions approvals revoke ID"),
+            "{notice}"
+        );
+        for n in 0..crate::captain_approvals::MAX_LIVE {
+            assert!(notice.contains(&format!("other-{n}")), "{notice}");
+        }
         // The failed answer preserves the challenge. Once capacity is free,
         // the same explicit consent works.
         store
@@ -1372,6 +1390,43 @@ mod tests {
         assert_eq!(
             crate::mail::find(&store, "ask").unwrap().unwrap()["state"],
             "answered"
+        );
+    }
+
+    #[test]
+    fn one_time_chat_consent_preserves_the_exact_launch_sentence() {
+        let (_temp, store, mut ask) = fixture();
+        let _clock = FrozenWallClock::at(1_000_000);
+        ask["payload"]["approves"]["one_time"] = json!(true);
+        store
+            .connection()
+            .execute(
+                "UPDATE mail SET payload=?1 WHERE id='ask'",
+                [ask["payload"].to_string()],
+            )
+            .unwrap();
+        let prepared = prepare(&store, &ask, &context()).unwrap();
+        assert!(
+            prepared["grant"]["sentence"]
+                .as_str()
+                .unwrap()
+                .ends_with("One successful retry only.")
+        );
+        let reply = json!({"id":prepared["grant"]["reply_id"],"from":"captain","to":"alpha",
+            "kind":"reply","correlation":"ask","body":"yes","payload":{"chat_door":true}});
+        let sent = crate::mail::send_door_approval(
+            &store,
+            &reply,
+            &answer(&prepared),
+            &context(),
+            true,
+            &|| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(sent["payload"]["approval"]["one_time"], true);
+        assert_eq!(
+            crate::captain_approvals::sentences(&store, "alpha", Store::now_ms()).unwrap(),
+            vec![prepared["grant"]["sentence"].as_str().unwrap()]
         );
     }
 

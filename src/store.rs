@@ -188,7 +188,8 @@ impl Store {
         let approvals: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('captain_approvals') WHERE name='applies_at')
                AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approvals'
-                 AND instr(sql, '''block''') > 0)",
+                 AND instr(sql, '''block''') > 0)
+               AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approval_once')",
             [],
             |r| r.get(0),
         )?;
@@ -312,6 +313,11 @@ impl Store {
         migrate.execute_batch(
             "CREATE INDEX IF NOT EXISTS event_recipient ON events(json_extract(payload,'$.to'),seq) WHERE kind='message';
              CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(owner, status);",
+        )?;
+        migrate.execute_batch(
+            "CREATE TABLE IF NOT EXISTS captain_approval_once(
+               approval_id TEXT PRIMARY KEY REFERENCES captain_approvals(id),
+               used_ms INTEGER, evidence TEXT);",
         )?;
         migrate.commit()?;
         connection.execute("INSERT OR IGNORE INTO metadata VALUES('schema','1')", [])?;
