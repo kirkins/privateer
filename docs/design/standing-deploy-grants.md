@@ -720,6 +720,48 @@ on an unqualified directory; a positive test requires the explicitly supplied
 rather than substitutes fake files if it cannot qualify. No real-kernel escape
 containment result is claimed when that opt-in is absent.
 
+### b2c-b2b-iii-a: private authority-free exec gate and PR 705 fixes
+
+The approved follow-up split keeps iii-a below roughly 800 production lines:
+fix the two PR 705 probe findings and add a private, authority-free gated exec
+primitive on the held `Qualified` boundary. No caller outside the Linux module
+can release this gate. Its opt-in tests execute only a native fake fixture;
+there is no adapter entry point, claim binding, deployment metadata, artifact
+stream, command registration or activation in this slice. iii-b will add the
+sole consuming `Handoff` spawn, exact fresh `Claim` and durable cross-ledger
+custody binding, sealed adapter integration, bounded streaming supervisor and
+six fake adapter fixtures. Neither slice enables deployments.
+
+A missing ancestor `cgroup.procs` must never qualify: report the child's open
+errno separately and require open success before accepting **write** `ENOENT`.
+Every post-clone path attempts both `cgroup.kill` and pidfd SIGKILL before
+propagating a clock/observation error. A failed cleanup clock read permits a
+second BOOTTIME read solely to bound rescue by the separate cleanup window;
+it must never reuse a potentially distant runtime deadline. If the clock
+remains unreadable, only a nonblocking reap is permitted (never an unbounded
+wait). Unresolved reaping/emptiness retains custody. A successful reap does not
+convert a clock failure into qualification.
+
+The private gate repeats qualification on the exact held boundary and repeats
+the child's root, namespace, credential and child-open migration checks at the
+actual exec gate. Before release it verifies process identity and membership.
+A failed check or dropped gate kills via both cgroup and pidfd with bounded
+cleanup. Inconclusive cleanup retains the boundary and process identity for
+inspection. The child has no authority while gated. It uses an empty environment
+except a fixed protocol version, a fresh private cwd, umask 077, null standard
+streams, empty capabilities and no-new-privileges. Only its explicit gate/ack
+pipes and held native executable survive setup; all close at exec. Execution
+uses `execveat(AT_EMPTY_PATH)` on the held inode, never a pathname or interpreter.
+The private primitive does not itself establish the executable's sealed digest;
+that is iii-b's mandatory pinned-adapter check before it may create any gate.
+
+Gate acknowledgement is not durable deployment permission. In iii-b only the
+consuming spawn may release it, after recording exact claim/hold/cgroup/process
+custody. A failed or ambiguous acknowledgement never permits replay. The
+primitive records no deployment outcome or capacity release; `Qualified` and
+all inconclusive cleanup retain local custody. Positive tests require the
+explicit isolated real-kernel delegation, otherwise they assert refusal.
+
 ### b2c-b2b child-gate contract (supervisor not implemented here)
 
 Prepare and verify the private pinned adapter before giving it deployment
@@ -784,8 +826,9 @@ an outside-namespace ancestor `cgroup.procs` file **opened by the probe child**
 using `openat` on a deliberately supplied ancestor `O_PATH` directory fd. Never
 supply a supervisor-opened migration file: the kernel uses the opener's namespace
 and credentials, not those of the writer. The supervisor first checks that the
-ancestor file can be opened for writing. Both the child's directory and migration
-fds close before adapter exec; a DAC-only `EACCES` refusal does not prove namespace
+ancestor file can be opened for writing. The child's own open must also succeed;
+only the subsequent write's `ENOENT` is namespace-delegation proof. Both the
+child's directory and migration fds close before adapter exec; a DAC-only `EACCES` refusal does not prove namespace
 containment. Source evidence: Linux v5.16
 [`cgroup_file_open`, `__cgroup_procs_write`, `cgroup_procs_write_permission`](https://github.com/torvalds/linux/blob/v5.16/kernel/cgroup/cgroup.c)
 respectively retain `current->nsproxy->cgroup_ns`, use `of->file->f_cred` and
