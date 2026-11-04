@@ -6,6 +6,8 @@
 //! admitting process lives. Handoff/payload custody is never released here.
 use super::*;
 
+pub(crate) mod containment;
+
 /// Process-local, nonserializable pre-launch custody. No Drop-based release.
 /// Only admit can create this token outside this module's tests. A future
 /// executor must consume it through handoff before spawning anything;

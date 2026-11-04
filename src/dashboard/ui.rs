@@ -1055,12 +1055,14 @@ impl App {
                     let job = clean(held["job_id"].as_str().unwrap_or("?"), 160);
                     let recover = held["recover"].as_str().filter(|s| !s.trim().is_empty());
                     if held["inspection_required"] == true || recover.is_none() {
+                        let outcome = held["outcome"]
+                            .as_str()
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or("unknown");
                         lines.push(Line::from(format!(
-                            "{job} · inspection required, outcome unknown, capacity retained"
+                            "{job} · inspection required, outcome {}, capacity retained",
+                            clean(outcome, 160)
                         )));
-                        if let Some(outcome) = held["outcome"].as_str() {
-                            lines.push(Line::from(format!("Outcome: {}", clean(outcome, 160))));
-                        }
                         if let Some(reason) = held["reason"].as_str() {
                             lines.push(Line::from(format!("Reason: {}", clean(reason, 1024))));
                         }
@@ -1345,7 +1347,7 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(text.contains("Outcome: unknown"), "{text}");
+        assert!(!text.contains("Outcome:"), "{text}");
         assert!(
             text.contains("Reason: deployment handoff; inspect local payload and remote outcome"),
             "{text}"
@@ -1390,6 +1392,17 @@ mod tests {
                 "{text}"
             );
         }
+        assert!(!text.contains("recover"), "{text}");
+    }
+
+    #[test]
+    fn inspection_preserves_recorded_outcome() {
+        let text = capacity_details(serde_json::json!([{
+            "job_id":"deployment-alpha", "inspection_required":true,
+            "outcome":"failed", "recover":null
+        }]));
+        assert!(text.contains("outcome failed, capacity retained"), "{text}");
+        assert!(!text.contains("outcome unknown"), "{text}");
         assert!(!text.contains("recover"), "{text}");
     }
 

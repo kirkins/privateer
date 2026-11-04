@@ -691,6 +691,35 @@ supervisor and six fake adapters. All three remain dormant: no dispatcher,
 command registration, restart hook or activation. No containment implementation
 or real-kernel qualification is claimed by this contract/UI slice.
 
+### b2c-b2b-ii: dormant Linux qualification and authority-free gate
+
+This slice implements the qualification primitive, not the adapter supervisor.
+It accepts only an explicitly trusted isolated delegation, pins the directory
+without following symlinks, checks its cgroup2 mount identity and `nsdelegate`,
+creates and holds a private empty boundary, verifies finite `pids.max`, and
+clones a disposable authority-free child into that boundary with a pidfd and
+new cgroup namespace. The child uses only allocation-free libc/syscalls, a
+fresh private cwd, umask 077, closed inherited descriptors, empty capabilities
+and no-new-privileges. It verifies its namespace root and that its namespace
+differs from the parent's, opens the ancestor migration file itself, reports
+the result and remains gated until killed. The parent verifies membership,
+exercises `cgroup.kill` on the live gated child, proves emptiness and bounds
+pidfd rescue/reaping by `CLOCK_BOOTTIME`. No adapter is executed; the explicit
+cleared exec environment and held-inode executable policy remain obligations
+of iii's sole consuming spawn, not capabilities of this authority-free probe.
+
+An inconclusive cleanup returns bounded refusal plus retained cgroup/process
+custody; it never removes that boundary. A successful qualification returns
+an empty held boundary, not a launch token or persistent permission. Dropping
+it does not discharge custody or remove the boundary. There is no caller,
+durable ledger recording, activation or automatic restart path in this slice;
+iii must bind and record these facts before any authority release and repeat
+the probe against the exact held launch boundary. Ordinary CI asserts refusal
+on an unqualified directory; a positive test requires the explicitly supplied
+`PRIVATEER_TEST_CGROUP_DELEGATION` isolated real-kernel delegation and fails
+rather than substitutes fake files if it cannot qualify. No real-kernel escape
+containment result is claimed when that opt-in is absent.
+
 ### b2c-b2b child-gate contract (supervisor not implemented here)
 
 Prepare and verify the private pinned adapter before giving it deployment
@@ -717,8 +746,9 @@ Hash the actual artifact stream delivered to the adapter and hash its observed
 stdout/stderr streams incrementally. Bound protocol metadata, artifact bytes,
 combined stdout/stderr, retained diagnostics and per-iteration IO work; a child
 that writes continuously must not starve deadline checks. Exceeding any IO or
-protocol bound terminates the attempt through cgroup cleanup and records failure
-(or unknown if cleanup cannot prove emptiness), never success. Use nonblocking IO
+protocol bound kills the attempt cgroup and records the outcome **locally** as
+failed (or unknown if cleanup cannot prove emptiness), never success. This says
+nothing about whether a remote deployment completed. Use nonblocking IO
 and the admitted hard deadline measured on Linux `CLOCK_BOOTTIME`, never
 `Store::now_ms` wall time. Suspend **counts** toward both runtime and the separate
 bounded cleanup deadline; `std::time::Instant`/`CLOCK_MONOTONIC` alone is not
@@ -733,10 +763,15 @@ reparenting. The concrete qualifying mechanism is a trusted, pinned cgroup2
 mount with `nsdelegate`, and `clone3(CLONE_INTO_CGROUP | CLONE_NEWCGROUP)` using
 the held attempt-directory fd. The child is born in that cgroup, with a new
 cgroup namespace rooted there, **before** executing the adapter. The kernel floor
-is Linux 5.14 (`cgroup.kill`; `CLONE_INTO_CGROUP` itself needs 5.7); a version
-string is not a substitute for probing the required operations. An unprivileged
-launcher also needs an appropriately qualified user namespace for
-`CLONE_NEWCGROUP`; if unavailable it refuses, not a weaker join-after-fork path.
+is Linux 5.16 (open-time namespace/credential permission checks for
+CVE-2021-4197); `cgroup.kill` needs 5.14 and `CLONE_INTO_CGROUP` needs 5.7.
+A version string is not a substitute for probing the required operations.
+This implementation conservatively refuses older kernels, including possible
+stable backports, rather than infer that the security fix is present.
+An unprivileged launcher also needs an appropriately qualified user namespace
+for `CLONE_NEWCGROUP`; this slice does not implement a user-namespace launcher
+and refuses when the current credentials cannot perform the exact clone, not
+a weaker join-after-fork path.
 The adapter must have no privilege to change the enclosing cgroup mount or
 namespace boundary: drop capabilities and set no-new-privileges before exec.
 No inherited namespace/mount/control fds may cross exec.
@@ -745,9 +780,18 @@ Qualification runs an authority-free disposable child under the **same** launch
 credentials, namespaces and fd policy as the adapter. Verify the mount's cgroup2
 identity and `nsdelegate` option, the child's actual cgroup namespace root and
 membership, and kernel rejection (`ENOENT`) of a probe moving that child through
-a deliberately supplied outside-namespace ancestor `cgroup.procs` fd. The probe
-fd must be usable by the supervisor and closed before adapter exec; a DAC-only
-`EACCES` refusal does not prove namespace containment. Also exercise `cgroup.kill`
+an outside-namespace ancestor `cgroup.procs` file **opened by the probe child**
+using `openat` on a deliberately supplied ancestor `O_PATH` directory fd. Never
+supply a supervisor-opened migration file: the kernel uses the opener's namespace
+and credentials, not those of the writer. The supervisor first checks that the
+ancestor file can be opened for writing. Both the child's directory and migration
+fds close before adapter exec; a DAC-only `EACCES` refusal does not prove namespace
+containment. Source evidence: Linux v5.16
+[`cgroup_file_open`, `__cgroup_procs_write`, `cgroup_procs_write_permission`](https://github.com/torvalds/linux/blob/v5.16/kernel/cgroup/cgroup.c)
+respectively retain `current->nsproxy->cgroup_ns`, use `of->file->f_cred` and
+`ctx->ns`, and return `-ENOENT` for a source/destination outside that namespace
+when `nsdelegate` is enabled. See also the
+[cgroup-v2 namespace delegation rules](https://docs.kernel.org/admin-guide/cgroup-v2.html#delegation-containment). Also exercise `cgroup.kill`
 and bounded `populated 0` observation on the held probe cgroup. An unexpectedly
 successful migration fails qualification; retain the probe's pidfd for bounded
 termination even outside the probe cgroup. Probe children receive no metadata,
@@ -799,7 +843,8 @@ including CI and macOS, the test must assert activation refusal and record that
 the environment is unqualified, not substitute fake containment.
 
 PR 691/694 follow-ups also require stale `deployment-handoff` reservations to be
-presented as "inspection required, outcome unknown, capacity retained", including
+presented as "inspection required, outcome <recorded outcome>, capacity retained"
+(or "outcome unknown" only when none is recorded), including
 in the dashboard's stuck-capacity detail. Preserve their bounded reason/outcome,
 show no blank command and offer no recovery instruction for inspection-only
 holds, even alongside ordinary actionable reservations. Never turn them into
