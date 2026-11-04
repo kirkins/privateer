@@ -2,7 +2,7 @@
 //! Status (including a replay saying `claimed`) is never permission to launch.
 use super::{ledger, verifier};
 use crate::store::Store;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use rusqlite::params;
 use serde_json::{Value, json};
 
@@ -46,24 +46,24 @@ impl Claim {
     #[cfg(target_os = "linux")]
     pub(crate) fn record_started(&self, store: &Store, custody: &Value) -> Result<()> {
         super::captain(store, "deployment spawn")?;
-        ensure!(
+        anyhow::ensure!(
             !store.connection().is_autocommit(),
             "spawn requires home writer lock"
         );
         let dispatcher = serde_json::from_str::<Value>(&self.identity)?;
-        ensure!(
+        anyhow::ensure!(
             dispatcher["dispatcher"]
                 == serde_json::from_str::<Value>(&crate::jobs::own_identity()?)?,
             "claim dispatcher changed"
         );
-        ensure!(
+        anyhow::ensure!(
             custody["claim"] == self.binding(),
             "deployment custody claim mismatch"
         );
         self.used
             .matches(ledger::recorded(store, &self.id)?.value())?;
         verifier::recheck_claim(store, &self.proof, &self.used)?;
-        ensure!(
+        anyhow::ensure!(
             store.connection().execute(
                 "UPDATE deployment_intents SET state='started',updated_ms=?3
              WHERE use_id=?1 AND state='claimed' AND claim_identity=?2",
@@ -211,7 +211,7 @@ fn claim_with(
 pub(super) fn mark_started(store: &Store, claim: Claim) -> Result<()> {
     super::captain(store, "deployment start transition")?;
     let tx = store.write_transaction()?;
-    ensure!(
+    anyhow::ensure!(
         tx.execute(
             "UPDATE deployment_intents SET state='started',updated_ms=?3
              WHERE use_id=?1 AND state='claimed' AND claim_identity=?2",
