@@ -12,6 +12,7 @@ const NATIVE: &str = r#"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 static int check(const char *path, const char *expected) {
@@ -22,12 +23,26 @@ static int check(const char *path, const char *expected) {
     return strcmp(bytes, expected);
 }
 int main(int argc, char **argv) {
-    if (argc != 2 || check(argv[1], "alpha") ||
+    if (argc != 3 || check(argv[1], "alpha") ||
         check(getenv("PRIVATEER_ADAPTER_CONFIG"), "beta")) return 42;
     for (int fd = 3; fd < 1024; fd++) {
         if (fd == 7 || fd == 8) continue;
         if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) return 43;
     }
+    /* A fixed hex argument keeps this fixture's output path out of the
+       supporting-input argv namespace. No production policy is relaxed. */
+    char path[4096];
+    size_t length = strlen(argv[2]);
+    if (length % 2 || length / 2 >= sizeof(path)) return 44;
+    for (size_t i = 0; i < length / 2; i++) {
+        unsigned int value;
+        if (sscanf(argv[2] + 2*i, "%2x", &value) != 1) return 44;
+        path[i] = (char)value;
+    }
+    path[length / 2] = 0;
+    int marker = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (marker < 0 || write(marker, "executed", 8) != 8) return 44;
+    close(marker);
     return 0;
 }
 "#;
@@ -47,8 +62,16 @@ fn prepared_fixture(binary: &Path) -> Fixture {
     private(&config, b"beta");
     let path = fixture.store.home().join("deployment/beta.json");
     let mut configuration: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    configuration["adapter"] =
-        json!({"id":"beta","executable":executable,"args":[file],"files":[file],"config":config});
+    // The marker is output, not a supporting input. Encode its path as an
+    // opaque fixed fixture argument; absolute file argv is correctly refused.
+    let marker = fixture.root.join("executed");
+    let marker_hex: String = marker
+        .to_str()
+        .unwrap()
+        .bytes()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    configuration["adapter"] = json!({"id":"beta","executable":executable,"args":[file,marker_hex],"files":[file],"config":config});
     private(&path, configuration.to_string());
     let spec: String = fixture
         .store
@@ -185,6 +208,8 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
         "none",
         "pause",
         "unreadable-pause",
+        "malformed-pause",
+        "wrong-installation",
         "charter",
         "task",
         "grant-pause",
@@ -202,6 +227,8 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
         match fault {
             "pause" => private(&pause, b"{\"installation_id\":\"alpha\",\"paused\":true}"),
             "unreadable-pause" => { fs::remove_file(pause).unwrap(); },
+            "malformed-pause" => private(&pause, b"{"),
+            "wrong-installation" => private(&pause, b"{\"installation_id\":\"gamma\",\"paused\":false}"),
             "charter" => { fixture.store.connection().execute_batch("UPDATE charters SET data=json_set(data,'$.actions',json('[]'))").unwrap(); },
             "task" => { fixture.store.connection().execute_batch("UPDATE tasks SET status='done'").unwrap(); },
             "grant-pause" => fixture.store.connection().execute_batch("UPDATE standing_deploy_grants SET paused_ms=1,revision=revision+1 WHERE id='alpha'").unwrap(),
@@ -212,7 +239,14 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
             _ => {}
         }
         let home = fixture.store.write_transaction().unwrap();
-        let result = claim.record_started(&fixture.store, &custody);
+        assert_eq!(
+            claim.check_pause().is_ok(),
+            !matches!(
+                fault,
+                "pause" | "unreadable-pause" | "malformed-pause" | "wrong-installation"
+            )
+        );
+        let result = containment::record_started_for_test(&claim, &fixture.store, &custody);
         if fault == "none" {
             result.unwrap();
             home.commit().unwrap();
@@ -292,6 +326,8 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
         );
     }
 
+    abort_ledger_tests(&binary);
+
     let Some(delegation) = std::env::var_os("PRIVATEER_TEST_CGROUP_DELEGATION") else {
         assert!(containment::qualify(root.path()).is_err());
         eprintln!(
@@ -299,7 +335,15 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
         );
         return;
     };
-    for fault in ["none", "host-insert", "home-commit"] {
+    for fault in [
+        "none",
+        "host-insert",
+        "home-commit",
+        "locked-pause",
+        "late-pause",
+        "late-unreadable",
+        "late-malformed",
+    ] {
         let fixture = prepared_fixture(&binary);
         let (id, claim) = fresh(&fixture);
         let admitted = admit_for_test(&fixture.store).unwrap();
@@ -317,7 +361,29 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
         }
         let mut boundary = containment::qualify(Path::new(&delegation))
             .expect("explicit isolated delegation must qualify");
+        let pause = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap())
+            .join("privateer/deployment-pause.json");
+        containment::RELEASE_OBSERVER.with(|observer| {
+            *observer.borrow_mut() = Some(Box::new(move |stage| {
+                if (stage == "host_locked" && fault == "locked-pause")
+                    || (stage == "before_release" && fault == "late-pause")
+                {
+                    private(&pause, b"{\"installation_id\":\"alpha\",\"paused\":true}");
+                } else if stage == "before_release" && fault == "late-unreadable" {
+                    fs::remove_file(&pause).unwrap();
+                } else if stage == "before_release" && fault == "late-malformed" {
+                    private(&pause, b"{");
+                }
+            }));
+        });
         let result = handoff.spawn(&fixture.store, claim, &mut boundary);
+        containment::RELEASE_OBSERVER.with(|observer| *observer.borrow_mut() = None);
+        assert_eq!(
+            fixture.root.join("executed").exists(),
+            fault == "none",
+            "{fault}: unreleased adapter executed"
+        );
+        let late = fault.starts_with("late-");
         if fault == "none" {
             let status = result.unwrap();
             assert!(libc::WIFEXITED(status));
@@ -329,10 +395,25 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
             state(&fixture, &id),
             if fault == "none" {
                 "started"
+            } else if late {
+                "denied"
             } else {
                 "claimed"
             }
         );
+        if late {
+            let outcome: String = fixture
+                .store
+                .connection()
+                .query_row(
+                    "SELECT outcome FROM deployment_intents WHERE use_id=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(outcome, "not_started");
+            assert_release_audit(&fixture, &id, true);
+        }
         let record: String = host
             .query_row(
                 "SELECT record FROM reservations WHERE key=?1",
@@ -343,13 +424,13 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
         let record: Value = serde_json::from_str(&record).unwrap();
         assert_eq!(
             record["state"],
-            if fault == "host-insert" {
+            if matches!(fault, "host-insert" | "locked-pause") {
                 "deployment-handoff"
             } else {
                 "deployment-started"
             }
         );
-        if fault == "none" {
+        if fault == "none" || late {
             let host_record: String = host
                 .query_row(
                     "SELECT record FROM deployment_payloads WHERE key=?1",
@@ -369,5 +450,122 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
             assert_eq!(host_record, home_record);
         }
         boundary.dispose_test_boundary();
+    }
+}
+
+fn assert_release_audit(fixture: &Fixture, id: &str, empty: bool) {
+    let payload: String = fixture
+        .store
+        .connection()
+        .query_row(
+            "SELECT payload FROM audit WHERE kind='deployment.release_refused'
+         AND json_extract(payload,'$.deployment_id')=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let detail = serde_json::from_str::<Value>(&payload).unwrap()["detail"].clone();
+    assert_eq!(detail["release_attempted"], false);
+    assert_eq!(detail["cleanup_proven_empty"], empty);
+    assert_eq!(detail["capacity_retained"], true);
+    assert_eq!(
+        detail["outcome"],
+        if empty { "not_started" } else { "unknown" }
+    );
+    assert_eq!(detail["containment_scope"], "attempt_cgroup_only");
+    assert_eq!(detail["limitation"], "outside_ipc_delegation_not_excluded");
+}
+
+// Home-ledger transaction tests only. `empty` is an injected cleanup result,
+// NOT evidence of kernel containment; the opt-in spawn tests prove that path.
+fn abort_ledger_tests(binary: &Path) {
+    for fault in ["empty", "unknown", "audit", "stale", "custody"] {
+        let fixture = prepared_fixture(binary);
+        let (id, claim) = fresh(&fixture);
+        let custody = json!({"claim":claim.binding()});
+        let tx = fixture.store.write_transaction().unwrap();
+        containment::record_started_for_test(&claim, &fixture.store, &custody).unwrap();
+        tx.commit().unwrap();
+        let mut attempted = custody.clone();
+        match fault {
+            "audit" => fixture
+                .store
+                .connection()
+                .execute_batch(
+                    "CREATE TRIGGER fail_abort BEFORE INSERT ON audit
+                 WHEN NEW.kind='deployment.release_refused'
+                 BEGIN SELECT RAISE(ABORT,'fixture'); END;",
+                )
+                .unwrap(),
+            "stale" => {
+                fixture
+                    .store
+                    .connection()
+                    .execute(
+                        "UPDATE deployment_intents SET claim_identity='gamma' WHERE use_id=?1",
+                        [&id],
+                    )
+                    .unwrap();
+            }
+            "custody" => attempted["claim"]["deployment_id"] = json!("gamma"),
+            _ => {}
+        }
+        let empty = fault != "unknown";
+        let result =
+            containment::record_not_started_for_test(&claim, &fixture.store, &attempted, empty);
+        let succeeded = matches!(fault, "empty" | "unknown");
+        assert_eq!(result.is_ok(), succeeded, "{fault}");
+        assert_eq!(
+            state(&fixture, &id),
+            if !succeeded {
+                "started"
+            } else if empty {
+                "denied"
+            } else {
+                "unknown"
+            }
+        );
+        let reopened = Store::open(fixture.store.home()).unwrap();
+        let saved: String = reopened
+            .connection()
+            .query_row(
+                "SELECT record FROM deployment_payloads WHERE use_id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, custody.to_string());
+        assert!(
+            reopened
+                .connection()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM deployment_uses WHERE id=?1)",
+                    [&id],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+        if succeeded {
+            assert_release_audit(&fixture, &id, empty);
+            // No stale witness/custody can repeat the abort transition.
+            assert!(
+                containment::record_not_started_for_test(&claim, &fixture.store, &custody, empty)
+                    .is_err()
+            );
+            assert!(claims::claim(&fixture.store, &id).unwrap().claim.is_none());
+        } else {
+            let outcome: Option<String> = reopened
+                .connection()
+                .query_row(
+                    "SELECT outcome FROM deployment_intents WHERE use_id=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                outcome.is_none(),
+                "{fault}: failed transaction changed outcome"
+            );
+        }
     }
 }

@@ -892,6 +892,64 @@ the explicit script policy refusal; an unprivileged fork/execveat test must prov
 the mode-0500 executable memfd works without cgroup delegation. Executable memfd
 creation requests `MFD_EXEC` on supporting kernels and falls back only on EINVAL.
 
+### b2c-b2b-iii-b3a: release-window fixes and remaining supervisor split
+
+The first mate approved a further reviewable split before implementation: b3a
+addresses the four PR 715 findings and records this contract; b3b adds bounded,
+nonblocking hashed protocol IO while retaining capacity; b3c adds terminal
+outcomes, proof-gated capacity release and all six qualified fake scenarios.
+Combine b3b/b3c only if the production change stays below roughly 800 lines.
+B3a still uses null streams. None adds registration, activation, a restart
+launcher or production permission. B3b/b3c are not implemented by b3a.
+
+The home writer lock is taken first, then the host writer lock, and only then
+may the fresh claim's authority, pause and evidence age be rechecked. Waiting
+for the host lock must not silently age a previously checked claim. Both
+custody commits still precede release. Immediately after the last membership
+and deadline checks, re-read the authoritative emergency-pause file fail-closed,
+then write the release byte without another database operation in between.
+Pause-file replacement is not serialized by the home lock: this narrows the
+release decision to that final read, not an atomic pause/exec guarantee. A pause
+which arrives after that read cannot recall the byte.
+
+A pause or unreadable pause at this final check sends no release byte. Kill via
+both the held cgroup and pidfd, and bound reaping and proof of emptiness. Persist
+a fixed, credential-free `not_started` outcome and audit fact in the home ledger
+only after successful cleanup; use `unknown` if cleanup is inconclusive. Keep
+the original append-only custody records in both ledgers, the consumed use and
+all host capacity. The earlier `started` custody transition means permission
+was prepared, not that exec occurred. If outcome persistence itself fails, leave
+that conservative started custody for inspection. No late abort grants a retry,
+refund or automatic release. Full dual-ledger terminal reconciliation remains
+b3c. Tests must cover pause in the post-commit release window, missing/malformed
+pause, and prove no fixture marker after host-insert/home-commit failures.
+Positive launch/cleanup scenarios still require explicit real-kernel delegation;
+ordinary pipe/check tests do not establish containment.
+
+Only the spawn module can construct the witness required by `record_started`.
+The gate itself checks all fd sources are at least 64 before clone, independent
+of its caller. This protects the reserved child-fd remapping against clobbering.
+
+B3b's protocol will send bounded, length-delimited metadata followed by the
+exact retained artifact from the claim's held inode, never a caller pathname or
+caller-supplied digest. Hash only bytes actually accepted by the nonblocking
+artifact pipe and compare the final digest and byte count with the immutable
+use. Hash stdout/stderr incrementally; bound combined output, metadata, retained
+diagnostics and work per IO iteration, so continuous output cannot starve
+CLOCK_BOOTTIME deadline checks. Retained diagnostics must not expose private
+configuration or credentials. Short/extra input, malformed result framing,
+partial delivery, oversize output and IO failure cannot yield success.
+
+B3c records the local protocol result separately from remote outcome and local
+cleanup proof. Only proven terminal process identity, reaping and emptiness of
+the exact held attempt cgroup can permit a capacity-release CAS; ambiguity,
+clock/read/kill errors, partial ledger commits and suspected outside IPC handoff
+retain capacity. Outcomes carry `attempt_cgroup_only` and
+`outside_ipc_delegation_not_excluded`. A crash never recreates a launch token.
+The six fake scenarios remain success, failure, hard-deadline hang, oversized
+output, pre-authority identity mismatch and immediate reparent/double-fork.
+Positive containment requires real qualification, never fake cgroup files.
+
 ### b2c-b2b child-gate contract (bounded IO supervisor not implemented here)
 
 Prepare and verify the private pinned adapter before giving it deployment

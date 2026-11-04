@@ -6,7 +6,9 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{Qualified, SealedExecutable, SealedInput};
+pub(crate) use linux::{Qualified, SealedExecutable, SealedInput, SpawnWitness};
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use linux::{RELEASE_OBSERVER, record_not_started_for_test, record_started_for_test};
 
 #[derive(Debug)]
 pub(crate) struct Refusal {

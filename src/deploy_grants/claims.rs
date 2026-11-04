@@ -44,7 +44,12 @@ impl Claim {
     // Only the consuming spawn calls this, inside its home transaction. Neither
     // a historical started row nor a saved JSON binding reconstructs a token.
     #[cfg(target_os = "linux")]
-    pub(crate) fn record_started(&self, store: &Store, custody: &Value) -> Result<()> {
+    pub(crate) fn record_started(
+        &self,
+        store: &Store,
+        custody: &Value,
+        _witness: &crate::jobs::deployment_admission::containment::SpawnWitness,
+    ) -> Result<()> {
         super::captain(store, "deployment spawn")?;
         anyhow::ensure!(
             !store.connection().is_autocommit(),
@@ -76,6 +81,63 @@ impl Claim {
             params![self.id, custody.to_string()],
         )?;
         audit(store, &self.used, "deployment.started", custody.clone())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn check_pause(&self) -> Result<()> {
+        self.proof.check_pause()
+    }
+
+    // Called only when the final pause read refused BEFORE any release write.
+    // No current authority is needed to preserve an abort after revocation.
+    // Failure leaves the conservative started custody, never a replay token.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn record_not_started(
+        &self,
+        store: &Store,
+        custody: &Value,
+        empty: bool,
+        _witness: &crate::jobs::deployment_admission::containment::SpawnWitness,
+    ) -> Result<()> {
+        let tx = store.write_transaction()?;
+        let saved: String = tx.query_row(
+            "SELECT record FROM deployment_payloads WHERE use_id=?1",
+            [&self.id],
+            |r| r.get(0),
+        )?;
+        let expected = custody.to_string();
+        anyhow::ensure!(
+            custody["claim"] == self.binding() && saved == expected,
+            "deployment abort custody mismatch"
+        );
+        let outcome = if empty { "not_started" } else { "unknown" };
+        anyhow::ensure!(
+            tx.execute(
+                "UPDATE deployment_intents SET state=?3,outcome=?4,updated_ms=?5
+                 WHERE use_id=?1 AND state='started' AND claim_identity=?2",
+                params![
+                    self.id,
+                    self.identity,
+                    if empty { "denied" } else { "unknown" },
+                    outcome,
+                    Store::now_ms()
+                ],
+            )? == 1,
+            "deployment abort claim no longer matches"
+        );
+        audit(
+            store,
+            &self.used,
+            "deployment.release_refused",
+            json!({
+            "claim":self.binding(), "outcome":outcome,
+            "reason":"final emergency pause check refused", "release_attempted":false,
+            "cleanup_proven_empty":empty, "capacity_retained":true,
+            "containment_scope":"attempt_cgroup_only",
+            "limitation":"outside_ipc_delegation_not_excluded"}),
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 }
 
