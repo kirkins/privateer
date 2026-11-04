@@ -2276,3 +2276,158 @@ fn an_approve_detaches_another_ships_attached_ask_and_approves_nothing_for_it() 
     );
     assert_eq!(theirs_approved["approvals"], json!([]), "{theirs_approved}");
 }
+
+/// A Codex first mate's command ran, but its workspace-write sandbox has no
+/// network: one notice that names Codex and the supported option, no
+/// permission card, and the ship is told no policy denied it. The same
+/// restriction reported again, from another task or after a policy change
+/// withdrew another ship's ask, adds no mail; a changed sandbox is a new
+/// notice. Earlier mail stays as it was.
+#[test]
+fn a_codex_sandbox_failure_is_one_notice_naming_codex_and_never_a_permission_card() {
+    let f = Fleet::new();
+    f.init("alpha", "codex");
+    let report = |task: &str| {
+        f.json(
+            "alpha",
+            "permissions.blocked",
+            json!({"task_id": task, "tool": "exec_command",
+                "input": {"cmd": "curl https://registry.example/index"}}),
+        )
+    };
+    let first = report("alpha-duty");
+    assert!(first["request_id"].is_null(), "{first}");
+    assert_eq!(first["harness"], "codex", "{first}");
+    assert_eq!(first["duplicate"], false, "{first}");
+    let message = first["message"].as_str().unwrap();
+    assert!(message.contains("not denied by policy"), "{message}");
+    assert!(message.contains("network:true"), "{message}");
+    assert!(f.asks("alpha").is_empty(), "{:?}", f.asks("alpha"));
+    let notice = f.show("alpha", &first["restriction"]);
+    let body = notice["body"].as_str().unwrap().to_owned();
+    assert!(
+        body.starts_with(
+            "alpha: Codex's sandbox (workspace-write, no network) restricted exec_command"
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains(
+            "Codex workspace-write has no network; the supported per-ship option is first_mate options network:true, see #724"
+        ),
+        "{body}"
+    );
+    assert!(!body.contains("Claude was denied"), "{body}");
+    assert!(!body.contains("permissions allow"), "{body}");
+    assert!(!body.contains("permissions authorize"), "{body}");
+    assert_eq!(notice["kind"], "notice");
+    let restriction = &notice["payload"]["restriction"];
+    assert_eq!(notice["payload"]["type"], "harness_restriction");
+    assert_eq!(restriction["harness"], "codex", "{notice}");
+    assert_eq!(restriction["sandbox"], "workspace-write", "{notice}");
+    assert_eq!(restriction["network"], false, "{notice}");
+    assert!(notice["payload"].get("decision").is_none(), "{notice}");
+    assert!(restriction["denials"][0].get("rule").is_none(), "{notice}");
+
+    // A Claude ship's ask, withdrawn by the policy change that covers it.
+    let ask = f.json(
+        "liaison",
+        "permissions.blocked",
+        json!({"task_id": "liaison-duty", "tool": "Bash",
+            "input": {"command": "apify run actor/x"}}),
+    )["request_id"]
+        .clone();
+    f.ok(None, &["permissions", "allow", "Bash(apify run *)"]);
+    let ended = f.show("liaison", &ask);
+    assert_eq!(ended["state"], "withdrawn", "{ended}");
+    let before = f.captain_mail("alpha").len();
+    let again = report("alpha-duty");
+    assert_eq!(again["duplicate"], true, "{again}");
+    assert_eq!(again["restriction"], first["restriction"]);
+    assert!(
+        again["message"].as_str().unwrap().contains("already has"),
+        "{again}"
+    );
+    f.json(
+        "alpha",
+        "task.create",
+        json!({"id": "alpha-fetch", "charter_id": "alpha", "owner": "alpha", "title": "Fetch"}),
+    );
+    assert_eq!(report("alpha-fetch")["duplicate"], true);
+    assert_eq!(f.captain_mail("alpha").len(), before);
+    assert!(f.asks("alpha").is_empty());
+    // Earlier mail is kept as it was.
+    assert_eq!(
+        f.show("alpha", &first["restriction"])["body"],
+        body.as_str()
+    );
+    let kept = f.show("liaison", &ask);
+    assert_eq!(kept["state"], "withdrawn", "{kept}");
+    assert!(
+        kept["body"]
+            .as_str()
+            .unwrap()
+            .starts_with("liaison: Claude was denied Bash(apify run *)"),
+        "{kept}"
+    );
+
+    // A changed sandbox is a changed cause: a notice of its own.
+    let mut profile = f.json("alpha", "ship.show", json!({"name": "alpha"}));
+    profile["first_mate"]["options"]["sandbox"] = json!("read-only");
+    f.json("alpha", "ship.put", profile);
+    let changed = report("alpha-duty");
+    assert_eq!(changed["duplicate"], false, "{changed}");
+    assert_ne!(changed["restriction"], first["restriction"]);
+    assert!(f.asks("alpha").is_empty());
+}
+
+/// A Claude first mate's own report still offers its Allow, as the pane and
+/// hook paths do; one that says its sandbox restricted the command is a
+/// notice naming Claude instead, with no rule offered.
+#[test]
+fn a_claude_report_keeps_its_card_unless_its_sandbox_restricted_it() {
+    let f = Fleet::new();
+    let denied = f.json(
+        "liaison",
+        "permissions.blocked",
+        json!({"task_id": "liaison-duty", "tool": "Bash",
+            "input": {"command": "apify run actor/x"}}),
+    );
+    let ask = f.show("liaison", &denied["request_id"]);
+    assert!(
+        ask["payload"]["decision"]["question"]
+            .as_str()
+            .unwrap()
+            .starts_with("liaison: Claude was denied Bash(apify run *)"),
+        "{ask}"
+    );
+    assert_eq!(ask["payload"]["block"]["harness"], "claude", "{ask}");
+    assert_eq!(
+        ask["payload"]["decision"]["options"][0]["id"], "allow",
+        "{ask}"
+    );
+    let sandboxed = f.json(
+        "liaison",
+        "permissions.blocked",
+        json!({"task_id": "liaison-duty", "tool": "Bash", "cause": "sandbox",
+            "input": {"command": "curl https://registry.example/index"}}),
+    );
+    assert!(sandboxed["request_id"].is_null(), "{sandboxed}");
+    assert_eq!(sandboxed["harness"], "claude", "{sandboxed}");
+    let notice = f.show("liaison", &sandboxed["restriction"]);
+    assert!(
+        notice["body"]
+            .as_str()
+            .unwrap()
+            .starts_with("liaison: Claude's sandbox"),
+        "{notice}"
+    );
+    assert_eq!(f.asks("liaison").len(), 1);
+    let refused = f.fails(
+        "liaison",
+        "permissions.blocked",
+        json!({"task_id": "liaison-duty", "tool": "Bash", "cause": "network",
+            "input": {"command": "curl https://registry.example/index"}}),
+    );
+    assert!(refused.contains("cause must be"), "{refused}");
+}

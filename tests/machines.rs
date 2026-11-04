@@ -117,6 +117,16 @@ impl Machine {
         assert!(made.status.success(), "{}", text(&made));
     }
 
+    /// Run `name`'s first mate on Claude: a tool permission card is only
+    /// ever Claude's, whose approvals Privateer's allow rules reach. Any
+    /// other harness's report is a notice (see `src/restriction.rs`).
+    fn claude_mate(&self, name: &str) {
+        let mut profile = self.ok(name, "ship.show", json!({"name": name}));
+        profile["first_mate"]["manifest"] = json!("bundled:claude");
+        profile["first_mate"]["options"] = json!({"permission_mode": "acceptEdits"});
+        self.ok(name, "ship.put", profile);
+    }
+
     /// Put the harness its ships run on this machine's PATH, so machine
     /// readiness has nothing to tell the owner.
     fn ready(&self) {
@@ -6039,6 +6049,7 @@ fn a_malformed_closure_is_refused_once_and_not_sent_again() {
 fn a_relay_on_the_other_machine_joins_the_ask_at_the_desk_and_only_the_desks_allow_counts() {
     let (_temp, laptop, mac, ssh) = fixture();
     mac.ship("scout");
+    mac.claude_mate("fitforge");
     let linked = link(&laptop, &mac, &ssh);
     assert!(linked.status.success(), "{}", text(&linked));
     let rule = "Bash(apify run *)";
@@ -6126,6 +6137,7 @@ fn a_relay_on_the_other_machine_joins_the_ask_at_the_desk_and_only_the_desks_all
 #[test]
 fn the_captains_allow_to_an_ask_the_desk_never_held_is_applied_where_it_lives() {
     let (_temp, laptop, mac, ssh) = fixture();
+    mac.claude_mate("fitforge");
     let rule = "Bash(apify run *)";
     // Asked before the link, so the desk holds no copy of it.
     let asked = mac.ok(
@@ -6161,6 +6173,8 @@ fn the_captains_allow_to_an_ask_the_desk_never_held_is_applied_where_it_lives() 
 fn a_desk_copy_of_an_ask_no_rule_narrows_stays_its_own_card() {
     let (_temp, laptop, mac, ssh) = fixture();
     mac.ship("scout");
+    mac.claude_mate("fitforge");
+    mac.claude_mate("scout");
     let linked = link(&laptop, &mac, &ssh);
     assert!(linked.status.success(), "{}", text(&linked));
     let blocked = |ship: &str, task: &str, tool: &str, input: Value| {

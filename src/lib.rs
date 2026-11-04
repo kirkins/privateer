@@ -57,6 +57,7 @@ mod readiness;
 pub mod releases;
 mod reply;
 pub mod report;
+mod restriction;
 pub mod review;
 pub mod routes;
 pub mod scheduling;
