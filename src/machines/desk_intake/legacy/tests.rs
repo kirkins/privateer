@@ -154,12 +154,11 @@ fn cut_status_and_public_coverage_are_separate_dated_and_revocable() {
         &[(ALPHA.into(), vec!["survey".into()])],
     )
     .unwrap();
-    let context = crate::door::scoped::DelegatedContext::resolved(
-        uuid::Uuid::new_v4().to_string(),
-        "door:alpha".into(),
-        vec!["mail:read".into()],
-        None,
-    );
+    let context = crate::door::scoped::DelegatedContext::from_gateway(&json!({
+        "version":1,"client":uuid::Uuid::new_v4().to_string(),"resource":"door:alpha",
+        "scopes":["mail:read"],"ships":null,"result_id":uuid::Uuid::new_v4().to_string()
+    }))
+    .unwrap();
     let clock = Clock {
         session: "alpha",
         wall_ms: 1000,
