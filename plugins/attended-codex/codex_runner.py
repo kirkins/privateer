@@ -214,6 +214,13 @@ def accounting(value):
     return result
 
 
+def progress(value):
+    a = accounting(value)
+    accepted = max(s.get("accepted_through", 0) for s in value["sessions"].values())
+    if accepted > a["accepted_through"]:
+        a.update(accepted_through=accepted, declines=0, retry_after_ms=0)
+
+
 def lifecycle(state, record):
     """Independent durable forward cursor, even after a mail intent settles.
 
@@ -317,6 +324,16 @@ class Runner:
         """Read-only native evidence; no queue mutation and no enable path."""
         record = load(self.registry)
         session = exact_uuid(record["session"])
+        require(type(acknowledged_through) is int and acknowledged_through >= 0,
+                "invalid runtime acknowledgement")
+        # Runtime ack is independent positive evidence, even if the daemon is
+        # gone. No queue absence below is used as proof of non-admission.
+        if acknowledged_through:
+            value = self.ledger.read()
+            intent = value["sessions"].get(session, {}).get("intent")
+            if intent:
+                self.ledger.reconcile(session, intent["nonce"], {"data": [], "nextCursor": None},
+                                      acknowledged_through)
         try:
             with Daemon(record["codex_home"]) as daemon:
                 thread = daemon.call("thread/read", {"threadId": session})["thread"]
@@ -333,6 +350,7 @@ class Runner:
                 value = self.ledger.read()
                 a = accounting(value)
                 a.update(observation_lost=True, diagnostic="codex-native-evidence-unavailable")
+                progress(value)
                 save(self.ledger, value)
         return self.report(session, record)
 
@@ -358,9 +376,7 @@ class Runner:
                 # Retain the last known busy ID/start; disconnection is not idle.
                 a["observation_lost"] = True
                 a["diagnostic"] = "codex-native-evidence-unavailable"
-            progress = max(s.get("accepted_through", 0) for s in value["sessions"].values())
-            if progress > a["accepted_through"]:
-                a.update(accepted_through=progress, declines=0, retry_after_ms=0)
+            progress(value)
             save(self.ledger, value)
 
     def dispatch(self):

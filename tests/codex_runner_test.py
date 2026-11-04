@@ -240,6 +240,21 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["possibly_unattended_spent"], 1)
         self.assertFalse(result["busy"])
 
+    def test_covering_runtime_ack_settles_even_after_daemon_death(self):
+        self.runner.dispatch()
+        self.mutate(lambda v: v['runner'].update(declines=3))
+        self.daemon_process.kill()
+        self.daemon_process.wait()
+        result = self.runner.observe(acknowledged_through=1)
+        self.assertEqual(result['accepted_through'], 1)
+        self.assertEqual(result['decline_count'], 0)
+        self.assertEqual(result['possibly_unattended_spent'], 1)
+        self.assertNotEqual(result['diagnostic'], 'codex-uncertain-' + self.nonce)
+        state = self.runner.ledger.read()['sessions'][self.session]
+        self.assertEqual(state['intent']['state'], 'acked')
+        self.assertEqual(state['acknowledged_through'], 1)
+        self.assertFalse(result['report_eligible'])
+
     def test_three_invocations_exhaust_budget_even_with_real_progress_and_restart(self):
         for i in range(3):
             self.runner.dispatch()

@@ -954,7 +954,9 @@ Invocation follows this durable state machine:
    `invoking`/`uncertain` offer immediately exposes stable diagnostic
    `codex-uncertain-<nonce>`, with unchanged decline count; no five-minute wait.
    Exact queued evidence remains pending, exact promoted input advances receipt
-   progress, covering real ack settles independently. The runner issues no ack.
+   progress, covering real ack settles independently, including after daemon
+   death (ack reduction precedes connection). That progress resets the decline
+   spell but never refunds the turn budget. The runner issues no ack.
 2. `dispatch` requires native **legacy** history, exact UUID/cwd, loaded-list
    membership without pagination, an idle native snapshot, and an empty,
    non-paginated native queue. All daemon RPC and `ship.presence` calls precede
@@ -1046,7 +1048,8 @@ pane alive, independent start/executable substitution and FD cleanup, commit
 failure, expired/replaced holder, no enabled/B0-fence bypass, unsupported status,
 unloaded/pending queue and daemon replacement, exact argv/environment isolation,
 no RPC/wait under flock, observed escaped-descendant cleanup, lost response,
-receipt vs ack, restart, K=3, permanent cumulative budget, native abort/human
+receipt vs ack (including covering ack after daemon death), restart, K=3,
+permanent cumulative budget, native abort/human
 pause and stable busy/catch-up. The native C2 fixture is unchanged: it still
 qualifies daemon-side promotion without a TUI and exactly one captain-authorized
 loopback mock request, **not attachment or live operation of this runner**.
