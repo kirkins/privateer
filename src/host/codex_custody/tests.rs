@@ -183,6 +183,20 @@ fn codex_custody_prelock_poison_survives_timeout_and_cannot_be_renewed() {
     revoke(&f.custody.dir, "barrier").unwrap();
     assert_ne!(before, f.token());
     assert_eq!(f.held()["state"], "owned"); // Token, NOT cached state, is the fence.
+    let poison = read(&f.custody.dir.join("custody-poison.json")).unwrap();
+    assert_eq!(poison["record_update"], "failed");
+    assert!(
+        poison["record_error"]
+            .as_str()
+            .unwrap()
+            .contains("timed out")
+    );
+    assert!(
+        poison["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("may still say owned")
+    );
     drop(lock);
     f.observe().unwrap();
     f.assert_revoked();
@@ -347,6 +361,30 @@ fn codex_custody_supervision_loss_is_sticky_and_no_old_pid_reconstruction_exists
             .is_err()
     );
     assert_eq!(f.token(), token);
+}
+
+#[test]
+fn codex_custody_poison_failure_is_retryable_by_revoke_and_retire() {
+    for retire in [false, true] {
+        let mut f = Fixture::new();
+        f.observe().unwrap();
+        let before = f.token();
+        let path = f.custody.dir.join("custody-poison.json");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(f.custody.revoke("first_failed").is_err());
+        assert!(!f.custody.revoked);
+        fs::remove_dir(&path).unwrap();
+        if retire {
+            f.custody.retire("recovered");
+        } else {
+            f.custody.revoke("recovered").unwrap();
+        }
+        assert!(f.custody.revoked);
+        assert_ne!(before, f.token());
+        f.assert_revoked();
+        assert_eq!(read(&path).unwrap()["reason"], "recovered");
+    }
 }
 
 #[test]

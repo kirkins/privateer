@@ -62,6 +62,10 @@ fn atomic(dir: &Path, name: &str, value: &Value) -> Result<()> {
 }
 
 fn poison(dir: &Path, reason: &str) -> Result<()> {
+    poison_record(dir, reason, None)
+}
+
+fn poison_record(dir: &Path, reason: &str, error: Option<&str>) -> Result<()> {
     safe(dir, true)?;
     let path = dir.join("custody-poison.json");
     match safe(&path, false) {
@@ -75,7 +79,12 @@ fn poison(dir: &Path, reason: &str) -> Result<()> {
     atomic(
         dir,
         "custody-poison.json",
-        &json!({"token": uuid::Uuid::new_v4().to_string(), "reason": reason}),
+        &json!({"token": uuid::Uuid::new_v4().to_string(), "reason": reason,
+            // Written BEFORE the best-effort update: even an unwritable record
+            // or a supervisor crash leaves a durable availability diagnostic.
+            "record_update": if error.is_some() { "failed" } else { "not_confirmed" },
+            "record_error": error,
+            "diagnostic": "Custody revoked; custody.json may still say owned. Only the poison token is authoritative."}),
     )
 }
 
@@ -189,6 +198,13 @@ fn revoke(dir: &Path, reason: &str) -> Result<()> {
         // The durable poison is the safety boundary. A diagnostic rewrite must
         // not roll back attend/leave/handover and strand the presence lease.
         eprintln!("Codex custody poisoned ({reason}); record update failed: {error:#}");
+        // Publish a NEW revoked token, never rewrite a token read earlier: a
+        // pre-lock callback may already have replaced it. Failure here leaves
+        // the first poison (or a missing token), neither of which grants custody.
+        let detail: String = format!("{error:#}").chars().take(512).collect();
+        if let Err(error) = poison_record(dir, reason, Some(&detail)) {
+            eprintln!("Codex custody diagnostic persistence failed: {error:#}");
+        }
     }
     Ok(())
 }
@@ -328,10 +344,11 @@ impl Custody {
         if self.revoked {
             return Ok(());
         }
-        self.revoked = true;
         if self.held.is_some() {
             revoke(&self.dir, reason)?;
         }
+        // A failed poison write must remain retryable by observe/retire/Drop.
+        self.revoked = true;
         Ok(())
     }
 }
@@ -368,3 +385,42 @@ fn daemon(record: &Value, expected: &Value) -> Result<bool> {
 // Custody needs pidfd_open and /proc, so its tests run only where custody can exist.
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
+
+#[cfg(all(test, not(target_os = "linux")))]
+#[test]
+fn codex_custody_non_linux_refuses_without_changing_presence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join(".privateer")).unwrap();
+    fs::write(store.home().join("config.json"), br#"{"ship":"alpha"}"#).unwrap();
+    store
+        .connection()
+        .execute(
+            "INSERT INTO ships(name,record) VALUES('alpha','{\"location\":\"here\"}')",
+            [],
+        )
+        .unwrap();
+    crate::presence::attend(&store, "alpha", "host:alpha", 90, None).unwrap();
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let result = Custody::new(&child, tmp.path());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Codex custody requires Linux")
+    );
+    holder_changed(&store, "alpha").unwrap();
+    assert_eq!(
+        crate::presence::session(&store, "alpha")
+            .unwrap()
+            .unwrap()
+            .holder,
+        "host:alpha"
+    );
+    assert!(!tmp.path().join(".codex/privateer-attended").exists());
+}
