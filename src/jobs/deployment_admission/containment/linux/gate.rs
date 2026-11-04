@@ -4,6 +4,7 @@
 use super::*;
 
 mod elf;
+mod io;
 pub(super) mod sealed;
 mod spawn;
 use sealed::SealedExecutable;
@@ -14,7 +15,7 @@ pub(crate) use spawn::{RELEASE_OBSERVER, record_not_started_for_test, record_sta
 pub(super) struct ChildExec {
     gate: RawFd,
     executable: RawFd,
-    null: RawFd,
+    stdio: [RawFd; 3],
     argv: *const *const libc::c_char,
     env: *const *const libc::c_char,
     inputs: *const RawFd,
@@ -81,6 +82,7 @@ impl Qualified {
             args,
             &[CString::new("PRIVATEER_ADAPTER_PROTOCOL=1")?],
             &[],
+            None,
             timeout_ms,
         )
     }
@@ -92,6 +94,7 @@ impl Qualified {
         args: &[CString],
         environment: &[CString],
         inputs: &[File],
+        streams: Option<&[File; 3]>,
         timeout_ms: u64,
     ) -> Result<ExecGate<'_>> {
         ensure!(inputs.len() <= 17, "too many gate inputs");
@@ -136,6 +139,18 @@ impl Qualified {
                 .open("/dev/null")?
                 .as_raw_fd(),
         )?;
+        let stdio = match streams {
+            Some(fds) => [
+                duplicate(fds[0].as_raw_fd())?,
+                duplicate(fds[1].as_raw_fd())?,
+                duplicate(fds[2].as_raw_fd())?,
+            ],
+            None => [
+                duplicate(null.as_raw_fd())?,
+                duplicate(null.as_raw_fd())?,
+                duplicate(null.as_raw_fd())?,
+            ],
+        };
         let (input, output) = report_pipe()?;
         let (original_gate, release) = pipe()?;
         let gate = duplicate(original_gate.as_raw_fd())?;
@@ -156,10 +171,11 @@ impl Qualified {
                 .iter()
                 .map(|f| f.as_raw_fd()),
         )?;
+        check_sources(stdio.iter().map(AsRawFd::as_raw_fd))?;
         let child = ChildExec {
             gate: gate.as_raw_fd(),
             executable: native.as_raw_fd(),
-            null: null.as_raw_fd(),
+            stdio: std::array::from_fn(|i| stdio[i].as_raw_fd()),
             argv: argv.as_ptr(),
             env: env.as_ptr(),
             inputs: input_fds.as_ptr(),
@@ -248,8 +264,7 @@ impl ExecGate<'_> {
         cleanup_child(self.held, self.pid, &self.pidfd, boottime_ms)
     }
 
-    // Null IO only. The later supervisor must replace this bounded local wait.
-    fn wait(mut self) -> Result<i32> {
+    fn acknowledge_exec(&mut self) -> Result<()> {
         // CLOEXEC EOF acknowledges exec; an explicit errno acknowledges failure.
         // This is a separate short bound, capped by the existing runtime bound.
         let ack_deadline = self.deadline.min(boottime_ms()? + PROBE_MS);
@@ -276,6 +291,13 @@ impl ExecGate<'_> {
                 Err(e) => return Err(e.into()),
             }
         }
+        Ok(())
+    }
+
+    // Authority-free fixtures only; the consuming spawn uses bounded IO.
+    #[cfg(test)]
+    fn wait(mut self) -> Result<i32> {
+        self.acknowledge_exec()?;
         loop {
             self.check_deadline()?;
             let mut fd = libc::pollfd {
@@ -339,7 +361,7 @@ pub(super) unsafe fn prepare_child(exec: &ChildExec) {
             libc::_exit(123);
         }
         for fd in 0..3 {
-            if libc::dup2(exec.null, fd) < 0 {
+            if libc::dup2(exec.stdio[fd as usize], fd) < 0 {
                 libc::_exit(123);
             }
         }

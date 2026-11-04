@@ -88,6 +88,42 @@ impl Claim {
         self.proof.check_pause()
     }
 
+    // Final release check: a committed grant pause/revoke must be visible even
+    // after the earlier home transaction. File pause is the LAST observation.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn check_release(&self, store: &Store) -> Result<()> {
+        let value = self.used.value();
+        let (revision, paused, revoked): (i64, Option<i64>, Option<i64>) =
+            store.connection().query_row(
+                "SELECT revision,paused_ms,revoked_ms FROM standing_deploy_grants WHERE id=?1",
+                [crate::store::required(value, "grant_id")?],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+        anyhow::ensure!(
+            Some(revision) == value["grant_revision"].as_i64()
+                && paused.is_none()
+                && revoked.is_none(),
+            "final deployment grant lifecycle check refused"
+        );
+        self.check_pause()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn protocol_input(&self) -> Result<(std::fs::File, Value)> {
+        let value = self.used.value();
+        Ok((
+            self.proof.artifact_file()?,
+            json!({
+                "schema_version":1, "claim":self.binding(),
+                "grant_id":value["grant_id"], "grant_revision":value["grant_revision"],
+                "environment":value["environment"], "task_id":value["task_id"],
+                "commit":value["commit"],
+                "artifact":{"sha256":value["artifact"]["sha256"],
+                    "size_bytes":value["artifact"]["size_bytes"]}
+            }),
+        ))
+    }
+
     // Called only when the final pause read refused BEFORE any release write.
     // No current authority is needed to preserve an abort after revocation.
     // Failure leaves the conservative started custody, never a replay token.
@@ -131,7 +167,7 @@ impl Claim {
             "deployment.release_refused",
             json!({
             "claim":self.binding(), "outcome":outcome,
-            "reason":"final emergency pause check refused", "release_attempted":false,
+            "reason":"final deployment release check refused", "release_attempted":false,
             "cleanup_proven_empty":empty, "capacity_retained":true,
             "containment_scope":"attempt_cgroup_only",
             "limitation":"outside_ipc_delegation_not_excluded"}),
