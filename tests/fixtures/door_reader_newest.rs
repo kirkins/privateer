@@ -87,6 +87,65 @@ fn scoped_reader_newest_snapshot_filters_and_sparse_ack_gaps() {
 }
 
 #[test]
+fn scoped_reader_lookup_acks_reserve_oldest_progress() {
+    for lookup in [json!({"order":"newest"}), json!({"from":"alpha"}), json!({"kind":"notice"})] {
+        let fleet = Fleet::with_ships(&[("alpha", true), ("beta", false)]);
+        delegated_adapter(&fleet);
+        let (_, token) = delegated_issue(&fleet, "reader", "mail:read", None);
+        let db = rusqlite::Connection::open(fleet.home("alpha").join("privateer.sqlite")).unwrap();
+        let supervisor = fleet.supervise();
+        fleet.wait("lookup reserve hello", |e| e.first().cloned());
+        let mut acknowledged = 0;
+        // Two cycles acknowledge 256 lookup rows in total, recovering the
+        // reserve between cycles rather than permanently filling sparse state.
+        for round in 0..2 {
+            let gap = format!("gap-{round}");
+            db.execute("INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms)
+                VALUES(?1,'beta','captain','reply','Fixture','{}','normal',0)", [&gap]).unwrap();
+            db.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<129)
+                INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms)
+                SELECT ?1||x,'alpha','captain','notice','Fixture','{}','normal',0 FROM n;",
+                [format!("tail-{round}-")]).unwrap();
+            let mut args = json!({"ship":"alpha"});
+            args.as_object_mut().unwrap().extend(lookup.as_object().unwrap().clone());
+            for limit in [50, 50, 28] {
+                args["limit"] = json!(limit);
+                let page = delegated_ok(&fleet, &token, "inbox", args.clone());
+                assert_eq!(page["items"].as_array().unwrap().len(), limit);
+                assert!(page["items"].as_array().unwrap().iter().all(|i| i["mail"]["id"] != gap));
+                delegated_ok(&fleet, &token, "ack", json!({"ship":"alpha","refs":reader_refs(&page)}));
+                acknowledged += limit;
+                args["continuation"] = page["continuation"].clone();
+                assert!(args["continuation"].is_string());
+            }
+            // Further sparse acknowledgments must stop at the half-window,
+            // not consume the slots needed by an oldest read (even elsewhere).
+            args["limit"] = json!(1);
+            credential_request(&fleet, &token, "inbox", args, "reader_window_full");
+            let other_id = format!("other-{round}");
+            reader_mail(&fleet, "beta", &other_id, None);
+            let other = delegated_ok(&fleet, &token, "inbox", json!({"ship":"beta"}));
+            assert_eq!(other["items"].as_array().unwrap().len(), 1);
+            assert_eq!(other["items"][0]["mail"]["id"], other_id);
+            delegated_ok(&fleet, &token, "ack", json!({"ship":"beta","refs":reader_refs(&other)}));
+            // Oldest reads must still serve both unread rows, without
+            // ReaderFull, gaps or duplicates, then compact the sparse acks.
+            let remaining = if lookup["order"] == "newest" { 1 } else { 129 };
+            for id in [gap, format!("tail-{round}-{remaining}")] {
+                let page = delegated_ok(&fleet, &token, "inbox", json!({"ship":"alpha","limit":1}));
+                assert_eq!(page["items"].as_array().unwrap().len(), 1);
+                assert_eq!(page["items"][0]["mail"]["id"], id);
+                delegated_ok(&fleet, &token, "ack", json!({"ship":"alpha","refs":reader_refs(&page)}));
+            }
+            let empty = delegated_ok(&fleet, &token, "inbox", json!({"ship":"alpha"}));
+            assert!(empty["items"].as_array().unwrap().is_empty());
+        }
+        assert_eq!(acknowledged, 256);
+        stop(supervisor);
+    }
+}
+
+#[test]
 fn scoped_reader_newest_pages_past_window_without_ack_and_survives_restart() {
     let fleet = Fleet::with_ships(&[("alpha", true), ("beta", false)]);
     delegated_adapter(&fleet);

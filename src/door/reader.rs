@@ -420,9 +420,10 @@ fn page(
             more = true;
             break;
         }
-        // Reserve half the window for inbox progress, so sparse show/thread
-        // acknowledgments cannot fill every slot behind an unseen gap.
-        let bound = if command == Command::Inbox {
+        // Only unfiltered oldest inbox pages necessarily serve the next gap.
+        // Reserve half the window for that progress: sparse lookups, show and
+        // thread acknowledgments must not consume every slot ahead of it.
+        let bound = if command == Command::Inbox && !lookup {
             WINDOW
         } else {
             WINDOW / 2

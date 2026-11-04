@@ -816,6 +816,8 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(tool.annotations.read_only_hint)
                 self.assertIn("local arrival order", tool.description)
                 self.assertIn("not source-authored time", tool.description)
+                self.assertIn("Acknowledged mail is hidden in both orders", tool.description)
+                self.assertIn("newest unacknowledged", tool.description)
                 self.assertIn("not every report from that sender fleet-wide", tool.description)
                 oldest = await self.tool(client, "mail_inbox", {"ship": "alpha"})
                 explicit = await self.tool(client, "mail_inbox", {"ship": "alpha", "order": "oldest"})

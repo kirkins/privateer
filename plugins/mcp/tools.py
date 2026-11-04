@@ -274,6 +274,7 @@ TOOLS = {
         "from": STRING, "kind": STRING}, ["ship"]),
                    "Page incoming captain mail in the selected local or reachable linked mailbox; listing does not acknowledge or mark read. "
                    "Order defaults to oldest; newest means local arrival order in this mailbox, not source-authored time. "
+                   "Acknowledged mail is hidden in both orders: newest from a sender means newest unacknowledged. "
                    "Optional from (exact sender address) and kind filters apply within this authorized mailbox, not every report from that sender fleet-wide. "
                    "Pages freeze an upper sequence snapshot, excluding later arrivals. Repeat the same order/filters on continuation. "
                    "Newest or filtered continuations are single-use; reuse or changed order/filters returns continuation_invalid. "
