@@ -5,8 +5,9 @@ use serde_json::{Value, json};
 use std::os::unix::fs::PermissionsExt;
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
@@ -79,6 +80,44 @@ fn response_script(result: &str) -> String {
 fn private(path: &Path, value: Value) {
     fs::write(path, value.to_string()).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// Run the real Codex adapter for a role the fixture's store cannot create,
+/// such as a reviewer that the dispatch layer marks from its review records.
+fn codex_response(f: &Fixture, options: Value, role: &str) -> Value {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/codex/adapter.py");
+    let request = json!({
+        "id": "network-option",
+        "version": 1,
+        "method": "command",
+        "options": options,
+        "context": {
+            "task_id": "task",
+            "title": "Fix a real task",
+            "repo": f.repo,
+            "role": role,
+            "control": {"cli_argv": ["privateer", "--home", f.store.home()], "writable": []},
+        },
+    });
+    let mut child = Command::new(support::python())
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 #[test]
@@ -212,6 +251,7 @@ fn native_harness_plans_and_brief_are_generic_and_lean() {
         json!({"sandbox":"unrestricted"}),
         json!({"ephemeral":"true"}),
         json!({"web_search":"always"}),
+        json!({"network":"true"}),
     ] {
         let mut args = f.args(&example("codex"));
         args["options"] = invalid;
@@ -254,6 +294,74 @@ fn native_harness_plans_and_brief_are_generic_and_lean() {
     );
     // This launch is crew, so the brief offers no first-mate commands.
     assert!(!brief["brief"].as_str().unwrap().contains("peer.call"));
+}
+
+#[test]
+fn codex_network_option_is_opt_in_and_limited_to_workspace_write() {
+    let mut f = Fixture::new();
+    let flag = "sandbox_workspace_write.network_access=true";
+
+    let mut args = f.args(&example("codex"));
+    args["options"] = json!({"sandbox":"workspace-write","network":true});
+    let command = plugins::dispatch(&mut f.store, "plugin.command", args).unwrap();
+    let argv = command["argv"].as_array().unwrap();
+    assert!(
+        argv.windows(2).any(|p| p[0] == "-c" && p[1] == flag),
+        "{argv:?}"
+    );
+    assert_eq!(argv.iter().filter(|v| *v == flag).count(), 1, "{argv:?}");
+    assert!(argv.iter().any(|v| v == "exec"), "{argv:?}");
+
+    // The same -c pair belongs before the resumed session id in headless runs.
+    let id = "46a81234-1234-4567-8123-123456789abc";
+    let mut args = f.args(&example("codex"));
+    args["options"] = json!({"sandbox":"workspace-write","network":true,"resume":id});
+    let command = plugins::dispatch(&mut f.store, "plugin.command", args).unwrap();
+    let argv = command["argv"].as_array().unwrap();
+    let pair = argv
+        .windows(2)
+        .position(|p| p[0] == "-c" && p[1] == flag)
+        .unwrap();
+    let resume = argv.iter().position(|v| v == "resume").unwrap();
+    assert!(pair < resume, "{argv:?}");
+    assert_eq!(argv[resume + 1], id);
+
+    // Absent or false changes nothing for an otherwise identical plan.
+    let mut plain = f.args(&example("codex"));
+    plain["options"] = json!({"sandbox":"workspace-write"});
+    let plain = plugins::dispatch(&mut f.store, "plugin.command", plain).unwrap();
+    let mut off = f.args(&example("codex"));
+    off["options"] = json!({"sandbox":"workspace-write","network":false});
+    let off = plugins::dispatch(&mut f.store, "plugin.command", off).unwrap();
+    assert_eq!(plain["argv"], off["argv"]);
+    assert!(
+        !plain["argv"].as_array().unwrap().iter().any(|v| v == flag),
+        "{plain:?}"
+    );
+
+    // Network needs an effective workspace-write sandbox and no yolo.
+    for options in [
+        json!({"sandbox":"read-only","network":true}),
+        json!({"sandbox":"danger-full-access","network":true}),
+        json!({"network":true}),
+        json!({"sandbox":"workspace-write","network":true,"yolo":true}),
+    ] {
+        let mut args = f.args(&example("codex"));
+        args["options"] = options.clone();
+        assert!(
+            plugins::dispatch(&mut f.store, "plugin.command", args).is_err(),
+            "{options}"
+        );
+    }
+
+    // The reviewer override forces read-only, so network is refused there too,
+    // even when the route asked for workspace-write.
+    let response = codex_response(
+        &f,
+        json!({"sandbox":"workspace-write","network":true}),
+        "reviewer",
+    );
+    assert_eq!(response["ok"], false, "{response}");
 }
 
 #[test]
