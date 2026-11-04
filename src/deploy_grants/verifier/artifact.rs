@@ -78,6 +78,11 @@ impl Seal {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn file(&self) -> &File {
+        &self.file
+    }
+
     pub(super) fn digest(&self) -> &str {
         &self.sha256
     }

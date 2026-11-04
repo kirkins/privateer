@@ -88,6 +88,48 @@ fn native_static_fixture_is_accepted_without_a_loader_exception() {
 }
 
 #[test]
+fn mode_0500_sealed_memfd_execveat_needs_no_cgroup_delegation() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("alpha.c");
+    let binary = root.path().join("alpha");
+    std::fs::write(&source, "int main(void) { return 42; }\n").unwrap();
+    assert!(
+        std::process::Command::new("cc")
+            .args(["-static", "-O2", "-o"])
+            .arg(&binary)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file = File::open(binary).unwrap();
+    let executable = SealedExecutable::copy(&file, &sealed::digest(&file).unwrap()).unwrap();
+    assert_eq!(executable.file().metadata().unwrap().mode() & 0o777, 0o500);
+    let argv = [c"alpha".as_ptr(), std::ptr::null()];
+    let env = [std::ptr::null::<libc::c_char>()];
+    let blocked = super::super::signals::Blocked::new().unwrap();
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        unsafe {
+            libc::syscall(
+                libc::SYS_execveat,
+                executable.file().as_raw_fd(),
+                c"".as_ptr(),
+                argv.as_ptr(),
+                env.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            );
+            libc::_exit(127);
+        }
+    }
+    drop(blocked);
+    assert!(pid > 0);
+    let status = finish_child(pid, &child_pidfd(pid));
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 42);
+}
+
+#[test]
 fn setup_child_exit_is_eof_not_the_runtime_deadline() {
     let (mut input, output) = report_pipe().unwrap();
     let pid = unsafe { libc::fork() };
@@ -319,14 +361,21 @@ fn acknowledgement_deadline_is_not_extended_by_available_data() {
 
 #[test]
 fn real_gate_rechecks_boundary_and_rejects_scripts_before_clone() {
-    let Some(mut held) = isolated_boundary() else {
-        return;
-    };
     // Raw files cannot enter gate() at all; the sealed constructor must
     // reject scripts before any child or containment operation.
     let temp = tempfile::tempfile().unwrap();
     (&temp).write_all(b"#!/bin/false\n").unwrap();
-    assert!(SealedExecutable::copy(&temp, &"0".repeat(64)).is_err());
+    temp.set_len(128).unwrap();
+    assert!(
+        SealedExecutable::copy(&temp, &sealed::digest(&temp).unwrap())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("not a script")
+    );
+    let Some(mut held) = isolated_boundary() else {
+        return;
+    };
     assert!(!held.cleanup_unknown);
     open_at(&held.directory, c"pids.max", libc::O_WRONLY)
         .unwrap()

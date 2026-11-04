@@ -4,7 +4,8 @@
 use super::*;
 
 mod elf;
-mod sealed;
+pub(super) mod sealed;
+mod spawn;
 use sealed::SealedExecutable;
 
 pub(super) struct ChildExec {
@@ -13,6 +14,8 @@ pub(super) struct ChildExec {
     null: RawFd,
     argv: *const *const libc::c_char,
     env: *const *const libc::c_char,
+    inputs: *const RawFd,
+    input_count: usize,
 }
 
 struct ExecGate<'a> {
@@ -62,14 +65,33 @@ fn read_ack(report: &mut File, bytes: &mut [u8], deadline: u64) -> Result<()> {
 }
 
 impl Qualified {
-    // Intentionally private even to the rest of the crate. Only authority-free
-    // fixtures call this. Immutable executable bytes are not a claim proof.
+    // Authority-free fixtures use the same policy, without supporting inputs.
+    #[cfg(test)]
     fn gate(
         &mut self,
         executable: &SealedExecutable,
         args: &[CString],
         timeout_ms: u64,
     ) -> Result<ExecGate<'_>> {
+        self.gate_with(
+            executable,
+            args,
+            &[CString::new("PRIVATEER_ADAPTER_PROTOCOL=1")?],
+            &[],
+            timeout_ms,
+        )
+    }
+
+    // Only the consuming spawn and authority-free fixtures may construct this.
+    fn gate_with(
+        &mut self,
+        executable: &SealedExecutable,
+        args: &[CString],
+        environment: &[CString],
+        inputs: &[File],
+        timeout_ms: u64,
+    ) -> Result<ExecGate<'_>> {
+        ensure!(inputs.len() <= 17, "too many gate inputs");
         ensure!(
             (1..=3_600_000).contains(&timeout_ms),
             "invalid gate timeout"
@@ -119,13 +141,20 @@ impl Qualified {
             .map(|arg| arg.as_ptr())
             .chain([std::ptr::null()])
             .collect();
-        let env = [c"PRIVATEER_ADAPTER_PROTOCOL=1".as_ptr(), std::ptr::null()];
+        let env: Vec<_> = environment
+            .iter()
+            .map(|e| e.as_ptr())
+            .chain([std::ptr::null()])
+            .collect();
+        let input_fds: Vec<_> = inputs.iter().map(AsRawFd::as_raw_fd).collect();
         let child = ChildExec {
             gate: gate.as_raw_fd(),
             executable: native.as_raw_fd(),
             null: null.as_raw_fd(),
             argv: argv.as_ptr(),
             env: env.as_ptr(),
+            inputs: input_fds.as_ptr(),
+            input_count: input_fds.len(),
         };
         let mut pidfd = -1i32;
         let args = CloneArgs {
@@ -274,7 +303,20 @@ pub(super) unsafe fn prepare_child(exec: &ChildExec) {
                 libc::_exit(123);
             }
         }
-        if libc::syscall(libc::SYS_close_range, 7u32, u32::MAX, 0) < 0 {
+        for index in 0..exec.input_count {
+            // All source fds are >=64, so no earlier destination clobbers a
+            // later source. Only immutable declared inputs survive exec.
+            if libc::dup3(*exec.inputs.add(index), 7 + index as i32, 0) < 0 {
+                libc::_exit(123);
+            }
+        }
+        if libc::syscall(
+            libc::SYS_close_range,
+            7u32 + exec.input_count as u32,
+            u32::MAX,
+            0,
+        ) < 0
+        {
             libc::_exit(123);
         }
     }

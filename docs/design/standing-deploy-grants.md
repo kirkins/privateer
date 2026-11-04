@@ -840,7 +840,59 @@ conditions are not runtime-qualified by this slice; immutable bytes do not
 establish either assumption. Refusing known loader paths alone cannot rule out
 a renamed loader, and this memfd primitive has no configured source pathname.
 
-### b2c-b2b child-gate contract (supervisor not implemented here)
+### b2c-b2b-iii-b2b: consuming spawn contract (dormant)
+
+This slice consumes both process-local `Handoff` and fresh `Claim` exactly once.
+No command, dispatcher, restart hook, production path or artifact/metadata IO is
+added. B3 still owns the bounded IO protocol and six scenarios. Until then the
+spawn can execute only with null standard streams; it supplies no deployment
+metadata/artifact protocol bytes. The pinned configuration may itself contain
+credentials, so null IO is not a sandbox or a claim that a trusted adapter cannot
+contact a service. There is no dispatched caller or enabled deployment executor.
+
+The claim retains its fresh verifier proof and exact home identity. Preparation
+copies the adapter executable, every declared supporting input and optional
+private config from those held inodes into sealed memfds, checking each digest
+against the claim's configuration snapshot. The executable additionally passes
+native static ELF validation on the same sealed fd. Supporting file arguments
+are rewritten to explicit child `/proc/self/fd/N` paths; only these sealed input
+fds survive exec, with a fixed private-config variable when configured. The
+adapter must support these explicit descriptors, not infer sibling files or
+ambient paths. No arbitrary caller digest or argv is accepted by spawn.
+
+Spawn checks the complete original host record, current dispatcher identity,
+canonical hold key/incarnation, same home/ship/task/charter and admitted timeout.
+A gated child receives no artifact or deployment metadata. Under the home writer
+lock, the fresh claim, current authority, evidence age, all original input seals
+and emergency pause are checked again. The exact same bounded custody JSON binds
+the immutable use digest, claim, complete original hold, timeout, adapter binding,
+sealed input digests, real payload identity and cgroup identity in both ledgers.
+The host CAS and append-only custody record commit first; the home started
+transition, append-only custody record and audit commit second, before release.
+This is deliberately not an atomic cross-database commit. Partial writes,
+failures or crashes retain capacity and require inspection, never token recovery,
+refund or automatic replay. Gate acknowledgement is not evidence of remote
+success. Even a normal local wait status and proven cgroup emptiness retain the
+started records and capacity; no terminal deployment outcome is written here.
+B3 must retain these records and add bounded stream/outcome handling.
+
+Ordinary tests exercise sealed support/config copies, production fresh-claim
+rechecks (pause, missing pause, task/charter/grant changes, stale identity,
+configuration changes and audit rollback), exact host-hold comparison, and host
+CAS/custody rollback plus append-only reopen. The production claim tests re-exec
+with private fleet/resource/XDG state instead of touching captain configuration.
+An explicit `PRIVATEER_TEST_CGROUP_DELEGATION` additionally exercises the sole
+spawn, sealed input descriptors at exec, identical cross-ledger records and a
+host-insert/home-commit failure. Without that opt-in the tests assert qualification
+refusal; passing ordinary CI does not prove positive cgroup containment or the
+cross-ledger partial-commit subprocess scenarios.
+
+PR 712 follow-ups precede spawn: a padded script with its real digest must reach
+the explicit script policy refusal; an unprivileged fork/execveat test must prove
+the mode-0500 executable memfd works without cgroup delegation. Executable memfd
+creation requests `MFD_EXEC` on supporting kernels and falls back only on EINVAL.
+
+### b2c-b2b child-gate contract (bounded IO supervisor not implemented here)
 
 Prepare and verify the private pinned adapter before giving it deployment
 metadata or artifact bytes. The adapter inherits the verifier's launch contract:
@@ -858,7 +910,7 @@ no `PT_INTERP`, so neither a shebang, dynamic loader nor ambient PATH resolution
 may substitute another executable. No credentials or deployment metadata belong
 in argv or ambient env.
 
-The sole spawn method (still unimplemented) consumes `Handoff` and a fresh,
+The sole dormant spawn method consumes `Handoff` and a fresh,
 nonserializable `Claim`. B2b must retain the exact immutable adapter/configuration
 binding and all supporting inputs; the b2a executable token alone is insufficient.
 It must compare the entire durable host hold again and bind its canonical key,

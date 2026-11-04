@@ -8,10 +8,34 @@ use std::os::unix::fs::FileExt;
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 const SEALS: i32 = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
 
-pub(super) struct SealedExecutable(File);
+pub(crate) struct SealedExecutable(SealedInput);
 
 impl SealedExecutable {
-    pub(super) fn copy(source: &File, expected_sha256: &str) -> Result<Self> {
+    pub(crate) fn copy(source: &File, expected_sha256: &str) -> Result<Self> {
+        let sealed = SealedInput::copy_with(source, expected_sha256, MAX_BYTES, true)?;
+        elf::validate(sealed.file())?;
+        Ok(Self(sealed))
+    }
+
+    pub(crate) fn file(&self) -> &File {
+        self.0.file()
+    }
+}
+
+/// Immutable supporting/config bytes; never an executable or claim token.
+pub(crate) struct SealedInput(File);
+
+impl SealedInput {
+    pub(crate) fn copy(source: &File, expected_sha256: &str, limit: u64) -> Result<Self> {
+        Self::copy_with(source, expected_sha256, limit, false)
+    }
+
+    fn copy_with(
+        source: &File,
+        expected_sha256: &str,
+        limit: u64,
+        executable: bool,
+    ) -> Result<Self> {
         ensure!(
             expected_sha256.len() == 64
                 && expected_sha256
@@ -21,15 +45,25 @@ impl SealedExecutable {
         );
         let metadata = source.metadata()?;
         ensure!(
-            metadata.is_file() && (64..=MAX_BYTES).contains(&metadata.len()),
+            metadata.is_file()
+                && ((if executable { 64 } else { 0 })..=limit).contains(&metadata.len()),
             "sealed executable source size/type refused"
         );
-        let fd = unsafe {
+        // MFD_EXEC (Linux 6.3) avoids an implicit F_SEAL_EXEC under
+        // vm.memfd_noexec=1. Only EINVAL permits the older-kernel fallback.
+        let flags = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
+        let mut fd = unsafe {
             libc::memfd_create(
                 c"privateer-adapter".as_ptr(),
-                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+                flags | if executable { 0x10 } else { 0 },
             )
         };
+        if executable
+            && fd < 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
+        {
+            fd = unsafe { libc::memfd_create(c"privateer-adapter".as_ptr(), flags) };
+        }
         ensure!(fd >= 0, "executable memfd unavailable");
         let mut copy = unsafe { File::from_raw_fd(fd) };
         let mut bytes = [0; 65_536];
@@ -43,16 +77,16 @@ impl SealedExecutable {
                 break;
             }
             offset += n as u64;
-            ensure!(offset <= MAX_BYTES, "sealed executable exceeds bound");
+            ensure!(offset <= limit, "sealed input exceeds bound");
             copy.write_all(&bytes[..n])?;
         }
         ensure!(
-            unsafe { libc::fchmod(fd, 0o500) } == 0,
+            unsafe { libc::fchmod(fd, if executable { 0o500 } else { 0o400 }) } == 0,
             "executable memfd permission refused"
         );
         ensure!(
             unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, SEALS) } == 0
-                && unsafe { libc::fcntl(fd, libc::F_GET_SEALS) } == SEALS,
+                && unsafe { libc::fcntl(fd, libc::F_GET_SEALS) } & SEALS == SEALS,
             "executable memfd sealing refused"
         );
         // Both checks MUST follow sealing, and inspect exactly the fd that is
@@ -61,16 +95,15 @@ impl SealedExecutable {
             digest(&copy)? == expected_sha256,
             "sealed executable digest mismatch"
         );
-        elf::validate(&copy)?;
         Ok(Self(copy))
     }
 
-    pub(super) fn file(&self) -> &File {
+    pub(crate) fn file(&self) -> &File {
         &self.0
     }
 }
 
-fn digest(file: &File) -> Result<String> {
+pub(crate) fn digest(file: &File) -> Result<String> {
     let mut hash = Sha256::new();
     let mut bytes = [0; 65_536];
     let mut offset = 0;
