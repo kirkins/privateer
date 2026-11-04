@@ -875,7 +875,11 @@ inside the SQLite writer transaction. Fixed order is **SQLite writer (when
 needed) -> project flock**; poison removal/file+parent fsync/publication comes
 before flock. There is no SQLite acquisition, daemon/report RPC, child wait or
 reap under flock. A lock timeout may leave the old record saying `owned`, but its
-old token is already unusable. Same-holder live renewal and stale leave do not
+old token is already unusable. Once poison is durable, flock or diagnostic
+`custody.json` read/rewrite failures are logged and **do not abort presence**:
+attend, leave and handover still commit. Only poison persistence failure aborts
+revocation. A stale `owned` record is not authorization without its matching
+unrevoked token. Same-holder live renewal and stale leave do not
 rotate custody. Projects without launch/custody state are untouched. A failed
 transaction may conservatively leave custody revoked; it never rolls poison
 back or discards receipts. Revocation failures do not abandon a running native
@@ -915,7 +919,15 @@ initial publication after poison, sticky supervision loss, holder replacement,
 handover/release and harmless stale leave. Python covers wrong-UUID pre-lock
 poison in the real dispatcher and direct path, daemon change, exact B5a migration,
 attribution-ID mismatch in scan/legacy recovery, lifecycle seeding and queue-ID
-change. These are custody/reducer tests, **not runner spawn-barrier evidence**.
+change. Round-2 regression coverage holds the real project flock through its
+timeout during attend, leave and handover, then reopens SQLite to verify each
+presence change committed while the stale `owned` record remains poisoned. A
+malformed custody record exercises the same post-poison best-effort boundary;
+an unsafe poison path instead proves all three presence changes roll back.
+Home-context comparison resolves both paths canonically, accepting a symlink
+alias of the same home while refusing a different home. Store's existing
+symlink-policy checks are unchanged. The non-Linux pidfd build fix is retained.
+These are custody/reducer tests, **not runner spawn-barrier evidence**.
 Real supervisor-crash recovery, before/after final-spawn barriers, lost queue
 responses, same-UUID second client, idle navigation, PTY draft preservation,
 K=3/busy accounting and live qualification remain B5c/C activation gates.

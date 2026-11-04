@@ -175,14 +175,22 @@ pub(crate) fn holder_changed(store: &Store, ship: &str) -> Result<()> {
 fn revoke(dir: &Path, reason: &str) -> Result<()> {
     // The sticky token is already unusable even if flock/registry update fails.
     poison(dir, reason)?;
-    let _lock = lock(dir)?;
-    if !dir.join("custody.json").try_exists()? {
-        return Ok(());
+    let update = || -> Result<()> {
+        let _lock = lock(dir)?;
+        if !dir.join("custody.json").try_exists()? {
+            return Ok(());
+        }
+        let mut custody = read(&dir.join("custody.json"))?;
+        custody["state"] = json!("revoked");
+        custody["reason"] = json!(reason);
+        atomic(dir, "custody.json", &custody)
+    };
+    if let Err(error) = update() {
+        // The durable poison is the safety boundary. A diagnostic rewrite must
+        // not roll back attend/leave/handover and strand the presence lease.
+        eprintln!("Codex custody poisoned ({reason}); record update failed: {error:#}");
     }
-    let mut custody = read(&dir.join("custody.json"))?;
-    custody["state"] = json!("revoked");
-    custody["reason"] = json!(reason);
-    atomic(dir, "custody.json", &custody)
+    Ok(())
 }
 
 /// Only constructed by the hosted supervisor while it owns the unreaped Child.
@@ -259,7 +267,9 @@ impl Custody {
             record["hosted"] == true
                 && record["holder"] == holder
                 && record["ship"] == ship
-                && record["home"] == store.home().to_string_lossy().as_ref(),
+                && fs::canonicalize(record["home"].as_str().context("Codex custody home")?)
+                    .context("resolve Codex custody home")?
+                    == fs::canonicalize(store.home()).context("resolve Privateer home")?,
             "Codex custody launch context mismatch"
         );
         let exe = executable(self.pid)?;

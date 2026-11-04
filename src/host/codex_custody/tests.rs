@@ -180,12 +180,7 @@ fn codex_custody_prelock_poison_survives_timeout_and_cannot_be_renewed() {
     f.observe().unwrap();
     let before = f.token();
     let lock = lock(&f.custody.dir).unwrap();
-    assert!(
-        revoke(&f.custody.dir, "barrier")
-            .unwrap_err()
-            .to_string()
-            .contains("timed out")
-    );
+    revoke(&f.custody.dir, "barrier").unwrap();
     assert_ne!(before, f.token());
     assert_eq!(f.held()["state"], "owned"); // Token, NOT cached state, is the fence.
     drop(lock);
@@ -222,6 +217,117 @@ fn codex_custody_handover_and_release_revoke_in_the_writer_transaction() {
         }
         f.assert_revoked();
     }
+}
+
+#[test]
+fn codex_custody_presence_commits_after_poison_despite_record_update_failure() {
+    for blocked_lock in [false, true] {
+        for action in ["attend", "leave", "hand_over"] {
+            let mut f = Fixture::new();
+            f.observe().unwrap();
+            let before = f.token();
+            let guard = if blocked_lock {
+                Some(lock(&f.custody.dir).unwrap())
+            } else {
+                // A malformed record cannot be diagnostically rewritten, but
+                // must not prevent the independently durable poison fencing it.
+                fs::write(f.custody.dir.join("custody.json"), b"{").unwrap();
+                None
+            };
+            match action {
+                "attend" => {
+                    crate::presence::attend(&f.store, "alpha", "host:new", 90, None).unwrap();
+                }
+                "leave" => {
+                    assert!(crate::presence::leave(&f.store, "alpha", "host:alpha").unwrap());
+                }
+                "hand_over" => {
+                    assert!(
+                        crate::presence::hand_over(&f.store, "alpha", "host:alpha", "host:new")
+                            .unwrap()
+                    );
+                }
+                _ => unreachable!(),
+            }
+            // Reopen the database: this is committed presence, not just the
+            // transaction's uncommitted view while the project flock is held.
+            let reopened = Store::open(f.store.home()).unwrap();
+            let presence = crate::presence::session(&reopened, "alpha").unwrap();
+            if action == "leave" {
+                assert!(presence.is_none());
+            } else {
+                assert_eq!(presence.unwrap().holder, "host:new");
+            }
+            assert_ne!(before, f.token());
+            assert_eq!(
+                read(&f.custody.dir.join("custody-poison.json")).unwrap()["reason"],
+                "holder_changed"
+            );
+            if blocked_lock {
+                assert_eq!(f.held()["state"], "owned");
+                assert_ne!(f.held()["token"], f.token());
+            }
+            assert!(live(&f.custody.fd).unwrap());
+            drop(guard);
+        }
+    }
+}
+
+#[test]
+fn codex_custody_poison_failure_still_aborts_presence_change() {
+    for action in ["attend", "leave", "hand_over"] {
+        let mut f = Fixture::new();
+        f.observe().unwrap();
+        let path = f.custody.dir.join("custody-poison.json");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap(); // Unsafe poison path: cannot persist revocation.
+        let result = match action {
+            "attend" => {
+                crate::presence::attend(&f.store, "alpha", "host:new", 90, None).map(|_| ())
+            }
+            "leave" => crate::presence::leave(&f.store, "alpha", "host:alpha").map(|_| ()),
+            "hand_over" => {
+                crate::presence::hand_over(&f.store, "alpha", "host:alpha", "host:new").map(|_| ())
+            }
+            _ => unreachable!(),
+        };
+        assert!(result.is_err());
+        let reopened = Store::open(f.store.home()).unwrap();
+        assert_eq!(
+            crate::presence::session(&reopened, "alpha")
+                .unwrap()
+                .unwrap()
+                .holder,
+            "host:alpha"
+        );
+        fs::remove_dir(path).unwrap();
+    }
+}
+
+#[test]
+fn codex_custody_home_comparison_resolves_symlink_alias_and_refuses_other_home() {
+    let mut f = Fixture::new();
+    let alias = f._tmp.path().join("home-alias");
+    symlink(f.store.home(), &alias).unwrap();
+    f.record["home"] = json!(alias);
+    f.save();
+    f.observe().unwrap();
+    assert_eq!(f.held()["state"], "owned");
+    assert_eq!(f.held()["delivery_enabled"], false);
+    f.observe().unwrap();
+    assert_eq!(f.held()["state"], "owned");
+
+    let mut other = Fixture::new();
+    other.record["home"] = json!(f.store.home());
+    other.save();
+    assert!(
+        other
+            .observe()
+            .unwrap_err()
+            .to_string()
+            .contains("launch context mismatch")
+    );
+    assert!(!other.custody.dir.join("custody.json").exists());
 }
 
 #[test]
