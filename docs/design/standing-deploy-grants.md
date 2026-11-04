@@ -681,6 +681,16 @@ They never suggest the pre-handoff-only `resource.recover force:true` path.
 Observation retains the record and capacity. Ordinary reservations and unchanged
 pre-handoff deployment holds retain their existing recovery suggestions.
 
+### b2c-b2b-i: PR 694 refinements before a child gate
+
+The approved three-way split keeps this slice to the updated contract below and
+the dashboard inspection-only rendering regression. Slice b2c-b2b-ii will add the
+Linux qualification/child-gate module with real-kernel probe and refusal tests;
+b2c-b2b-iii will add the consuming spawn, exact claim/hold bindings, bounded
+supervisor and six fake adapters. All three remain dormant: no dispatcher,
+command registration, restart hook or activation. No containment implementation
+or real-kernel qualification is claimed by this contract/UI slice.
+
 ### b2c-b2b child-gate contract (supervisor not implemented here)
 
 Prepare and verify the private pinned adapter before giving it deployment
@@ -706,34 +716,78 @@ requires inspection, not replay. No spawn closure may bypass these checks.
 Hash the actual artifact stream delivered to the adapter and hash its observed
 stdout/stderr streams incrementally. Bound protocol metadata, artifact bytes,
 combined stdout/stderr, retained diagnostics and per-iteration IO work; a child
-that writes continuously must not starve deadline checks. Use nonblocking IO and
-the admitted hard deadline measured on `std::time::Instant` (monotonic), never
-`Store::now_ms` wall time. Clock changes must neither extend nor shorten runtime.
-Cleanup has its own bounded monotonic deadline; no unbounded wait/reap or external
-`ps` is permitted on either path. Protocol/stream mismatch or partial delivery
-never implies a successful remote deployment.
+that writes continuously must not starve deadline checks. Exceeding any IO or
+protocol bound terminates the attempt through cgroup cleanup and records failure
+(or unknown if cleanup cannot prove emptiness), never success. Use nonblocking IO
+and the admitted hard deadline measured on Linux `CLOCK_BOOTTIME`, never
+`Store::now_ms` wall time. Suspend **counts** toward both runtime and the separate
+bounded cleanup deadline; `std::time::Instant`/`CLOCK_MONOTONIC` alone is not
+sufficient because it stops during suspend on Linux. Clock changes must neither
+extend nor shorten runtime. No unbounded wait/reap or external `ps` is permitted
+on either path. Protocol/stream mismatch or partial delivery never implies a
+successful remote deployment.
 
 **Positive containment choice:** Linux cgroup v2, a dedicated per-attempt cgroup
 with kernel-enforced membership inherited across fork, double-fork, setsid and
-reparenting. The child must join it before executing the adapter. A supported
-activation environment must provide a trusted, pinned cgroup delegation and
-prevent adapter-initiated migration outside the attempt's subtree; merely having
-a writable `cgroup.procs` path is not a containment qualification. Same-account
-workflow controls alone do not establish that migration restriction. Unsupported
-platforms, missing delegation/controller support, or unqualified migration
-restrictions refuse activation before executing the adapter. Never fall back to
-process-group signals, descendant sampling or "wrapper disappeared" as proof.
+reparenting. The concrete qualifying mechanism is a trusted, pinned cgroup2
+mount with `nsdelegate`, and `clone3(CLONE_INTO_CGROUP | CLONE_NEWCGROUP)` using
+the held attempt-directory fd. The child is born in that cgroup, with a new
+cgroup namespace rooted there, **before** executing the adapter. The kernel floor
+is Linux 5.14 (`cgroup.kill`; `CLONE_INTO_CGROUP` itself needs 5.7); a version
+string is not a substitute for probing the required operations. An unprivileged
+launcher also needs an appropriately qualified user namespace for
+`CLONE_NEWCGROUP`; if unavailable it refuses, not a weaker join-after-fork path.
+The adapter must have no privilege to change the enclosing cgroup mount or
+namespace boundary: drop capabilities and set no-new-privileges before exec.
+No inherited namespace/mount/control fds may cross exec.
+
+Qualification runs an authority-free disposable child under the **same** launch
+credentials, namespaces and fd policy as the adapter. Verify the mount's cgroup2
+identity and `nsdelegate` option, the child's actual cgroup namespace root and
+membership, and kernel rejection (`ENOENT`) of a probe moving that child through
+a deliberately supplied outside-namespace ancestor `cgroup.procs` fd. The probe
+fd must be usable by the supervisor and closed before adapter exec; a DAC-only
+`EACCES` refusal does not prove namespace containment. Also exercise `cgroup.kill`
+and bounded `populated 0` observation on the held probe cgroup. An unexpectedly
+successful migration fails qualification; retain the probe's pidfd for bounded
+termination even outside the probe cgroup. Probe children receive no metadata,
+artifact bytes or credentials. Repeat qualification against the held attempt
+boundary before any real adapter launch; never trust a cached pathname or a
+boolean supplied by configuration.
+
+Set and verify a finite `pids.max` before creating either probe or adapter
+children so a fork storm cannot outrun cleanup. Missing controllers, rejected
+clone flags, unavailable namespace privileges, or any inconclusive probe refuse
+activation **before executing the adapter**, with a bounded reason recorded.
+Merely having a writable `cgroup.procs` path, kernel version, or same-account
+workflow convention is not qualification. Unsupported platforms refuse as well.
+Never fall back to process-group signals, descendant sampling or "wrapper
+disappeared" as proof.
 
 Before releasing authority, durably record the cgroup identity together with the
 payload's kernel process identity and the exact claim/hold binding. Cleanup
 writes `cgroup.kill` and proves `populated 0` via `cgroup.events` on that same held
 cgroup within its cleanup deadline. Failure to kill, read, match identity or
 prove emptiness retains capacity and records an unknown outcome, even if the
-leader exited successfully. Only a kill-and-empty proof establishes local
-payload absence; it never proves remote rollback or remote outcome. An escaped
-or unprovable payload is durably recorded, never automatically re-run, and never
-released by pre-handoff recovery. A supervisor crash leaves its persisted cgroup
-custody for explicit later inspection; no restart launch hook is added here.
+leader exited successfully. A kill-and-empty proof establishes **only absence of
+processes in the attempt cgroup**; it never proves whole-host payload absence,
+remote rollback or remote outcome. An escaped or unprovable payload is durably
+recorded, never automatically re-run, and never released by pre-handoff recovery.
+A supervisor crash leaves its persisted cgroup custody for explicit later
+inspection; no restart launch hook is added here.
+
+**Explicit pinned-adapter trust assumption:** this slice does not isolate all IPC
+channels to already-running outside processes. The reviewed pinned adapter must
+not delegate local work to an outside service (for example a user service manager,
+D-Bus activation, a pre-existing terminal server, or an at/cron daemon). Cgroup
+namespace containment does not prevent those handoffs. Every recorded outcome,
+including success with proven cgroup emptiness, must carry the containment scope
+`attempt_cgroup_only` and the limitation `outside_ipc_delegation_not_excluded`.
+These are durable custody facts, not optional diagnostics. A known or suspected
+outside handoff records unknown outcome and retains capacity for inspection;
+kill-and-empty cannot discharge that custody. A malicious pinned adapter or
+violated IPC trust assumption is outside this slice's local absence guarantee;
+stronger sandboxing and qualification are required before claiming otherwise.
 
 Fake subprocess fixtures must cover success, failure, hard-deadline hang,
 oversized output, identity mismatch before authority, and an immediate
@@ -744,8 +798,11 @@ where a real, qualified delegated cgroup-v2 subtree is available. Elsewhere,
 including CI and macOS, the test must assert activation refusal and record that
 the environment is unqualified, not substitute fake containment.
 
-PR 691 follow-ups also require stale `deployment-handoff` reservations to be
-presented as unknown outcomes needing inspection, not as actionable
+PR 691/694 follow-ups also require stale `deployment-handoff` reservations to be
+presented as "inspection required, outcome unknown, capacity retained", including
+in the dashboard's stuck-capacity detail. Preserve their bounded reason/outcome,
+show no blank command and offer no recovery instruction for inspection-only
+holds, even alongside ordinary actionable reservations. Never turn them into
 `resource.recover force:true` suggestions. A host writer-lock failure before any
 handoff write should return pre-handoff custody to its caller for explicit
 compensation or retry; failures at/after a write or commit remain conservatively
