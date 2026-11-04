@@ -63,6 +63,12 @@ def options_for(harness, options, value, role=None):
     if value["mode"] != "yolo":
         return options
     if harness == "codex":
+        # The fleet's bypass already grants network access, so a route's
+        # network request is redundant there. Drop it so the launch does not
+        # look like a route that set yolo and network together; a route that
+        # set yolo itself keeps network so the adapter refuses the conflict.
+        if not options.get("yolo"):
+            options.pop("network", None)
         options.pop("sandbox", None)
         options["yolo"] = True
     elif harness in ("claude", "grok") and not (harness == "grok" and options.get("mode", "headless") == "headless"):
