@@ -126,6 +126,8 @@ pub fn init(store: &Store) -> Result<()> {
     for (column, declaration) in [
         ("approvals_digest", "TEXT"),
         ("approvals_ids", "TEXT"),
+        // The current harness's approval pickup, including an in-pane refresh.
+        ("approvals_loaded_ms", "INTEGER"),
         ("approvals_refresh_pid", "INTEGER"),
         ("approvals_refreshed_ms", "INTEGER"),
         ("authorizations_digest", "TEXT"),

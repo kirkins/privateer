@@ -1,0 +1,865 @@
+//! Runtime receipts for explicitly one-time approvals. A launch is not a
+//! receipt, nor is an agent's report: only a successful exact retry recorded
+//! by the hosted harness after it carried the grant can retire it. This is
+//! the same workflow trust boundary as the runtime's refusal watcher, not OS
+//! isolation against a process that writes its own transcript or database.
+use super::*;
+use std::path::Path;
+
+pub(super) fn is_once(conn: &Connection, id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM captain_approvals WHERE id=?1 AND one_time=1)",
+        [id],
+        |r| r.get(0),
+    )?)
+}
+
+pub(super) fn used(conn: &Connection, id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM captain_approvals WHERE id=?1 AND one_time=1 AND used_ms IS NOT NULL)",
+        [id], |r| r.get(0),
+    )?)
+}
+
+// Include process identity and the byte-exact carried set in the fence. A
+// refreshed pane cannot lend its new approvals to a result of the old one.
+type Pane = (i64, String, i64, String, String);
+fn pane(store: &Store, ship: &str) -> Result<Option<Pane>> {
+    Ok(store
+        .connection()
+        .query_row(
+            "SELECT pid,started,approvals_loaded_ms,approvals_ids,session_id FROM hosted_panes
+         WHERE ship=?1 AND approvals_ids IS NOT NULL AND approvals_loaded_ms IS NOT NULL
+           AND session_id IS NOT NULL AND session_id<>''",
+            [ship],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?)
+}
+
+/// Called by the runtime's hosted-pane watcher, never exposed as an agent
+/// command. Unreadable or ambiguous evidence leaves the slot occupied.
+pub(crate) fn observe_retries(
+    store: &Store,
+    ship: &str,
+    projects: &Path,
+    folder: &Path,
+) -> Result<()> {
+    let now = Store::now_ms();
+    let rows: Vec<Row> = live(store, ship, now)?
+        .into_iter()
+        .filter(|r| r.one_time)
+        .collect();
+    let Some(before) = pane(store, ship)? else {
+        return Ok(());
+    };
+    let carried: Vec<String> = serde_json::from_str(&before.3).unwrap_or_default();
+    if !rows.iter().any(|r| carried.contains(&r.id)) {
+        return Ok(());
+    }
+    // Never pick the newest interactive conversation in the folder: it may
+    // be the captain's. Only the lease-fenced hosted harness names this ID.
+    if !before
+        .4
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Ok(());
+    }
+    let dir = projects.join(crate::host::claude_project_name(folder));
+    if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+        return Ok(());
+    }
+    let path = dir.join(format!("{}.jsonl", before.4));
+    let previous = checkpoint(store, ship)?;
+    let fence = crate::core::hash(&json!(before));
+    let mut saved: Saved = previous
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .filter(|s: &Saved| s.fence == fence)
+        .unwrap_or_else(|| Saved {
+            fence,
+            cursor: Default::default(),
+        });
+    let Some(scan) =
+        crate::claude_denials::receipts::read(&path, folder, &before.4, &mut saved.cursor)
+    else {
+        return Ok(());
+    };
+    let next = serde_json::to_string(&saved)?;
+    if previous.as_deref() == Some(&next) {
+        return Ok(());
+    }
+    record_retries(
+        store,
+        ship,
+        &before,
+        &scan,
+        Some((previous.as_deref(), &next)),
+    )
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Saved {
+    fence: String,
+    cursor: crate::claude_denials::receipts::Cursor,
+}
+
+fn checkpoint(store: &Store, ship: &str) -> Result<Option<String>> {
+    Ok(store
+        .connection()
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [format!("captain_approval_cursor:{ship}")],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+fn record_retries(
+    store: &Store,
+    ship: &str,
+    before: &Pane,
+    scan: &crate::claude_denials::Scan,
+    progress: Option<(Option<&str>, &str)>,
+) -> Result<()> {
+    let tx = store.write_transaction()?;
+    if pane(store, ship)?.as_ref() != Some(before) {
+        return Ok(());
+    }
+    if let Some((old, _)) = progress
+        && checkpoint(store, ship)?.as_deref() != old
+    {
+        return Ok(());
+    }
+    // Authority can change during transcript I/O or while waiting for the
+    // writer. Re-read grants and time under that same lock as their receipts.
+    let now = Store::now_ms();
+    let rows: Vec<Row> = live(store, ship, now)?
+        .into_iter()
+        .filter(|r| r.one_time)
+        .collect();
+    let carried: Vec<String> = serde_json::from_str(&before.3).unwrap_or_default();
+    for denial in &scan.denials {
+        let (Some(session), Some(passed_session), Some(started), Some(passed), Some(call)) = (
+            denial["session"].as_str(),
+            denial["passed_session"].as_str(),
+            denial["passed_started_ms"].as_i64(),
+            denial["passed_ms"].as_i64(),
+            denial["passed_use_id"].as_str(),
+        ) else {
+            continue;
+        };
+        if session.is_empty()
+            || session != passed_session
+            || scan.session.as_deref() != Some(session)
+            || session != before.4
+            || started < before.2
+            || passed < started
+            || passed > now
+            || call.is_empty()
+            || denial["tool_name"] != "Bash"
+            || denial["classifier"] != true
+        {
+            continue;
+        }
+        let Some(head) = denial["tool_input"]["command"]
+            .as_str()
+            .and_then(command_head)
+        else {
+            continue;
+        };
+        let evidence = crate::core::hash(
+            &json!({"transcript": scan.transcript, "session": session, "call": call}),
+        );
+        let recorded: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM captain_approvals WHERE evidence=?1)",
+            [&evidence],
+            |r| r.get(0),
+        )?;
+        if recorded {
+            continue;
+        }
+        for row in &rows {
+            if !carried.contains(&row.id)
+                || state(&tx, row, now) != "live"
+                || row.created_ms > before.2
+                || started <= row.created_ms
+                || passed >= row.expires_ms
+                || denial["denied_ms"]
+                    .as_i64()
+                    .is_none_or(|ms| ms >= row.created_ms)
+                || !row.prefix.as_deref().is_some_and(|p| covers(p, &head))
+            {
+                continue;
+            }
+            // The frozen request must still be the one that granted this
+            // ship/task/prefix. Never infer once from old TTL rows.
+            let request: Option<String> = tx
+                .query_row(
+                    "SELECT payload FROM mail WHERE id=?1 AND sender=?2 AND task_id=?3",
+                    params![row.request, ship, row.task],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let valid = request
+                .and_then(|p| serde_json::from_str::<Value>(&p).ok())
+                .is_some_and(|p| {
+                    p["approves"]["one_time"] == true
+                        && p["approves"]["action"].as_str() == Some(&row.action)
+                        && p["approves"]["command_prefix"].as_str() == row.prefix.as_deref()
+                });
+            if !valid {
+                continue;
+            }
+            if tx.execute(
+                "UPDATE captain_approvals SET used_ms=?2,evidence=?3
+                 WHERE id=?1 AND one_time=1 AND used_ms IS NULL",
+                params![row.id, passed, evidence],
+            )? == 1
+            {
+                store.audit(
+                    "permissions.approval_used",
+                    &json!({"id":row.id,"ship":ship,
+                    "task":row.task,"request":row.request,"used_ms":passed,"evidence":evidence,
+                    "pane_pid":before.0,"pane_started":before.1}),
+                )?;
+                break; // One executed call never retires two approvals.
+            }
+        }
+    }
+    if let Some((_, next)) = progress {
+        tx.execute(
+            "INSERT INTO metadata(key,value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![format!("captain_approval_cursor:{ship}"), next],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{dispatch, store::FrozenWallClock};
+
+    fn base() -> i64 {
+        crate::routes::iso_timestamp_ms("2026-10-20T00:00:00.000Z").unwrap()
+    }
+
+    fn fixture() -> (tempfile::TempDir, Store) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&temp.path().join("home")).unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        dispatch(
+            &mut store,
+            "charter.put",
+            json!({"id":"gamma","objective":"Publish beta","repo":repo,"min_free_bytes":0}),
+        )
+        .unwrap();
+        dispatch(
+            &mut store,
+            "task.create",
+            json!({"id":"beta","charter_id":"gamma","owner":"alpha","title":"Publish beta"}),
+        )
+        .unwrap();
+        dispatch(
+            &mut store,
+            "ship.put",
+            json!({"name":"alpha","scope":"Publish beta"}),
+        )
+        .unwrap();
+        (temp, store)
+    }
+
+    fn grant(store: &Store, n: usize, once: bool) -> Value {
+        let id = format!("alpha-{n}");
+        let ask = json!({"id":id,"from":"alpha","to":"captain","kind":"request","task_id":"beta",
+            "state":"open","payload":{"approves":{"action":"Publish beta","command_prefix":"make release","one_time":once}}});
+        store.connection().execute(
+            "INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state)
+             VALUES(?1,'alpha','captain','request','beta','Publish beta',?2,'normal',?3,'open')",
+            params![id,ask["payload"].to_string(),base()],
+        ).unwrap();
+        record(
+            store,
+            &ask,
+            &format!("gamma-{n}"),
+            "yes",
+            &json!({"operator":true}),
+            base() + 3000,
+            None,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn pane_with(store: &Store, ids: &[&str]) {
+        store.connection().execute(
+            "INSERT OR REPLACE INTO hosted_panes(ship,pid,started,executable,recorded_ms,approvals_ids,approvals_loaded_ms,session_id)
+             VALUES('alpha',123,'alpha','alpha',?1,?2,?1,'alpha')", params![base()+4000,json!(ids).to_string()],
+        ).unwrap();
+    }
+
+    fn transcript(
+        folder: &Path,
+        projects: &Path,
+        command: &str,
+        session: &str,
+        passed_second: u8,
+        error: bool,
+    ) {
+        let dir = projects.join(crate::host::claude_project_name(folder));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut out = String::new();
+        for (id, sec, failed, session) in [
+            ("alpha", 1, true, "alpha"),
+            ("beta", passed_second, error, session),
+        ] {
+            let at = format!("2026-10-20T00:00:{sec:02}.000Z");
+            let call = json!({"cwd":folder,"entrypoint":"cli","type":"assistant","sessionId":session,"timestamp":at,
+                "message":{"content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":command}}]}});
+            let result = json!({"cwd":folder,"entrypoint":"cli","type":"user","sessionId":session,"timestamp":at,
+                "message":{"content":[{"type":"tool_result","tool_use_id":id,"is_error":failed,
+                "content":if failed {"Permission for this action was denied by the Claude Code auto mode classifier"} else {"Published beta"}}]}});
+            out.push_str(&format!("{call}\n{result}\n"));
+        }
+        std::fs::write(dir.join("beta.tmp"), out).unwrap();
+        std::fs::rename(dir.join("beta.tmp"), dir.join("alpha.jsonl")).unwrap();
+    }
+
+    #[test]
+    fn runtime_receipt_frees_only_the_used_once_slot_and_survives_restart() {
+        let _clock = FrozenWallClock::at(base() + 10000);
+        let (temp, mut store) = fixture();
+        let once = grant(&store, 0, true);
+        for n in 1..MAX_LIVE {
+            grant(&store, n, false);
+        }
+        let id = once["id"].as_str().unwrap();
+        assert_eq!(
+            live(&store, "alpha", Store::now_ms()).unwrap().len(),
+            MAX_LIVE
+        );
+        let projects = temp.path().join("projects");
+        let folder = temp.path().canonicalize().unwrap();
+        pane_with(&store, &[id]);
+        // Pickup is not use. Neither can an agent's command free this slot.
+        store.set_caller(Caller::Agent {
+            actor: "alpha".into(),
+        });
+        for command in [
+            "captain_approval.consume",
+            "captain_approval.revoke",
+            "approval.consume",
+        ] {
+            assert!(
+                dispatch(
+                    &mut store,
+                    command,
+                    json!({"id":id,"task_id":"beta","artifact":"beta","environment":"gamma"})
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            live(&store, "alpha", Store::now_ms()).unwrap().len(),
+            MAX_LIVE
+        );
+        store.set_caller(Caller::Operator);
+        for (command, session, sec, error, carried) in [
+            ("make release", "alpha", 6, false, false), // not carried
+            ("make releasex", "alpha", 6, false, true), // not the prefix
+            ("make release", "gamma", 6, false, true),  // another session
+            ("make release", "alpha", 2, false, true),  // before grant
+            ("make release", "alpha", 6, true, true),   // refused again
+        ] {
+            let ids = if carried { vec![id] } else { vec![] };
+            pane_with(&store, &ids);
+            transcript(&folder, &projects, command, session, sec, error);
+            observe_retries(&store, "alpha", &projects, &folder).unwrap();
+            assert!(!used(store.connection(), id).unwrap());
+        }
+        pane_with(&store, &[id]);
+        transcript(&folder, &projects, "make release", "alpha", 6, false);
+        // Exercise the production watcher integration, not a marking API.
+        crate::automode::alert_in(
+            &store,
+            &[("alpha".into(), "alpha".into(), String::new())],
+            Some(&projects),
+        )
+        .unwrap();
+        assert!(used(store.connection(), id).unwrap());
+        assert_eq!(
+            live(&store, "alpha", Store::now_ms()).unwrap().len(),
+            MAX_LIVE - 1
+        );
+        assert!(
+            !recent(&store, "alpha", Store::now_ms())
+                .unwrap()
+                .iter()
+                .any(|r| r.id == id)
+        );
+        let shown = described(
+            &store,
+            &select(store.connection(), "id=?1", [id], "id").unwrap(),
+            Store::now_ms(),
+        )
+        .unwrap();
+        assert_eq!(shown[0]["state"], "used");
+        assert_eq!(shown[0]["one_time"], true);
+        assert_eq!(shown[0]["used_ms"], base() + 6000);
+        assert!(grant(&store, MAX_LIVE, true)["recorded"] == true);
+        assert_eq!(
+            live(&store, "alpha", Store::now_ms()).unwrap().len(),
+            MAX_LIVE
+        );
+        let home = store.home().to_path_buf();
+        drop(store);
+        let mut store = Store::open(&home).unwrap();
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        let count: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM audit WHERE kind='permissions.approval_used'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            live(&store, "alpha", Store::now_ms()).unwrap().len(),
+            MAX_LIVE
+        );
+        let standing = live(&store, "alpha", Store::now_ms())
+            .unwrap()
+            .into_iter()
+            .find(|r| !r.one_time)
+            .unwrap()
+            .id;
+        dispatch(
+            &mut store,
+            "captain_approval.revoke",
+            json!({"id":standing}),
+        )
+        .unwrap();
+        assert_eq!(
+            live(&store, "alpha", Store::now_ms()).unwrap().len(),
+            MAX_LIVE - 1
+        );
+    }
+
+    #[test]
+    fn pre_once_home_remains_readable_and_upgrades_without_inventing_once() {
+        let _clock = FrozenWallClock::at(base() + 10000);
+        let (_temp, store) = fixture();
+        let alpha = grant(&store, 0, false);
+        store
+            .connection()
+            .execute_batch(
+                "ALTER TABLE captain_approvals DROP COLUMN one_time;
+             ALTER TABLE captain_approvals DROP COLUMN used_ms;
+             ALTER TABLE captain_approvals DROP COLUMN evidence;",
+            )
+            .unwrap();
+        let home = store.home().to_path_buf();
+        drop(store);
+        let readonly = Store::open_readonly(&home, Caller::Operator).unwrap();
+        let rows = live(&readonly, "alpha", Store::now_ms()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].one_time);
+        assert_eq!(rows[0].used_ms, None);
+        drop(readonly);
+        let store = Store::open(&home).unwrap();
+        assert!(!is_once(store.connection(), alpha["id"].as_str().unwrap()).unwrap());
+        assert_eq!(live(&store, "alpha", Store::now_ms()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn interim_table_migrates_receipts_without_schema_growth_or_replay() {
+        let _clock = FrozenWallClock::at(base() + 10000);
+        let (temp, store) = fixture();
+        let alpha = grant(&store, 0, true);
+        let beta = grant(&store, 1, true);
+        let gamma = grant(&store, 2, false);
+        let ids = [alpha["id"].as_str().unwrap(), beta["id"].as_str().unwrap()];
+        pane_with(&store, &ids);
+        let projects = temp.path().join("projects");
+        let folder = temp.path().canonicalize().unwrap();
+        transcript(&folder, &projects, "make release", "alpha", 6, false);
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        let expected = select(store.connection(), "1", [], "id").unwrap();
+        let used_id = expected
+            .iter()
+            .find(|r| r.used_ms.is_some())
+            .unwrap()
+            .id
+            .clone();
+        let evidence: String = store
+            .connection()
+            .query_row(
+                "SELECT evidence FROM captain_approvals WHERE id=?1",
+                [&used_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let schema_entries: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        // Reconstruct the interim on-disk format, not just an empty old home.
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TABLE captain_approval_once(
+               approval_id TEXT PRIMARY KEY REFERENCES captain_approvals(id),
+               used_ms INTEGER, evidence TEXT);
+             INSERT INTO captain_approval_once SELECT id,used_ms,evidence
+               FROM captain_approvals WHERE one_time=1;
+             ALTER TABLE captain_approvals DROP COLUMN one_time;
+             ALTER TABLE captain_approvals DROP COLUMN used_ms;
+             ALTER TABLE captain_approvals DROP COLUMN evidence;",
+            )
+            .unwrap();
+        let home = store.home().to_path_buf();
+        drop(store);
+        // Observation must still understand the interim format without migration.
+        let readonly = Store::open_readonly(&home, Caller::Operator).unwrap();
+        assert_eq!(live(&readonly, "alpha", Store::now_ms()).unwrap().len(), 2);
+        drop(readonly);
+        assert!(Store::open_existing_action(&home, Caller::Operator).is_err());
+        for _ in 0..2 {
+            let store = Store::open(&home).unwrap();
+            let rows = select(store.connection(), "1", [], "id").unwrap();
+            for (before, after) in expected.iter().zip(&rows) {
+                assert_eq!(before.id, after.id);
+                assert_eq!(before.one_time, after.one_time);
+                assert_eq!(before.used_ms, after.used_ms);
+            }
+            assert_eq!(rows.len(), expected.len());
+            assert!(!is_once(store.connection(), gamma["id"].as_str().unwrap()).unwrap());
+            let kept: String = store
+                .connection()
+                .query_row(
+                    "SELECT evidence FROM captain_approvals WHERE id=?1",
+                    [&used_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(kept, evidence);
+            let entries: i64 = store
+                .connection()
+                .query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                entries, schema_entries,
+                "interim table and index must be gone"
+            );
+            // Force historical evidence to be read again: its receipt still
+            // cannot retire the second overlapping, as-yet unused approval.
+            store
+                .connection()
+                .execute(
+                    "DELETE FROM metadata WHERE key='captain_approval_cursor:alpha'",
+                    [],
+                )
+                .unwrap();
+            observe_retries(&store, "alpha", &projects, &folder).unwrap();
+            assert_eq!(live(&store, "alpha", Store::now_ms()).unwrap().len(), 2);
+            let audits: i64 = store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM audit WHERE kind='permissions.approval_used'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(audits, 1);
+        }
+        assert!(Store::open_existing_action(&home, Caller::Operator).is_ok());
+    }
+
+    #[test]
+    fn cursor_survives_restart_and_reads_only_new_bytes_before_retiring() {
+        use std::io::Write;
+        let _clock = FrozenWallClock::at(base() + 10000);
+        let (temp, store) = fixture();
+        let alpha = grant(&store, 0, true);
+        let id = alpha["id"].as_str().unwrap();
+        pane_with(&store, &[id]);
+        let projects = temp.path().join("projects");
+        let folder = temp.path().canonicalize().unwrap();
+        transcript(&folder, &projects, "make release", "alpha", 6, false);
+        let path = projects
+            .join(crate::host::claude_project_name(&folder))
+            .join("alpha.jsonl");
+        let all = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = all.split_inclusive('\n').collect();
+        // Tick one: refusal only, no success yet.
+        let first = lines[..2].concat();
+        let retry = lines[2..].concat();
+        std::fs::write(&path, &first).unwrap();
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        assert!(!used(store.connection(), id).unwrap());
+        let saved: Saved =
+            serde_json::from_str(&checkpoint(&store, "alpha").unwrap().unwrap()).unwrap();
+        assert_eq!(saved.cursor.end, first.len() as u64);
+        assert_eq!(saved.cursor.read_bytes, 0); // Test-only metric is not persisted.
+        let home = store.home().to_path_buf();
+        drop(store);
+        let store = Store::open(&home).unwrap();
+        let mut saved: Saved =
+            serde_json::from_str(&checkpoint(&store, "alpha").unwrap().unwrap()).unwrap();
+        crate::claude_denials::receipts::read(&path, &folder, "alpha", &mut saved.cursor).unwrap();
+        assert_eq!(saved.cursor.read_bytes, 0); // No historical bytes on tick two.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(retry.as_bytes())
+            .unwrap();
+        crate::claude_denials::receipts::read(&path, &folder, "alpha", &mut saved.cursor).unwrap();
+        assert_eq!(saved.cursor.read_bytes, retry.len());
+        // Production observer uses the persisted refusal and the new retry.
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        assert!(used(store.connection(), id).unwrap());
+    }
+
+    #[test]
+    fn foreign_interactive_session_cannot_retire_the_hosted_panes_grant() {
+        let _clock = FrozenWallClock::at(base() + 10000);
+        let (temp, store) = fixture();
+        let alpha = grant(&store, 0, true);
+        let id = alpha["id"].as_str().unwrap();
+        pane_with(&store, &[id]);
+        let projects = temp.path().join("projects");
+        let folder = temp.path().canonicalize().unwrap();
+        transcript(&folder, &projects, "make release", "alpha", 6, false);
+        let dir = projects.join(crate::host::claude_project_name(&folder));
+        let alpha_path = dir.join("alpha.jsonl");
+        let foreign = std::fs::read_to_string(&alpha_path)
+            .unwrap()
+            .replace("\"sessionId\":\"alpha\"", "\"sessionId\":\"gamma\"");
+        std::fs::rename(&alpha_path, dir.join("beta.tmp")).unwrap();
+        std::fs::write(dir.join("gamma.jsonl"), &foreign).unwrap();
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        assert!(!used(store.connection(), id).unwrap());
+        // Even under the expected filename, foreign records are not evidence.
+        std::fs::write(&alpha_path, &foreign).unwrap();
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        assert!(!used(store.connection(), id).unwrap());
+        // No recorded session is ambiguous, never an invitation to guess.
+        store
+            .connection()
+            .execute("UPDATE hosted_panes SET session_id=NULL", [])
+            .unwrap();
+        transcript(&folder, &projects, "make release", "alpha", 6, false);
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        assert!(!used(store.connection(), id).unwrap());
+        pane_with(&store, &[id]);
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        assert!(used(store.connection(), id).unwrap());
+    }
+
+    #[test]
+    fn cap_yes_tells_captain_and_agent_the_holders_without_recording_a_grant() {
+        let _clock = FrozenWallClock::at(base() + 10000);
+        let (_temp, mut store) = fixture();
+        for n in 0..MAX_LIVE {
+            grant(&store, n, false);
+        }
+        let denied = grant(&store, MAX_LIVE, true);
+        assert_eq!(denied["recorded"], false);
+        let sent = dispatch(&mut store, "mail.send", json!({"from":"captain","to":"alpha","kind":"reply","correlation":"alpha-8","body":"yes"})).unwrap();
+        assert_eq!(sent["payload"]["approval"]["recorded"], false);
+        let body:String=store.connection().query_row(
+            "SELECT body FROM mail WHERE recipient='captain' AND kind='notice' AND json_extract(payload,'$.type')='approval_unavailable'",
+            [],|r|r.get(0)).unwrap();
+        assert!(
+            body.contains("cap is 8")
+                && body.contains("8 live")
+                && body.contains("Publish beta")
+                && body.contains("expires")
+                && body.contains("privateer permissions approvals revoke ID"),
+            "{body}"
+        );
+        for row in live(&store, "alpha", Store::now_ms()).unwrap() {
+            assert!(body.contains(&row.id));
+        }
+        let mut payload = json!({"approves":{"action":"Publish beta","command_prefix":"make release","one_time":true}});
+        let error = declare(
+            &store,
+            "beta",
+            "alpha",
+            "captain",
+            "request",
+            None,
+            Some("beta"),
+            &mut payload,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, body);
+        store
+            .connection()
+            .execute(
+                "UPDATE captain_approvals SET action=?1 WHERE request_id='alpha-0'",
+                ["beta ".repeat(25)],
+            )
+            .unwrap();
+        let shortened = capacity_notice(&store, "alpha", Store::now_ms())
+            .unwrap()
+            .unwrap();
+        assert!(shortened.contains(&format!("{}… (expires", "beta ".repeat(18))));
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM captain_approvals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 8);
+        let id = live(&store, "alpha", Store::now_ms()).unwrap()[0]
+            .id
+            .clone();
+        dispatch(&mut store, "captain_approval.revoke", json!({"id":id})).unwrap();
+        assert_eq!(live(&store, "alpha", Store::now_ms()).unwrap().len(), 7);
+        // A standing TTL approval remains live until its TTL, independently
+        // of a matching successful retry (only once rows can be retired).
+        drop(_clock);
+        let _expired = FrozenWallClock::at(base() + DEFAULT_TTL_SECS as i64 * 1000 + 3001);
+        assert!(live(&store, "alpha", Store::now_ms()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_in_pane_refresh_records_pickup_after_the_original_pane_started() {
+        let clock = FrozenWallClock::at(base() + 4000);
+        let (temp, store) = fixture();
+        let alpha = grant(&store, 0, true);
+        let id = alpha["id"].as_str().unwrap();
+        pane_with(&store, &[]);
+        store.connection().execute(
+            "UPDATE hosted_panes SET pid=?1,recorded_ms=?2,approvals_loaded_ms=NULL WHERE ship='alpha'",
+            params![std::process::id(), base()],
+        ).unwrap();
+        let set = launch_set(&store, "alpha", Store::now_ms()).unwrap();
+        crate::host::upgrade::record_approvals(&store, "alpha", &set, true, &json!({})).unwrap();
+        assert_eq!(pane(&store, "alpha").unwrap().unwrap().2, base() + 4000);
+        drop(clock);
+        let _clock = FrozenWallClock::at(base() + 10000);
+        let projects = temp.path().join("projects");
+        let folder = temp.path().canonicalize().unwrap();
+        transcript(&folder, &projects, "make release", "alpha", 6, false);
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        assert!(used(store.connection(), id).unwrap());
+    }
+
+    #[test]
+    fn one_executed_call_retires_only_one_overlapping_grant_even_after_replay() {
+        let _clock = FrozenWallClock::at(base() + 10000);
+        let (temp, store) = fixture();
+        let alpha = grant(&store, 0, true);
+        let beta = grant(&store, 1, true);
+        let ids = [alpha["id"].as_str().unwrap(), beta["id"].as_str().unwrap()];
+        pane_with(&store, &ids);
+        let projects = temp.path().join("projects");
+        let folder = temp.path().canonicalize().unwrap();
+        transcript(&folder, &projects, "make release", "alpha", 6, false);
+        for _ in 0..2 {
+            observe_retries(&store, "alpha", &projects, &folder).unwrap();
+            assert_eq!(live(&store, "alpha", Store::now_ms()).unwrap().len(), 1);
+        }
+        assert_eq!(
+            ids.iter()
+                .filter(|id| used(store.connection(), id).unwrap())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn revoke_or_a_changed_pane_between_read_and_receipt_rejects_stale_evidence() {
+        let _clock = FrozenWallClock::at(base() + 10000);
+        let (temp, mut store) = fixture();
+        let alpha = grant(&store, 0, true);
+        let id = alpha["id"].as_str().unwrap();
+        pane_with(&store, &[id]);
+        let before = pane(&store, "alpha").unwrap().unwrap();
+        let projects = temp.path().join("projects");
+        let folder = temp.path().canonicalize().unwrap();
+        transcript(&folder, &projects, "make release", "alpha", 6, false);
+        let scan = crate::claude_denials::since(&projects, &folder, base()).unwrap();
+        // A competing tick advanced the cursor: a stale reader cannot write
+        // either receipts or a checkpoint over it.
+        record_retries(
+            &store,
+            "alpha",
+            &before,
+            &scan,
+            Some((Some("beta"), "gamma")),
+        )
+        .unwrap();
+        assert!(!used(store.connection(), id).unwrap());
+        assert!(checkpoint(&store, "alpha").unwrap().is_none());
+        store
+            .connection()
+            .execute(
+                "UPDATE hosted_panes SET started='beta' WHERE ship='alpha'",
+                [],
+            )
+            .unwrap();
+        record_retries(&store, "alpha", &before, &scan, None).unwrap();
+        assert!(!used(store.connection(), id).unwrap());
+        pane_with(&store, &[id]);
+        dispatch(&mut store, "captain_approval.revoke", json!({"id":id})).unwrap();
+        record_retries(&store, "alpha", &before, &scan, None).unwrap();
+        assert!(!used(store.connection(), id).unwrap());
+        let count: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM audit WHERE kind='permissions.approval_used'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn once_requires_an_explicit_boolean_and_a_prefix() {
+        let (_temp, store) = fixture();
+        for approves in [
+            json!({"action":"Publish beta","one_time":true}),
+            json!({"action":"Publish beta","one_time":"yes","command_prefix":"make release"}),
+        ] {
+            let mut payload = json!({"approves":approves});
+            assert!(
+                declare(
+                    &store,
+                    "alpha",
+                    "alpha",
+                    "captain",
+                    "request",
+                    None,
+                    Some("beta"),
+                    &mut payload
+                )
+                .is_err()
+            );
+        }
+        let mut payload = json!({"approves":{"action":"Publish beta","one_time":true,"command_prefix":"make release"}});
+        let line = declare(
+            &store,
+            "alpha",
+            "alpha",
+            "captain",
+            "request",
+            None,
+            Some("beta"),
+            &mut payload,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(line.contains("do this once"));
+        assert_eq!(payload["approves"]["one_time"], true);
+    }
+}
