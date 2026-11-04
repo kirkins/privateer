@@ -3,6 +3,8 @@
 //! sealed executable verification and durable custody BEFORE using this gate.
 use super::*;
 
+mod elf;
+
 pub(super) struct ChildExec {
     gate: RawFd,
     executable: RawFd,
@@ -31,6 +33,32 @@ fn pipe() -> Result<(File, File)> {
     Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
 }
 
+// Duplicate above the reserved child descriptors and explicitly close the
+// original writer. Shadowing it would retain a parent writer and suppress EOF.
+fn report_pipe() -> Result<(File, File)> {
+    let (input, original) = pipe()?;
+    let output = duplicate(original.as_raw_fd())?;
+    drop(original);
+    Ok((input, output))
+}
+
+fn read_ack(report: &mut File, bytes: &mut [u8], deadline: u64) -> Result<()> {
+    let mut got = 0;
+    while got < bytes.len() {
+        ensure!(boottime_ms()? < deadline, "gate acknowledgement deadline");
+        match report.read(&mut bytes[got..]) {
+            Ok(0) => anyhow::bail!("gate exited before acknowledgement"),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => unsafe {
+                libc::poll(std::ptr::null_mut(), 0, 5);
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 impl Qualified {
     // Intentionally private even to the rest of the crate. Only authority-free
     // fixtures call this in iii-a. A held File is not a digest/claim proof.
@@ -40,7 +68,6 @@ impl Qualified {
         args: &[CString],
         timeout_ms: u64,
     ) -> Result<ExecGate<'_>> {
-        use std::os::unix::fs::FileExt;
         ensure!(
             (1..=3_600_000).contains(&timeout_ms),
             "invalid gate timeout"
@@ -56,13 +83,7 @@ impl Qualified {
                 <= 65536,
             "gate argv exceeds bound"
         );
-        let mut magic = [0; 4];
-        ensure!(
-            executable.metadata()?.is_file()
-                && executable.read_at(&mut magic, 0)? == 4
-                && magic == *b"\x7fELF",
-            "gate requires a held native executable, not a shebang"
-        );
+        elf::validate(executable)?;
         ensure!(!self.cleanup_unknown, "unresolved earlier custody");
         verify_mount(&self.directory)?;
         ensure!(self.read(c"pids.max")?.trim() == "16", "pids.max changed");
@@ -86,10 +107,10 @@ impl Qualified {
                 .open("/dev/null")?
                 .as_raw_fd(),
         )?;
-        let (input, output) = pipe()?;
-        let output = duplicate(output.as_raw_fd())?;
-        let (gate, release) = pipe()?;
-        let gate = duplicate(gate.as_raw_fd())?;
+        let (input, output) = report_pipe()?;
+        let (original_gate, release) = pipe()?;
+        let gate = duplicate(original_gate.as_raw_fd())?;
+        drop(original_gate);
         let argv: Vec<_> = args
             .iter()
             .map(|arg| arg.as_ptr())
@@ -148,7 +169,8 @@ impl Qualified {
             crate::jobs::identity(pid as u32)?.context("gate process identity unavailable")?,
         )?;
         let mut report = [0; 12];
-        pending.read_report(&mut report)?;
+        let ack_deadline = pending.deadline.min(boottime_ms()? + PROBE_MS);
+        read_ack(&mut pending.report, &mut report, ack_deadline)?;
         validate_report(&report)?;
         ensure!(
             pending.held.read(c"cgroup.procs")?.trim() == pid.to_string(),
@@ -164,33 +186,25 @@ impl ExecGate<'_> {
         Ok(())
     }
 
-    fn read_report(&mut self, bytes: &mut [u8]) -> Result<()> {
-        let mut got = 0;
-        while got < bytes.len() {
-            self.check_deadline()?;
-            match self.report.read(&mut bytes[got..]) {
-                Ok(0) => anyhow::bail!("gate exited before acknowledgement"),
-                Ok(n) => got += n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => unsafe {
-                    libc::poll(std::ptr::null_mut(), 0, 5);
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(())
-    }
-
     // Consuming and private. No deployment protocol or metadata is sent. iii-b
     // must replace this fixture-only wait with the bounded IO supervisor.
     fn execute(mut self) -> Result<i32> {
         self.check_deadline()?;
+        ensure!(
+            self.held.read(c"cgroup.procs")?.trim() == self.pid.to_string(),
+            "exec gate membership changed before release"
+        );
         self.release.write_all(b"1")?;
         // CLOEXEC EOF acknowledges exec; an explicit errno acknowledges failure.
+        // This is a separate short bound, capped by the existing runtime bound.
+        let ack_deadline = self.deadline.min(boottime_ms()? + PROBE_MS);
         let mut error = [0; 4];
         let mut got = 0;
         loop {
-            self.check_deadline()?;
+            ensure!(
+                boottime_ms()? < ack_deadline,
+                "exec acknowledgement deadline"
+            );
             match self.report.read(&mut error[got..]) {
                 Ok(0) if got == 0 => break,
                 Ok(0) => anyhow::bail!("partial exec acknowledgement"),
@@ -230,9 +244,7 @@ impl ExecGate<'_> {
         }
         // Never repeat an ambiguous cleanup with a fresh deadline on Drop.
         self.cleaned = true;
-        let status = cleanup_child(self.held, self.pid, &self.pidfd, boottime_ms)?;
-        self.held.cleanup_unknown = false;
-        Ok(status)
+        cleanup_child(self.held, self.pid, &self.pidfd, boottime_ms)
     }
 }
 
@@ -241,9 +253,7 @@ impl Drop for ExecGate<'_> {
         if !self.cleaned {
             // Drop cannot report success or discard ambiguous custody. The held
             // boundary and recorded identity outlive this borrowed gate token.
-            if cleanup_child(self.held, self.pid, &self.pidfd, boottime_ms).is_ok() {
-                self.held.cleanup_unknown = false;
-            }
+            let _ = cleanup_child(self.held, self.pid, &self.pidfd, boottime_ms);
         }
     }
 }
@@ -252,6 +262,9 @@ impl Drop for ExecGate<'_> {
 // allocation, formatting, locks, destructors or unwinding to these functions.
 pub(super) unsafe fn prepare_child(exec: &ChildExec) {
     unsafe {
+        if !reset_signals_and_session() {
+            libc::_exit(123);
+        }
         if libc::dup3(exec.gate, 5, libc::O_CLOEXEC) < 0
             || libc::dup3(exec.executable, 6, libc::O_CLOEXEC) < 0
         {
@@ -265,6 +278,43 @@ pub(super) unsafe fn prepare_child(exec: &ChildExec) {
         if libc::syscall(libc::SYS_close_range, 7u32, u32::MAX, 0) < 0 {
             libc::_exit(123);
         }
+    }
+}
+
+// Use the kernel ABI, not libc's NPTL-filtered signal API: signals 32/33 and
+// their mask bits must also be reset in this fork-like, single-threaded child.
+// A zero kernel sigaction is SIG_DFL, no flags/restorer and an empty mask on
+// supported Linux architectures; the buffer covers every ABI's struct layout.
+unsafe fn reset_signals_and_session() -> bool {
+    unsafe {
+        let empty = 0u64;
+        if libc::syscall(
+            libc::SYS_rt_sigprocmask,
+            libc::SIG_SETMASK,
+            &empty,
+            std::ptr::null_mut::<u64>(),
+            8,
+        ) != 0
+        {
+            return false;
+        }
+        let action = [0u64; 4];
+        for signal in 1..=64 {
+            if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+                continue;
+            }
+            if libc::syscall(
+                libc::SYS_rt_sigaction,
+                signal,
+                action.as_ptr(),
+                std::ptr::null_mut::<u64>(),
+                8,
+            ) != 0
+            {
+                return false;
+            }
+        }
+        libc::setsid() >= 0
     }
 }
 
