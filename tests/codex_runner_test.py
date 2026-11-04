@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""Dormant runner boundary tests: owned processes only, no Codex/model calls."""
+import copy
+import fcntl
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import tempfile
+import unittest
+import uuid
+from unittest.mock import patch
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins/attended-codex"))
+import codex_binding as binding
+import codex_receipts as receipts
+import codex_runner as runner
+from codex_socket import load, process_identity
+
+
+@unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open"), "Linux custody only")
+class RunnerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="codex-runner-", dir=os.environ.get("TMPDIR", "/var/tmp"))
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.directory = self.root / ".codex/privateer-attended"
+        self.directory.mkdir(parents=True, mode=0o700)
+        self.registry = self.directory / "launch.json"
+        self.env = {}
+        for name in binding.PATH_ENV:
+            if name == "PRIVATEER_SERVICE":
+                continue
+            path = self.root / name.lower()
+            path.mkdir()
+            self.env[name] = str(path)
+        environment = patch.dict(os.environ, self.env)
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.pane = self.process()
+        self.supervisor = self.process()
+        self.daemon_process = self.process()
+        self.listener = socket.socket(socket.AF_UNIX)
+        self.listener.bind(str(self.root / "socket"))
+        os.chmod(self.root / "socket", 0o600)
+        self.addCleanup(self.listener.close)
+        (self.root / "rendezvous").symlink_to(self.root / "socket")
+        codex = Path(self.env["CODEX_HOME"])
+        (codex / "app-server-daemon").mkdir(mode=0o700)
+        binding.atomic(codex / "app-server-daemon/daemon.pid", {
+            "pid": self.daemon_process.pid, "processIdentity": process_identity(self.daemon_process.pid)})
+        self.session = str(uuid.uuid4())
+        token, custody_token = str(uuid.uuid4()), str(uuid.uuid4())
+        self.rollout = codex / "rollout.jsonl"
+        self.rollout.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": self.session, "cwd": str(self.root), "history_mode": "legacy"}}) + "\n")
+        info = self.rollout.stat()
+        self.record = {"generation": str(uuid.uuid4()), "callback_generation": str(uuid.uuid4()),
+            "session": self.session, "holder": "host:alpha", "ship": "alpha", "home": self.env["HOME"],
+            "cwd": str(self.root), "codex_home": str(codex), "pid": self.pane.pid,
+            "process_identity": process_identity(self.pane.pid), "executable": runner.executable(self.pane.pid)["path"],
+            "state": "bound", "hosted": True, "delivery_enabled": True, "path_env": self.env,
+            "binding": {"session": self.session, "fence_version": 1, "invalidation_token": token,
+                "history_mode": "legacy", "transcript": str(self.rollout),
+                "transcript_identity": {"device": info.st_dev, "inode": info.st_ino},
+                "daemon_pid": self.daemon_process.pid, "daemon_identity": process_identity(self.daemon_process.pid),
+                "socket": str(self.root / "socket"), "rendezvous": str(self.root / "rendezvous")}}
+        info = (self.root / "socket").stat()
+        self.custody = {**{k: self.record[k] for k in ("generation", "session", "holder", "ship", "home", "cwd",
+            "codex_home", "pid", "process_identity")}, "version": 1, "state": "owned", "token": custody_token,
+            "epoch": str(uuid.uuid4()), "executable": runner.executable(self.pane.pid),
+            "supervisor_pid": self.supervisor.pid, "supervisor_identity": process_identity(self.supervisor.pid),
+            "supervisor_executable": runner.executable(self.supervisor.pid),
+            "daemon": {"pid": self.daemon_process.pid, "identity": process_identity(self.daemon_process.pid),
+                "executable": runner.executable(self.daemon_process.pid), "device": info.st_dev, "inode": info.st_ino,
+                "socket": str(self.root / "socket"), "rendezvous": str(self.root / "rendezvous")}}
+        binding.atomic(self.registry, self.record)
+        binding.atomic(self.directory / "custody.json", self.custody)
+        binding.atomic(self.directory / "invalidate.json", {"token": token})
+        binding.atomic(self.directory / "custody-poison.json", {"token": custody_token, "generation": self.record["generation"]})
+        self.runner = runner.Runner(self.registry)
+        self.prepare()
+        # A native-boundary stand-in, invoked as the exact recorded executable
+        # plus argv `queue ...`; never touches a provider, daemon, or auth file.
+        (self.root / "queue").write_text("import json, os, sys\nfrom pathlib import Path\n"
+            "Path('invoked.json').write_text(json.dumps({'argv':sys.argv, 'env':dict(os.environ)}))\n")
+        fixture = self
+        class FakeDaemon:
+            def __init__(self, home):
+                self.pid = fixture.daemon_process.pid
+                self.identity = process_identity(self.pid)
+                self.target = fixture.root / "socket"
+                self.rendezvous = fixture.root / "rendezvous"
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def check(self):
+                runner.native_check(fixture.record, fixture.custody)
+            def call(self, method, params):
+                if method == "thread/loaded/list":
+                    return {"data": [fixture.session], "nextCursor": None}
+                if method == "thread/read":
+                    return {"thread": {"id": fixture.session, "cwd": str(fixture.root), "historyMode": "legacy",
+                                       "status": {"type": "idle"}}}
+                if method == "thread/queue/list":
+                    return {"data": [], "nextCursor": None}
+                raise AssertionError(method)
+        self.daemon_class = FakeDaemon
+        daemon_patch = patch.object(runner, "Daemon", FakeDaemon)
+        daemon_patch.start()
+        self.addCleanup(daemon_patch.stop)
+        def control(record, command, args):
+            self.assertEqual(command, 'ship.presence')
+            with binding.locked(self.directory):
+                pass  # Runtime RPC must NEVER run under the project fence.
+            return {'attended': True, 'lease': {'holder': 'host:alpha', 'expires_ms': 10**18}}
+        control_patch = patch.object(runner, 'control', side_effect=control)
+        control_patch.start()
+        self.addCleanup(control_patch.stop)
+
+    def process(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(90)"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        def cleanup():
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+        self.addCleanup(cleanup)
+        return child
+
+    def prepare(self, after=0):
+        self.nonce = str(uuid.uuid4())
+        self.body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, self.nonce, after, after + 1)) + "\nNotification, not acknowledgment."
+        return self.runner.ledger.prepare(self.record, self.body, after, after + 1, self.nonce)
+
+    def mutate(self, change):
+        return self.runner.ledger.transaction(change)
+
+    def event(self, kind, **fields):
+        with self.rollout.open("a") as stream:
+            stream.write(json.dumps({"type": "event_msg", "payload": {"type": kind, **fields}}) + "\n")
+
+    def start(self, turn="turn", at=123):
+        self.event("task_started", turn_id=turn, started_at=at,
+                   turn_attribution={"turn_id": turn, "turn_trigger": "queue"})
+
+    def promoted(self):
+        self.start()
+        self.event("user_message", message=self.body, client_id=str(uuid.uuid4()),
+                   images=[], local_images=[], audio=[], local_audio=[], text_elements=[])
+        self.event("task_complete", turn_id="turn")
+
+    def assert_not_invoked(self):
+        self.assertFalse((self.root / "invoked.json").exists())
+
+    def test_no_enable_path_and_b0_fence_cannot_deliver(self):
+        self.record["delivery_enabled"] = False
+        binding.atomic(self.registry, self.record)
+        with self.assertRaisesRegex(ValueError, "disabled"):
+            self.runner.dispatch()
+        self.assert_not_invoked()
+        self.record["delivery_enabled"] = True
+        self.record["binding"].pop("fence_version")
+        binding.atomic(self.registry, self.record)
+        with self.assertRaisesRegex(ValueError, "fence"):
+            self.runner.dispatch()
+        self.assert_not_invoked()
+
+    def test_real_spawn_under_flock_exact_argv_allowlisted_env_and_uncertain_result(self):
+        original = subprocess.Popen
+        def spawn(argv, **kwargs):
+            fd = os.open(self.directory / "lock", os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+            value = self.runner.ledger.read()
+            self.assertEqual(value["sessions"][self.session]["intent"]["state"], "invoking")
+            self.assertEqual(value["runner"]["possibly_unattended_spent"], 1)
+            child = original(argv, **kwargs)
+            wait = child.wait
+            def unlocked_wait(*args, **kw):
+                with binding.locked(self.directory):
+                    pass
+                return wait(*args, **kw)
+            child.wait = unlocked_wait
+            return child
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "fixture-not-a-credential", "LD_PRELOAD": "bad"}), patch.object(runner.subprocess, "Popen", side_effect=spawn):
+            result = self.runner.dispatch()
+        invoked = json.loads((self.root / "invoked.json").read_text())
+        self.assertEqual(invoked["argv"], ["queue", "--remote", "unix://" + str(self.root / "socket"),
+                                          "--thread", self.session, "--message", self.body])
+        self.assertNotIn("OPENAI_API_KEY", invoked["env"])
+        self.assertNotIn("LD_PRELOAD", invoked["env"])
+        self.assertEqual(result["possibly_unattended_spent"], 1)
+        self.assertTrue(result["report_eligible"])
+        self.assertTrue(result["paused"])
+        self.assertEqual(result["diagnostic"], "codex-uncertain-" + self.nonce)
+        self.assertEqual(result["accepted_through"], 0)
+        with self.assertRaises(ValueError):
+            self.runner.dispatch()
+
+    def test_lost_response_immediate_queue_then_promotion_recovery_without_ack(self):
+        self.runner.dispatch()
+        queue = {"data": [{"id": "queue-item", "clientUserMessageId": str(uuid.uuid4()),
+                          "input": [{"type": "text", "text": self.body, "text_elements": []}]}], "nextCursor": None}
+        result = self.runner.ledger.reconcile(self.session, self.nonce, queue)
+        self.assertEqual(result["state"], "queued")
+        self.assertEqual(result["accepted_through"], 0)
+        self.promoted()
+        restarted = runner.Runner(self.registry)
+        result = restarted.observe()
+        self.assertEqual(result["accepted_through"], 1)
+        self.assertEqual(result["possibly_unattended_spent"], 1)
+        self.assertEqual(restarted.ledger.read()["sessions"][self.session]["acknowledged_through"], 0)
+
+    def test_lost_response_absence_nonzero_and_elapsed_time_never_prove_rejection(self):
+        (self.root / "queue").write_text("raise SystemExit(7)\n")
+        result = self.runner.dispatch()
+        self.assertEqual(result["decline_count"], 0)
+        with patch.object(runner.time, "time_ns", return_value=10**30):
+            result = self.runner.observe()
+            self.assertTrue(result["paused"])
+            self.assertEqual(result["diagnostic"], "codex-uncertain-" + self.nonce)
+            with self.assertRaises(ValueError):
+                self.runner.dispatch()
+        self.assertEqual(result["accepted_through"], 0)
+
+    def test_partial_and_covering_ack_never_refund_possibly_unattended_budget(self):
+        self.runner.dispatch()
+        result = self.runner.observe(acknowledged_through=0)
+        self.assertTrue(result["paused"])
+        result = self.runner.observe(acknowledged_through=1)
+        self.assertEqual(result["accepted_through"], 1)
+        self.assertEqual(result["possibly_unattended_spent"], 1)
+        self.assertFalse(result["busy"])
+
+    def test_three_invocations_exhaust_budget_even_with_real_progress_and_restart(self):
+        for i in range(3):
+            self.runner.dispatch()
+            self.promoted()
+            result = self.runner.observe()
+            self.assertEqual(result["possibly_unattended_spent"], i + 1)
+            self.assertEqual(result["accepted_through"], i + 1)
+            if i < 2:
+                self.prepare(i + 1)
+            self.runner = runner.Runner(self.registry)
+        self.prepare(3)
+        with self.assertRaisesRegex(ValueError, "budget exhausted"):
+            self.runner.dispatch()
+        self.assertTrue(result["paused"])
+
+    def test_exec_failure_only_rejection_retry_minute_and_k3_bound(self):
+        for i in range(3):
+            with patch.object(runner.subprocess, "Popen", side_effect=FileNotFoundError("fixture exec failed")):
+                with self.assertRaises(FileNotFoundError):
+                    self.runner.dispatch()
+            value = self.runner.ledger.read()
+            self.assertEqual(value["sessions"][self.session]["intent"]["state"], "rejected")
+            self.assertEqual(value["runner"]["declines"], i + 1)
+            if i < 2:
+                self.prepare()
+                with self.assertRaisesRegex(ValueError, "paused"):
+                    self.runner.dispatch()
+                self.mutate(lambda v: v["runner"].update(retry_after_ms=0))
+        self.prepare()
+        with self.assertRaises(ValueError):
+            self.runner.dispatch()
+        self.assert_not_invoked()
+
+    def test_busy_start_is_native_and_stable_across_poll_restart_observation_loss(self):
+        self.runner._observe_lifecycle(self.record)
+        self.start(at=456)
+        self.runner._observe_lifecycle(self.record)
+        first = self.runner.report(self.session)
+        self.assertTrue(first["busy"])
+        self.assertEqual(first["turn_started_ms"], 456000)
+        self.runner = runner.Runner(self.registry)
+        self.runner._observe_lifecycle(self.record)
+        self.assertEqual(self.runner.report(self.session)["turn_started_ms"], 456000)
+        with patch.object(runner, "lifecycle", side_effect=ValueError("fixture gap")):
+            self.runner._observe_lifecycle(self.record)
+        result = self.runner.report(self.session)
+        self.assertTrue(result["busy"])
+        self.assertFalse(result["busy_available"])
+        self.assertEqual(result["turn_started_ms"], 456000)
+        self.event("turn_aborted", turn_id="turn")
+        self.runner._observe_lifecycle(self.record)
+        result = self.runner.report(self.session)
+        self.assertFalse(result["busy"])
+        self.assertIsNone(result["turn_started_ms"])
+
+    def test_busy_unknown_paginated_and_unloaded_refuse(self):
+        self.runner._observe_lifecycle(self.record)
+        self.start()
+        with self.assertRaisesRegex(ValueError, "busy|unavailable"):
+            self.runner.dispatch()
+        self.assert_not_invoked()
+        self.record["binding"]["history_mode"] = "paginated"
+        self.runner._observe_lifecycle(self.record)
+        # Changing history settings is never an adapter remedy.
+        with self.assertRaises(ValueError):
+            runner.lifecycle({}, self.record)
+
+    def test_poison_and_identity_substitution_barriers_before_spawn(self):
+        self.runner._observe_lifecycle(self.record)
+        for field in ("pid", "process_identity", "supervisor_identity", "executable", "supervisor_executable"):
+            altered = copy.deepcopy(self.custody)
+            if field == "pid":
+                altered[field] = self.supervisor.pid
+            elif "identity" in field:
+                altered[field]["startTicks"] += 1
+            else:
+                altered[field]["inode"] += 1
+            binding.atomic(self.directory / "custody.json", altered)
+            with self.assertRaises(ValueError):
+                self.runner._spawn(self.record, self.custody, self.daemon_class(None))
+            self.assert_not_invoked()
+        binding.atomic(self.directory / "custody.json", self.custody)
+        binding.publish_request(self.registry, "custody-poison.json", reason="barrier")
+        with self.assertRaisesRegex(ValueError, "poison"):
+            self.runner._spawn(self.record, self.custody, self.daemon_class(None))
+        self.assert_not_invoked()
+
+    def test_exit_before_final_check_refuses_pane(self):
+        self.runner._observe_lifecycle(self.record)
+        self.pane.kill()
+        self.pane.wait()
+        with self.assertRaises((ValueError, ProcessLookupError, FileNotFoundError)):
+            self.runner._spawn(self.record, self.custody, self.daemon_class(None))
+        self.assert_not_invoked()
+
+    def test_supervisor_crash_with_live_pane_refuses_independently(self):
+        self.runner._observe_lifecycle(self.record)
+        self.supervisor.kill()
+        self.supervisor.wait()
+        self.assertIsNone(self.pane.poll())
+        with self.assertRaises((ValueError, ProcessLookupError, FileNotFoundError)):
+            self.runner._spawn(self.record, self.custody, self.daemon_class(None))
+        self.assert_not_invoked()
+
+    def test_late_supervisor_exit_after_check_still_charges_and_never_claims_cancellation(self):
+        original = subprocess.Popen
+        def spawn(*args, **kwargs):
+            self.supervisor.kill()
+            self.supervisor.wait()
+            return original(*args, **kwargs)
+        with patch.object(runner.subprocess, "Popen", side_effect=spawn):
+            result = self.runner.dispatch()
+        self.assertTrue((self.root / "invoked.json").exists())
+        self.assertEqual(result["possibly_unattended_spent"], 1)
+        self.assertTrue(result["paused"])
+        self.assertFalse(result["report_eligible"])
+        self.assertEqual(result["accepted_through"], 0)
+        self.assertEqual(self.runner.ledger.read()["sessions"][self.session]["intent"]["state"], "uncertain")
+
+    def test_callback_generation_and_invalidation_barriers_and_stale_reports(self):
+        self.runner._observe_lifecycle(self.record)
+        changed = copy.deepcopy(self.record)
+        changed["callback_generation"] = str(uuid.uuid4())
+        binding.atomic(self.registry, changed)
+        with self.assertRaisesRegex(ValueError, "changed"):
+            self.runner._spawn(self.record, self.custody, self.daemon_class(None))
+        self.assertFalse(self.runner.report(self.session)["report_eligible"])
+        binding.atomic(self.registry, self.record)
+        binding.publish_request(self.registry)
+        with self.assertRaisesRegex(ValueError, "fence"):
+            self.runner._spawn(self.record, self.custody, self.daemon_class(None))
+        self.assert_not_invoked()
+
+    def test_independent_pidfd_checks_detect_start_and_executable_substitution(self):
+        before = len(list(Path('/proc/self/fd').iterdir()))
+        for field in ('process_identity', 'supervisor_identity', 'executable', 'supervisor_executable'):
+            altered = copy.deepcopy(self.custody)
+            altered[field]['startTicks' if 'identity' in field else 'inode'] += 1
+            with self.assertRaisesRegex(ValueError, 'identity'):
+                runner.Handles(altered)
+        self.assertEqual(len(list(Path('/proc/self/fd').iterdir())), before)
+
+    def test_prelock_poison_after_invoking_commit_refuses_actual_spawn(self):
+        self.runner._observe_lifecycle(self.record)
+        original = runner.save
+        def save(ledger, value):
+            original(ledger, value)
+            if value['sessions'][self.session]['intent']['state'] == 'invoking':
+                binding.publish_request(self.registry)
+        with patch.object(runner, 'save', side_effect=save):
+            with self.assertRaisesRegex(ValueError, 'fence'):
+                self.runner._spawn(self.record, self.custody, self.daemon_class(None))
+        self.assert_not_invoked()
+        result = self.runner.report(self.session)
+        self.assertEqual(result['possibly_unattended_spent'], 1)
+        self.assertEqual(result['diagnostic'], 'codex-uncertain-' + self.nonce)
+        self.assertFalse(result['report_eligible'])
+
+    def test_late_callback_poison_is_not_remote_cancellation(self):
+        original = subprocess.Popen
+        def spawn(*args, **kwargs):
+            binding.publish_request(self.registry)
+            return original(*args, **kwargs)
+        with patch.object(runner.subprocess, 'Popen', side_effect=spawn):
+            result = self.runner.dispatch()
+        self.assertTrue((self.root / 'invoked.json').exists())
+        self.assertFalse(result['report_eligible'])
+        self.assertTrue(result['paused'])
+        self.assertEqual(result['possibly_unattended_spent'], 1)
+
+    def test_daemon_replacement_pending_queue_unloaded_and_unknown_status_refuse(self):
+        for method, response in [
+            ('thread/loaded/list', {'data': [], 'nextCursor': None}),
+            ('thread/read', {'thread': {'id': self.session, 'cwd': str(self.root), 'historyMode': 'legacy', 'status': {'type': 'unknown'}}}),
+            ('thread/queue/list', {'data': [{'id': 'another-item'}], 'nextCursor': None})]:
+            original = self.daemon_class.call
+            def call(daemon, name, args):
+                return response if name == method else original(daemon, name, args)
+            with patch.object(self.daemon_class, 'call', new=call):
+                with self.assertRaises(ValueError):
+                    self.runner.dispatch()
+            self.assert_not_invoked()
+        binding.atomic(Path(self.record['codex_home']) / 'app-server-daemon/daemon.pid', {'pid': self.pane.pid})
+        with self.assertRaises(ValueError):
+            self.runner.dispatch()
+        self.assert_not_invoked()
+
+    def test_disconnect_preserves_busy_timestamp_and_marks_observation_unavailable(self):
+        self.runner._observe_lifecycle(self.record)
+        self.start(at=789)
+        self.runner._observe_lifecycle(self.record)
+        with patch.object(self.daemon_class, 'call', side_effect=ConnectionError('fixture disconnect')):
+            result = self.runner.observe()
+        self.assertTrue(result['busy'])
+        self.assertFalse(result['busy_available'])
+        self.assertEqual(result['turn_started_ms'], 789000)
+
+    def test_native_abort_pauses_once_and_background_progress_does_not_resume(self):
+        self.runner._observe_lifecycle(self.record)
+        self.start()
+        self.event('turn_aborted', turn_id='turn')
+        self.runner._observe_lifecycle(self.record)
+        self.assertEqual(self.runner.report(self.session)['decline_count'], 1)
+        self.runner._observe_lifecycle(self.record)
+        self.assertEqual(self.runner.report(self.session)['decline_count'], 1)
+        self.runner.observe(acknowledged_through=1)
+        self.assertTrue(self.runner.report(self.session)['paused'])
+        self.prepare(1)
+        with self.assertRaisesRegex(ValueError, 'native stop'):
+            self.runner.dispatch()
+        self.assert_not_invoked()
+
+    def test_timeout_and_observed_escaped_descendant_cleanup_remain_uncertain(self):
+        (self.root / 'queue').write_text("import subprocess, sys, time\nfrom pathlib import Path\n"
+            "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(90)'], start_new_session=True)\n"
+            "Path('descendant.pid').write_text(str(p.pid))\ntime.sleep(90)\n")
+        original = runner.drain
+        with patch.object(runner, 'drain', side_effect=lambda child: original(child, timeout=0.3)):
+            result = self.runner.dispatch()
+        pid = int((self.root / 'descendant.pid').read_text())
+        try:
+            fd = os.pidfd_open(pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            try:
+                self.assertFalse(runner.live(fd))
+            finally:
+                os.close(fd)
+        self.assertEqual(result['diagnostic'], 'codex-uncertain-' + self.nonce)
+        self.assertEqual(result['decline_count'], 0)
+
+    def test_invoking_commit_failure_never_creates_child(self):
+        self.runner._observe_lifecycle(self.record)
+        with patch.object(runner, 'save', side_effect=OSError('fixture fsync failure')):
+            with self.assertRaises(OSError):
+                self.runner._spawn(self.record, self.custody, self.daemon_class(None))
+        self.assert_not_invoked()
+        self.assertEqual(self.runner.ledger.read()['sessions'][self.session]['intent']['state'], 'prepared')
+
+    def test_holder_change_and_lease_expiry_refuse_before_spawn(self):
+        for presence in [
+            {'attended': False, 'lease': {'holder': 'host:alpha', 'expires_ms': 10**18}},
+            {'attended': True, 'lease': {'holder': 'host:other', 'expires_ms': 10**18}},
+            {'attended': True, 'lease': {'holder': 'host:alpha', 'expires_ms': 1}}]:
+            with patch.object(runner, 'control', return_value=presence):
+                with self.assertRaisesRegex(ValueError, 'presence'):
+                    self.runner.dispatch()
+                self.assertFalse(self.runner.report(self.session)['report_eligible'])
+            self.assert_not_invoked()
+
+    def test_large_busy_scan_makes_bounded_forward_progress_without_reset(self):
+        self.runner._observe_lifecycle(self.record)
+        before = self.runner.ledger.read()['sessions'][self.session]['lifecycle']['scan']['offset']
+        with self.rollout.open('a') as stream:
+            for _ in range(1200):
+                stream.write(json.dumps({'type': 'response_item', 'payload': {'text': 'x' * 1000}}) + '\n')
+        self.runner._observe_lifecycle(self.record)
+        mid = self.runner.ledger.read()['sessions'][self.session]['lifecycle']['scan']['offset']
+        self.assertGreater(mid, before)
+        self.assertLess(mid - before, runner.LIMIT + 1)
+        self.assertFalse(self.runner.report(self.session)['busy_available'])
+        self.runner._observe_lifecycle(self.record)
+        self.assertTrue(self.runner.report(self.session)['busy_available'])
+
+    def test_three_aborts_in_one_observation_are_three_declines_not_one_poll(self):
+        self.runner._observe_lifecycle(self.record)
+        for i in range(3):
+            self.start(turn=f'turn-{i}')
+            self.event('turn_aborted', turn_id=f'turn-{i}')
+        self.runner._observe_lifecycle(self.record)
+        self.assertEqual(self.runner.report(self.session)['decline_count'], 3)
+        self.runner._observe_lifecycle(self.record)
+        self.assertEqual(self.runner.report(self.session)['decline_count'], 3)
+
+    def test_corrupt_negative_budget_refuses_instead_of_granting_more_turns(self):
+        self.mutate(lambda v: runner.accounting(v).update(possibly_unattended_spent=-1))
+        with self.assertRaisesRegex(ValueError, 'accounting'):
+            self.runner.dispatch()
+        self.assert_not_invoked()
+
+    def test_old_result_cannot_mutate_operator_settled_or_newer_callback_intent(self):
+        original = runner.drain
+        old_nonce = self.nonce
+        def drain(child):
+            cleaned = original(child)
+            self.runner.ledger.resolve_operator(self.session, old_nonce, 'mark_presented',
+                'fixture-only audit', 1234, caller_role='operator')
+            self.record['callback_generation'] = str(uuid.uuid4())
+            binding.atomic(self.registry, self.record)
+            self.prepare(1)
+            return cleaned
+        with patch.object(runner, 'drain', side_effect=drain):
+            result = self.runner.dispatch()
+        self.assertFalse(result['report_eligible'])
+        value = self.runner.ledger.read()
+        self.assertEqual(value['sessions'][self.session]['intent']['nonce'], self.nonce)
+        self.assertEqual(value['sessions'][self.session]['intent']['state'], 'prepared')
+        self.assertEqual(value['sessions'][self.session]['accepted_through'], 1)
+        self.assertEqual(value['runner']['possibly_unattended_spent'], 1)
+
+    def test_human_pause_does_not_clear_on_ack_or_observation(self):
+        self.mutate(lambda v: runner.accounting(v).update(human_paused=True))
+        self.runner.observe(acknowledged_through=1)
+        with self.assertRaises(ValueError):
+            self.runner.dispatch()
+        self.assertTrue(self.runner.report(self.session)["paused"])
+        self.assert_not_invoked()
+
+
+if __name__ == "__main__":
+    unittest.main()

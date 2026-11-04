@@ -1990,5 +1990,8 @@ class QueueFixtureHttpTests(unittest.TestCase):
         fixture.check_calls()
 
 
+# The dormant queue boundary shares this admitted suite, but no launcher imports it.
+from codex_runner_test import RunnerTests
+
 if __name__ == "__main__":
     unittest.main()

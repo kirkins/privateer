@@ -11,8 +11,10 @@ an isolated loopback mock (captain-approved scope change), and proposes a
 Privateer-owned attended-pane proof for review, **design only**.
 B5a fixes the B4 review findings below. The first mate approved separate B5b
 custody and B5c dormant-runner slices. B5b now implements the Rust custody
-prerequisite and PR700 receipt carry-ins below; B5c is not implemented.
-No runner or B3c control/report integration is implemented; delivery stays disabled. The fresh
+prerequisite and PR700 receipt carry-ins below. B5c adds a dormant, unconnected
+queue consumer and conservative local accounting, described below. No launcher
+imports it; no B3c dispatched control/report integration or enable path is
+implemented; delivery stays disabled. The fresh
 reservation decision below is design only, not implementation approval.
 Goal: an explicitly launched Codex first-mate pane handles idle mail without
 terminal injection. This qualifies attended mail, not full native autonomy.
@@ -891,7 +893,7 @@ generations and exact intent/UUID under the project fence immediately before
 spawn, acquire its own pidfds for pane and supervisor, and independently verify
 start time and executable device/inode plus daemon identity. It must not trust
 a Python Boolean, stored `owned` state, cached snapshot or pidfd acquisition
-alone. No such admission consumer is implemented or qualified here. Exit after
+alone. B5c implements a dormant consumer below; activation is not qualified. Exit after
 the final check may still lead to a late admitted turn; every future delivered
 turn is **possibly unattended**, counted/reported against K=3 and the budget.
 There is no cancellation or instantaneous UI-navigation guarantee.
@@ -932,6 +934,130 @@ Real supervisor-crash recovery, before/after final-spawn barriers, lost queue
 responses, same-UUID second client, idle navigation, PTY draft preservation,
 K=3/busy accounting and live qualification remain B5c/C activation gates.
 **Paginated installs get no idle mail**; no history-mode setting changes.
+
+### B5c: dormant queue consumer and conservative accounting (delivery disabled)
+
+`plugins/attended-codex/codex_runner.py` is an **unconnected library**, not a
+poller, launcher, scheduled worker, dispatched control or hosted-eligibility
+change. It consumes a ledger-prepared offer; body/header selection remains with
+the future runtime integration. No production caller imports it and no code
+writes `delivery_enabled:true`. The enabled records in the deterministic suite
+are fixture-owned data, not an activation mechanism. Production bindings remain
+`delivery_enabled:false`. Native attachment is not asserted: every potentially
+delivered queue turn is counted and reported as **possibly unattended**.
+
+Invocation follows this durable state machine:
+
+1. Reconcile earlier offers using `observe`: read-only queue evidence, anchored
+   promoted input and the trusted runtime ack cursor. There is no replay on
+   queue absence, CLI prose/nonzero/exit/timeout or elapsed time. An outstanding
+   `invoking`/`uncertain` offer immediately exposes stable diagnostic
+   `codex-uncertain-<nonce>`, with unchanged decline count; no five-minute wait.
+   Exact queued evidence remains pending, exact promoted input advances receipt
+   progress, covering real ack settles independently. The runner issues no ack.
+2. `dispatch` requires native **legacy** history, exact UUID/cwd, loaded-list
+   membership without pagination, an idle native snapshot, and an empty,
+   non-paginated native queue. All daemon RPC and `ship.presence` calls precede
+   the project flock. The final fence rechecks the lease's holder and expiry;
+   synchronous Rust poison orders holder replacement with that fence. It never
+   acquires SQLite while holding flock.
+3. Under the shared flock, reopen the entire launch and match the snapshot,
+   bound/hosted/enabled state, both generations, exact intent/session/body marker,
+   custody epoch/holder/context, `invalidate.json` and `custody-poison.json`.
+   Compare local daemon PID/boot/start/executable, daemon.pid, rendezvous and
+   socket device/inode against both binding and Rust custody. A fresh bounded
+   receipt scan must be caught up and idle; missing/schema/gap evidence refuses.
+4. Atomically save `invoking`, custody epoch, `possibly_unattended:true` and a
+   conservative budget reservation **in the same receipts.json transaction**.
+   Re-read launch and both fences after that fsync. Immediately before actual
+   `Popen`, independently acquire **both pane and supervisor pidfds**, check
+   boot/start/executable path/device/inode and exit readiness, and recheck lease
+   expiry. Actual spawn occurs under flock, with no RPC, unlocked deferred
+   spawn or wait between authorization and creation. Argv is exactly the recorded
+   absolute executable plus `queue --remote unix://<verified socket> --thread
+   <exact UUID> --message <saved body>`. No resume, embedded fallback, config,
+   provider, model, permission or history override is added. Only allowlisted
+   launch state paths, fixed PATH and locale reach the child.
+5. Check custody/liveness/fences again after spawn, then unlock before all waiting.
+   A late exit/poison is **not cancellation**: keep the old intent and charge it.
+   Discard English output to `/dev/null`. Bound the owned leader to three seconds,
+   track up to 64 observed descendants with pidfds, and kill/wait the actual
+   leader and observed escaped descendants by owned identities on cleanup.
+   Failed cleanup pauses immediately. A sub-20-ms unobserved double-fork can
+   escape sampling; stopping every possible payload is **not claimed**, and
+   real native queue descendant qualification remains an activation gate.
+6. Only `Popen` exec failure positively records `rejected`; count that decline
+   once and enforce the one-minute retry floor. Identity/fence failure after
+   durable `invoking` stays conservatively uncertain, even if this process knows
+   it never called Popen. Every successful spawn, including CLI nonzero/timeout,
+   remains uncertain until the normal evidence reducer settles it. A result for
+   an operator-settled old nonce cannot overwrite a replacement intent. Report
+   objects include `report_eligible:false` for changed custody/generation/fence,
+   dead pane/supervisor/daemon or expired presence; they are not sent to Rust.
+
+**Two separate conservative bounds** are persisted at project scope, so rebind,
+UUID switching and restart cannot reset them. Native declines are capped at
+**K=3**; only actual receipt/ack progress resets that no-progress spell. A native
+abort pauses once per observed turn and does not replay a presented range.
+Human/native-stop pauses do not clear on background mail, renewal or time; no
+resume control is introduced. Independently, the dormant implementation has a
+hard **three-reservation possibly-unattended turn budget**. Each `invoking`
+transaction spends one, even a later positively proved exec failure or pre-spawn
+fence failure; this intentionally over-counts rather than refunding a crash or
+late admission. Receipt/ack progress, a new session, rebind and restart never
+refund that budget. There is no reset/refill/configuration API. Report data
+includes spent count and the fixed cap. This is conservative local accounting,
+**not integration with the runtime wake/model budget ledger**; authenticated
+report dispatch and runtime budget reservation must be designed/tested before
+activation. Merely returning a report object does not spend/report a real Rust
+wake. No native turn is fabricated from queue success or ack-only settlement.
+
+A separate durable lifecycle cursor continues after an intent settles. It uses
+bounded complete-record forward scans and the native `task_started.started_at`
+seconds timestamp (the pinned 0.166 fixture shape), never heartbeat/reconnect
+wall time. Preserve the same open turn ID/start across polls, restart and
+observation loss; only matching completion/abort clears it. If initially
+anchored mid-turn without its timestamp, busy is known but unavailable for
+truthful timestamp reporting; refuse admission, never invent a fresh start.
+Unknown snapshot/schema, lag or history discontinuity exposes unavailable
+state while preserving known busy facts. Bounded catch-up commits its forward
+checkpoint; it cannot get stuck re-reading the first 1 MiB forever. Existing
+Rust five-minute blocked and thirty-minute continuous-busy policy is unchanged.
+
+B5b carry-ins: `Custody::revoke` sets its sticky in-memory flag only **after**
+poison succeeds, so failed poison persistence is retried by later revoke/retire/
+Drop. Tests replace the poison path with an unsafe directory, restore it, and
+prove the second attempt revokes. Before best-effort custody.json update, poison
+contains a durable `record_update:not_confirmed` warning. On update failure,
+Rust publishes a **new revoked poison token** containing bounded `record_error`
+and `record_update:failed` rather than mutating a stale read token or merely
+printing stderr. A diagnostic publication failure is logged but cannot roll back
+presence after the original durable revocation; a missing token still refuses.
+The non-Linux test lives outside the Linux-only custody module and pins Linux
+refusal plus no-custody holder change leaving presence intact. It is not Linux
+pidfd evidence and has not been executed on macOS in this Linux gate.
+
+`tests/codex_runner_test.py` is included by `tests/codex_attended_test.py`. It
+uses isolated state and actual owned processes with real pidfds, shared flocks
+and Popen boundaries, not a running Codex or a provider. It covers generation /
+poison before spawn (including after the invoking commit), late poison/exit
+with a real spawned child and charged uncertainty, supervisor crash with the
+pane alive, independent start/executable substitution and FD cleanup, commit
+failure, expired/replaced holder, no enabled/B0-fence bypass, unsupported status,
+unloaded/pending queue and daemon replacement, exact argv/environment isolation,
+no RPC/wait under flock, observed escaped-descendant cleanup, lost response,
+receipt vs ack, restart, K=3, permanent cumulative budget, native abort/human
+pause and stable busy/catch-up. The native C2 fixture is unchanged: it still
+qualifies daemon-side promotion without a TUI and exactly one captain-authorized
+loopback mock request, **not attachment or live operation of this runner**.
+
+Before activation: replay-preserving filter rollover/capacity migration; remaining
+queue/client-ID qualification (no equality assumption); real native runner/PTY
+composer, same-UUID second-client and idle-navigation barriers; authenticated
+runtime pause/reconcile/operator controls and budget/report integration; plus
+captain-authorized PR C live qualification. No real login/model/provider use,
+production deployment, hosted-eligibility change or Codex-owned Rust edit is
+part of B5c. **Paginated installs get no idle mail.** No history mode is changed.
 
 ### B4: Privateer-owned attended-pane proof (reviewed design; implementation split above)
 
