@@ -172,7 +172,10 @@ def build(harness, request):
         # Exec options belong before the resume subcommand. Passing -C or
         # --sandbox after `exec resume` is rejected by native Codex.
         if headless:
-            argv += ["exec", "--json"]
+            # A ship folder is not a git repository, and native Codex refuses
+            # exec outside a trusted git directory. Privateer chose the
+            # directory and the sandbox below still applies.
+            argv += ["exec", "--json", "--skip-git-repo-check"]
         elif resume:
             argv += ["resume"]
         argv += ["-C", repo]

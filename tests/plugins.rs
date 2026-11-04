@@ -175,6 +175,14 @@ fn native_harness_plans_and_brief_are_generic_and_lean() {
     let command = plugins::dispatch(&mut f.store, "plugin.command", args).unwrap();
     assert_eq!(command["argv"][3], "codex");
     assert_eq!(command["argv"][4], "exec");
+    // Ship folders are not git repositories; headless Codex must not refuse them.
+    assert!(
+        command["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "--skip-git-repo-check")
+    );
     assert_eq!(command["cwd"], json!(f.repo));
     assert_eq!(command["env_names"], json!([]));
     let mut args = f.args(&example("codex"));
