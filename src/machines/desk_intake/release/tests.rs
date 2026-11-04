@@ -123,6 +123,58 @@ fn digest_binds_registry_ship_home_and_both_filesystem_checks() {
 }
 
 #[test]
+fn digest_binds_cached_counts_beyond_the_first_fifty_one_rows() {
+    let (_dir, c, args) = setup();
+    let home = args["home"].as_str().unwrap();
+    let key = crate::core::hash(&json!(home));
+    for index in 0..60 {
+        c.execute(
+            "INSERT INTO desk_source_reconciliation VALUES('alpha',?1,?2)",
+            params![format!("beta-{index:02}"), json!({"homes":[]}).to_string()],
+        )
+        .unwrap();
+    }
+    let original = bound(&c, &args);
+    c.execute(
+        "UPDATE desk_source_reconciliation SET proof=?1 WHERE source='beta-59'",
+        [json!({"homes":[{"home":key,"unread":7,"open":3}]}).to_string()],
+    )
+    .unwrap();
+    assert_eq!(cached_counts(&c, home).unwrap(), (Some(7), Some(3)));
+    assert_ne!(plan(&c, &args).unwrap()["digest"], original["digest"]);
+    assert!(
+        apply(&c, &Caller::Operator, "release", &original)
+            .unwrap_err()
+            .to_string()
+            .contains("digest mismatch")
+    );
+    apply(&c, &Caller::Operator, "release", &bound(&c, &args)).unwrap();
+    assert_eq!(
+        c.query_row("SELECT unread,open FROM desk_home_release", [], |r| {
+            Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
+        })
+        .unwrap(),
+        (Some(7), Some(3))
+    );
+}
+
+#[test]
+fn release_plan_fails_closed_when_reconciliation_rows_exceed_the_bound() {
+    let (_dir, c, args) = setup();
+    c.execute_batch(
+        "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<10000)
+         INSERT INTO desk_source_reconciliation SELECT 'alpha',printf('beta-%05d',i),'{\"homes\":[]}' FROM n;",
+    )
+    .unwrap();
+    assert!(
+        plan(&c, &args)
+            .unwrap_err()
+            .to_string()
+            .contains("backpressure")
+    );
+}
+
+#[test]
 fn legacy_loss_writes_bump_epoch_without_rewriting_loss_and_init_repairs_triggers() {
     let (dir, c, _args) = setup();
     let old = Connection::open(dir.path().join("registry.sqlite")).unwrap();

@@ -65,7 +65,7 @@ fn revision(c: &Connection) -> Result<String> {
         "SELECT json_array(domain,source,epoch) FROM desk_intake_loss_epoch ORDER BY domain,source LIMIT 10001",
         "SELECT json_array(home,first_seen_ms) FROM desk_home_missing ORDER BY home LIMIT 10001",
         // Bind cached counts as well as registry membership to the plan.
-        "SELECT json_array(domain,source,proof) FROM desk_source_reconciliation ORDER BY domain,source LIMIT 51",
+        "SELECT json_array(domain,source,proof) FROM desk_source_reconciliation ORDER BY domain,source LIMIT 10001",
         "SELECT json_array(COALESCE(MAX(seq),0)) FROM desk_home_loss_boundary",
     ] {
         let rows = c

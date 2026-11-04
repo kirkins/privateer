@@ -309,6 +309,101 @@ fn unavailable_retained_home_keeps_cached_unread_and_open_facts() {
 }
 
 #[test]
+fn quiet_missing_home_save_reuses_census_and_needs_no_registry_writer_lock() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let t = tempfile::tempdir().unwrap();
+    let database = t.path().join("registry.sqlite");
+    let r = registry(&database);
+    let m = manifest();
+    let path = t.path().join("alpha");
+    r.execute(
+        "INSERT INTO ships VALUES('alpha',?1,1)",
+        [path.to_str().unwrap()],
+    )
+    .unwrap();
+    save(&r, &m, SOURCE, Instant::now() + Duration::from_secs(10)).unwrap();
+    let first: i64 = r
+        .query_row("SELECT first_seen_ms FROM desk_home_missing", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let seen = reads.clone();
+    r.authorizer(Some(move |ctx: AuthContext<'_>| {
+        if matches!(
+            ctx.action,
+            AuthAction::Read {
+                table_name: "desk_home_inventory",
+                ..
+            }
+        ) {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }
+        Authorization::Allow
+    }));
+    let before = r.total_changes();
+    let proof = inspect_now(&r, &m);
+    assert_eq!(proof.homes[0].state, "missing");
+    let inspect_reads = reads.swap(0, Ordering::SeqCst);
+    assert!(inspect_reads > 0);
+    let writer = Connection::open(&database).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    r.busy_timeout(Duration::ZERO).unwrap();
+    save(&r, &m, SOURCE, Instant::now() + Duration::from_secs(10)).unwrap();
+    assert_eq!(r.total_changes(), before, "quiet save wrote registry rows");
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        inspect_reads,
+        "save repeated the inventory census"
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+    r.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    assert_eq!(
+        r.query_row("SELECT first_seen_ms FROM desk_home_missing", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        first
+    );
+    assert_eq!(load(&r, &m, SOURCE).unwrap().unwrap(), proof);
+}
+
+#[test]
+fn missing_sighting_respects_the_shared_inspection_budget() {
+    use crate::mail::source::SlowClock;
+
+    for hours in [3, 5] {
+        let t = tempfile::tempdir().unwrap();
+        let r = registry(&t.path().join("registry.sqlite"));
+        let m = manifest();
+        r.execute(
+            "INSERT INTO ships VALUES('alpha',?1,1)",
+            [t.path().join("alpha").to_str().unwrap()],
+        )
+        .unwrap();
+        let before = r.total_changes();
+        let start = Instant::now();
+        let step = Duration::from_secs(3600);
+        let _clock = SlowClock::start(start, step);
+        // One census home, one proof home and the final inspection check use
+        // three checkpoints. Sighting and proof writes must share that budget,
+        // not restart it or spend it on a second census.
+        let result = save(&r, &m, SOURCE, start + step * hours);
+        if hours == 3 {
+            assert!(result.unwrap_err().to_string().contains("census budget"));
+            assert_eq!(r.total_changes(), before);
+        } else {
+            result.unwrap();
+            assert!(load(&r, &m, SOURCE).unwrap().is_some());
+        }
+    }
+}
+
+#[test]
 fn failed_attempt_discards_only_overflow_not_a_new_provenance_conflict() {
     for fallback in [false, true] {
         let t = tempfile::tempdir().unwrap();

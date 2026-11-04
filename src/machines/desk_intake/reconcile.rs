@@ -175,6 +175,7 @@ fn home_proof(
 /// in the vector. No network, Store::open, schema setup or home writes.
 /// The caller serializes registry imports while taking these home snapshots;
 /// later home writes are outside the vector, not proof of a fresh barrier.
+#[cfg(test)]
 pub(super) fn inspect(
     conn: &Connection,
     m: &Manifest,
@@ -182,6 +183,17 @@ pub(super) fn inspect(
     skipped: &[std::path::PathBuf],
     deadline: Instant,
 ) -> Result<Proof> {
+    Ok(inspect_with_missing(conn, m, source, skipped, deadline)?.0)
+}
+
+// Keep raw paths local to idle reconciliation, never in the serialized proof.
+fn inspect_with_missing(
+    conn: &Connection,
+    m: &Manifest,
+    source: &str,
+    skipped: &[std::path::PathBuf],
+    deadline: Instant,
+) -> Result<(Proof, Vec<std::path::PathBuf>)> {
     participant(m, source)?;
     let _budget = transport::Budget::new(conn, deadline)?;
     let read = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
@@ -195,9 +207,13 @@ pub(super) fn inspect(
             .collect::<Vec<_>>()
     ));
     let mut homes = Vec::new();
+    let mut missing = Vec::new();
     let bound = format!("{}:{source}", binding(m)?);
     for home in census.homes {
         check(deadline)?;
+        if home.state == "missing" {
+            missing.push(home.path.clone());
+        }
         let mut proof = HomeProof {
             home: crate::core::hash(&json!(home.path)),
             retired: home.retired,
@@ -269,28 +285,31 @@ pub(super) fn inspect(
         |r| r.get(0),
     )?;
     let registry_stamp = super::proof::registry_stamp(conn, m, source)?;
-    Ok(Proof {
-        candidate: registry_stamp.is_some()
-            && membership_proved
-            && !loss
-            && !unresolved_origin
-            && copies_complete
-            && homes.iter().all(accepted_home),
-        registry_stamp,
-        copies,
-        binding: binding(m)?,
-        source: source.into(),
-        source_upper: retention::read_head(conn, m, source)?,
-        inventory,
-        membership_history_gap: census.membership_history_gap,
-        membership_proved,
-        history_proved: membership_proved
-            && !loss
-            && !registry_gap
-            && !unresolved
-            && homes.iter().all(accepted_home),
-        homes,
-    })
+    Ok((
+        Proof {
+            candidate: registry_stamp.is_some()
+                && membership_proved
+                && !loss
+                && !unresolved_origin
+                && copies_complete
+                && homes.iter().all(accepted_home),
+            registry_stamp,
+            copies,
+            binding: binding(m)?,
+            source: source.into(),
+            source_upper: retention::read_head(conn, m, source)?,
+            inventory,
+            membership_history_gap: census.membership_history_gap,
+            membership_proved,
+            history_proved: membership_proved
+                && !loss
+                && !registry_gap
+                && !unresolved
+                && homes.iter().all(accepted_home),
+            homes,
+        },
+        missing,
+    ))
 }
 
 pub(super) fn load(conn: &Connection, m: &Manifest, source: &str) -> Result<Option<Proof>> {
@@ -399,18 +418,25 @@ pub(super) fn revalidate_step(
 }
 
 pub(super) fn save(conn: &Connection, m: &Manifest, source: &str, deadline: Instant) -> Result<()> {
-    let mut proof = inspect(conn, m, source, &[], deadline)?;
-    // Only writable idle reconciliation records missing sightings. Plans and
-    // inspection remain read-only. Never overwrite the first observed date.
-    let census = home::census_until(conn, &[], Some(deadline))?;
-    for home in census.homes.iter().filter(|h| h.state == "missing") {
-        conn.execute(
-            "INSERT OR IGNORE INTO desk_home_missing(home,first_seen_ms) VALUES(?1,?2)",
-            params![
-                home.path.to_string_lossy().as_ref(),
-                crate::store::Store::now_ms()
-            ],
+    let (mut proof, missing) = inspect_with_missing(conn, m, source, &[], deadline)?;
+    // Reuse the inspected census: do not open/count all the homes again.
+    // Only writable idle reconciliation records missing sightings. SELECT
+    // first so an already-recorded absence needs no registry writer lock.
+    // INSERT OR IGNORE preserves the first date if another worker races us.
+    for path in missing {
+        check(deadline)?;
+        let home = path.to_string_lossy();
+        let known: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM desk_home_missing WHERE home=?1)",
+            [home.as_ref()],
+            |r| r.get(0),
         )?;
+        if !known {
+            conn.execute(
+                "INSERT OR IGNORE INTO desk_home_missing(home,first_seen_ms) VALUES(?1,?2)",
+                params![home.as_ref(), crate::store::Store::now_ms()],
+            )?;
+        }
     }
     // Quiet reconciliation is read-only, even with a different writer active.
     let old: Option<String> = conn
@@ -446,6 +472,7 @@ pub(super) fn save(conn: &Connection, m: &Manifest, source: &str, deadline: Inst
     }
     let body = serde_json::to_string(&proof)?;
     if old.as_deref() != Some(&body) {
+        check(deadline)?;
         conn.execute("INSERT INTO desk_source_reconciliation(domain,source,proof) VALUES(?1,?2,?3) ON CONFLICT(domain,source) DO UPDATE SET proof=excluded.proof", params![m.domain,source,body])?;
     }
     Ok(())
