@@ -647,8 +647,8 @@ pub(crate) fn wanted(
 /// transaction that rechecks the reason. The adapter checks ownership before
 /// each delivery, so once this commits it starts no turn, and stopping the
 /// harness ends nothing a turn was using. None if nothing is due any more. The
-/// mail sequence seen at the fence comes back too: a pane that starts asleep
-/// from it wakes on any mail after it.
+/// accepted/acknowledged mail boundary comes back too: a pane starting asleep
+/// must wake for actionable backlog, including mail already at the fence.
 pub(crate) fn fence(
     store: &Store,
     ship: &str,
@@ -663,11 +663,7 @@ pub(crate) fn fence(
     if !presence::hand_over(store, ship, holder, &fenced)? {
         return Ok(None);
     }
-    let through: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(seq),0) FROM mail WHERE recipient=?1",
-        [ship],
-        |r| r.get(0),
-    )?;
+    let through = super::sleep::accepted_through(store.connection(), ship)?;
     tx.execute(
         "UPDATE hosted_relaunches SET holder=?3 WHERE ship=?1 AND holder=?2",
         params![ship, holder, fenced],

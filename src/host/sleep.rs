@@ -26,8 +26,8 @@ pub(crate) const DEFAULT_AFTER_SECS: u64 = 1_800;
 /// somehow still running, no longer owns the ship.
 pub(crate) struct Asleep {
     pub holder: String,
-    /// Mail through this sequence was there before sleeping and wakes
-    /// nothing, an unhandled request aside.
+    /// Wake scan boundary, never evidence of acceptance. At relaunch this
+    /// cannot exceed real accepted/acknowledged progress.
     pub through_seq: i64,
 }
 
@@ -105,11 +105,7 @@ pub(crate) fn sleep(
         params![ship, holder, asleep],
     )?;
     tx.execute("DELETE FROM work_sessions WHERE ship=?1", [ship])?;
-    let through_seq: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(seq),0) FROM mail WHERE recipient=?1",
-        [ship],
-        |r| r.get(0),
-    )?;
+    let through_seq = accepted_through(store.connection(), ship)?;
     store.audit(
         "host.slept",
         &json!({"ship": ship, "idle_secs": after_secs, "through_seq": through_seq}),
@@ -121,8 +117,22 @@ pub(crate) fn sleep(
     }))
 }
 
+/// Actual receipts survive a holder change as historical evidence only. A
+/// delivery report's diagnostic watermark, declines and sleep boundary are
+/// deliberately excluded. This reads facts; it never acknowledges mail.
+pub(super) fn accepted_through(conn: &rusqlite::Connection, ship: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT MAX(
+           COALESCE((SELECT presented_through FROM presence WHERE ship=?1),0),
+           COALESCE((SELECT through_seq FROM mail_cursor WHERE address=?1),0),
+           COALESCE((SELECT accepted FROM hosted_delivery WHERE ship=?1),0))",
+        [ship],
+        |r| r.get(0),
+    )?)
+}
+
 /// What wakes a sleeping first mate, other than the captain at its pane:
-/// actionable mail that arrived after it slept, a request it has neither
+/// actionable mail past accepted/acknowledged progress, a request it has neither
 /// answered nor acknowledged whenever it arrived, or scheduled work now ready.
 /// Mail that is only the dispatcher's backlog notices wakes it for "backlog".
 pub(crate) fn alarm(store: &Store, ship: &str, asleep: &Asleep) -> Result<Option<&'static str>> {
@@ -137,7 +147,15 @@ pub(crate) fn alarm(store: &Store, ship: &str, asleep: &Asleep) -> Result<Option
                AND COALESCE(delivery,'received')='received' AND NOT ({})",
             crate::mail::ROUTINE_MAIL
         ),
-        params![ship, asleep.through_seq, crate::mail::CREW],
+        // Clamp legacy arrival-based sleep boundaries too: mail queued before
+        // a replacement started must not require the captain to focus its pane.
+        params![
+            ship,
+            asleep
+                .through_seq
+                .min(accepted_through(store.connection(), ship)?),
+            crate::mail::CREW
+        ],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     if mail || unhandled_request(store, ship)? {
@@ -149,10 +167,9 @@ pub(crate) fn alarm(store: &Store, ship: &str, asleep: &Asleep) -> Result<Option
     Ok(crate::scheduling::has_ready(store, ship)?.then_some("scheduled work"))
 }
 
-/// A pane that starts asleep has no harness to stop: the mail already there
-/// wakes nothing, as it would have before a sleep. That is the mail through
-/// the sequence the retired pane recorded, so mail that arrived after it left
-/// but before this pane started still wakes it.
+/// A pane that starts asleep has no harness to stop. Only real acceptance or
+/// acknowledgement may exclude pre-handoff mail from its wake scan. Clamp a
+/// carried boundary from older releases that used mailbox arrival instead.
 pub(crate) fn asleep_at_start(store: &Store, ship: &str, holder: &str) -> Result<Asleep> {
     let carried: Option<i64> = store
         .connection()
@@ -163,14 +180,8 @@ pub(crate) fn asleep_at_start(store: &Store, ship: &str, holder: &str) -> Result
         )
         .optional()?
         .flatten();
-    let through_seq = match carried {
-        Some(through) => through,
-        None => store.connection().query_row(
-            "SELECT COALESCE(MAX(seq),0) FROM mail WHERE recipient=?1",
-            [ship],
-            |r| r.get(0),
-        )?,
-    };
+    let accepted = accepted_through(store.connection(), ship)?;
+    let through_seq = carried.map_or(accepted, |through| through.min(accepted));
     store.connection().execute(
         "UPDATE presence SET asleep_holder=?2, asleep_since_ms=?3 WHERE ship=?1 AND holder=?2",
         params![ship, holder, crate::store::Store::now_ms()],
@@ -515,6 +526,10 @@ fn say(store: &Store, ship: &str, body: &str) {
 }
 
 #[cfg(test)]
+#[path = "sleep_regressions.rs"]
+mod regressions;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -605,6 +620,16 @@ mod tests {
         )
         .unwrap();
 
+        // The first request was answered above. Record its acknowledgement:
+        // arrival alone is no longer enough to exclude pre-sleep mail.
+        store
+            .connection()
+            .execute(
+                "INSERT INTO mail_cursor(address,through_seq)
+             SELECT recipient,seq FROM mail WHERE id='baf32096'",
+                [],
+            )
+            .unwrap();
         // infra goes to sleep with all mail through current sequence seen.
         let through_seq: i64 = store
             .connection()
