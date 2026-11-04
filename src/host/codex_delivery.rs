@@ -273,7 +273,7 @@ impl Ticker {
         ticker
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn capture_stderr(&mut self, path: PathBuf) {
         self.stderr = Some(path);
     }

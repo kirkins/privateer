@@ -289,6 +289,9 @@ fn codex_delivery_low_budget_notice_reaches_the_captain_once() {
     assert_eq!(notices, 1);
 }
 
+// Hosted Codex delivery is Linux-only; macOS's python3 shim adds its own
+// environment (SDKROOT, CPATH, __CF_USER_TEXT_ENCODING) to every child.
+#[cfg(target_os = "linux")]
 #[test]
 fn codex_delivery_ticker_runs_one_bounded_pass_at_a_time_with_a_clean_environment() {
     if !Path::new(PYTHON).exists() {
@@ -332,6 +335,9 @@ fn codex_delivery_ticker_runs_one_bounded_pass_at_a_time_with_a_clean_environmen
     assert!(ticker.child.is_none());
 }
 
+// Hosted Codex delivery is Linux-only; macOS's python3 shim adds its own
+// environment (SDKROOT, CPATH, __CF_USER_TEXT_ENCODING) to every child.
+#[cfg(target_os = "linux")]
 #[test]
 fn codex_delivery_ticker_runs_the_real_runner_under_isolated_python() {
     if !Path::new(PYTHON).exists() {
