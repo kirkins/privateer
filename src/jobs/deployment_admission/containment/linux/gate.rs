@@ -4,6 +4,8 @@
 use super::*;
 
 mod elf;
+mod sealed;
+use sealed::SealedExecutable;
 
 pub(super) struct ChildExec {
     gate: RawFd,
@@ -61,10 +63,10 @@ fn read_ack(report: &mut File, bytes: &mut [u8], deadline: u64) -> Result<()> {
 
 impl Qualified {
     // Intentionally private even to the rest of the crate. Only authority-free
-    // fixtures call this in iii-a. A held File is not a digest/claim proof.
+    // fixtures call this. Immutable executable bytes are not a claim proof.
     fn gate(
         &mut self,
-        executable: &File,
+        executable: &SealedExecutable,
         args: &[CString],
         timeout_ms: u64,
     ) -> Result<ExecGate<'_>> {
@@ -83,7 +85,8 @@ impl Qualified {
                 <= 65536,
             "gate argv exceeds bound"
         );
-        elf::validate(executable)?;
+        // Only sealed::copy constructs this type, after hashing and validating
+        // the same immutable fd. No mutable source file can enter this gate.
         ensure!(!self.cleanup_unknown, "unresolved earlier custody");
         verify_mount(&self.directory)?;
         ensure!(self.read(c"pids.max")?.trim() == "16", "pids.max changed");
@@ -99,7 +102,7 @@ impl Qualified {
         let cwd = tempfile::tempdir()?;
         let work = duplicate(File::open(cwd.path())?.as_raw_fd())?;
         let ancestor = duplicate(self.parent.as_raw_fd())?;
-        let native = duplicate(executable.as_raw_fd())?;
+        let native = duplicate(executable.file().as_raw_fd())?;
         let null = duplicate(
             std::fs::OpenOptions::new()
                 .read(true)
@@ -132,6 +135,7 @@ impl Qualified {
             cgroup: self.directory.as_raw_fd() as u64,
             ..Default::default()
         };
+        let blocked = super::signals::Blocked::new()?;
         let pid =
             unsafe { libc::syscall(libc::SYS_clone3, &args, std::mem::size_of::<CloneArgs>()) };
         if pid == 0 {
@@ -145,11 +149,9 @@ impl Qualified {
                 )
             }
         }
-        ensure!(
-            pid > 0,
-            "exec gate clone3 refused: {}",
-            std::io::Error::last_os_error()
-        );
+        let clone_error = std::io::Error::last_os_error();
+        drop(blocked);
+        ensure!(pid > 0, "exec gate clone3 refused: {clone_error}");
         let pidfd = unsafe { File::from_raw_fd(pidfd) };
         // Establish RAII cleanup immediately after clone, before fallible reads.
         self.cleanup_unknown = true;
@@ -262,9 +264,6 @@ impl Drop for ExecGate<'_> {
 // allocation, formatting, locks, destructors or unwinding to these functions.
 pub(super) unsafe fn prepare_child(exec: &ChildExec) {
     unsafe {
-        if !reset_signals_and_session() {
-            libc::_exit(123);
-        }
         if libc::dup3(exec.gate, 5, libc::O_CLOEXEC) < 0
             || libc::dup3(exec.executable, 6, libc::O_CLOEXEC) < 0
         {
@@ -285,19 +284,10 @@ pub(super) unsafe fn prepare_child(exec: &ChildExec) {
 // their mask bits must also be reset in this fork-like, single-threaded child.
 // A zero kernel sigaction is SIG_DFL, no flags/restorer and an empty mask on
 // supported Linux architectures; the buffer covers every ABI's struct layout.
-unsafe fn reset_signals_and_session() -> bool {
+pub(super) unsafe fn reset_signals_and_session() -> bool {
     unsafe {
-        let empty = 0u64;
-        if libc::syscall(
-            libc::SYS_rt_sigprocmask,
-            libc::SIG_SETMASK,
-            &empty,
-            std::ptr::null_mut::<u64>(),
-            8,
-        ) != 0
-        {
-            return false;
-        }
+        // clone inherited the fully blocked mask. Reset dispositions FIRST:
+        // pending signals must never invoke an inherited parent handler.
         let action = [0u64; 4];
         for signal in 1..=64 {
             if signal == libc::SIGKILL || signal == libc::SIGSTOP {
@@ -313,6 +303,17 @@ unsafe fn reset_signals_and_session() -> bool {
             {
                 return false;
             }
+        }
+        let empty = 0u64;
+        if libc::syscall(
+            libc::SYS_rt_sigprocmask,
+            libc::SIG_SETMASK,
+            &empty,
+            std::ptr::null_mut::<u64>(),
+            8,
+        ) != 0
+        {
+            return false;
         }
         libc::setsid() >= 0
     }

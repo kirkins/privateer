@@ -15,6 +15,7 @@ use std::{
 };
 
 mod gate;
+mod signals;
 #[cfg(test)]
 mod tests;
 
@@ -338,6 +339,7 @@ fn probe(held: &mut Qualified) -> Result<()> {
         cgroup: held.directory.as_raw_fd() as u64,
         ..Default::default()
     };
+    let blocked = signals::Blocked::new()?;
     let pid = unsafe { libc::syscall(libc::SYS_clone3, &args, std::mem::size_of::<CloneArgs>()) };
     if pid == 0 {
         // SAFETY: no allocation, Rust cleanup or shared-VM clone on this path.
@@ -351,10 +353,11 @@ fn probe(held: &mut Qualified) -> Result<()> {
             )
         }
     }
+    let clone_error = std::io::Error::last_os_error();
+    drop(blocked);
     ensure!(
         pid > 0,
-        "clone3 INTO_CGROUP/NEWCGROUP/PIDFD refused: {}",
-        std::io::Error::last_os_error()
+        "clone3 INTO_CGROUP/NEWCGROUP/PIDFD refused: {clone_error}"
     );
     // CLONE_PIDFD is mandatory: never signal a possibly reused numeric pid.
     let pidfd = unsafe { File::from_raw_fd(pidfd) };
@@ -494,6 +497,9 @@ unsafe fn probe_child(
     exec: *const gate::ChildExec,
 ) -> ! {
     unsafe {
+        if !gate::reset_signals_and_session() {
+            libc::_exit(123);
+        }
         if libc::dup3(ancestor, 3, libc::O_CLOEXEC) < 0
             || libc::dup3(output, 4, libc::O_CLOEXEC) < 0
             || libc::fchdir(cwd) < 0

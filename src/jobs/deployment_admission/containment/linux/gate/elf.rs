@@ -2,6 +2,13 @@
 //! little-endian ELF on the listed Linux targets is supported. The kernel still
 //! validates loadability; this check prevents an ambient PT_INTERP escape from
 //! the held-inode digest policy before any child is created.
+//!
+//! Trusted adapter/host assumptions, NOT established by this structural check:
+//! ET_DYN without PT_INTERP includes the dynamic loader itself, which can load
+//! another program from argv (even if renamed away from a known loader path).
+//! A host binfmt_misc rule matching native ELF magic may run before binfmt_elf.
+//! The reviewed adapter must not load ambient code, and the trusted host must
+//! exclude such ELF-intercepting binfmt rules. See the design's b2a contract.
 use super::*;
 use std::os::unix::fs::FileExt;
 
