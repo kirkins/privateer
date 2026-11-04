@@ -331,3 +331,29 @@ fn codex_delivery_ticker_runs_one_bounded_pass_at_a_time_with_a_clean_environmen
     ticker.poll(tmp.path());
     assert!(ticker.child.is_none());
 }
+
+#[test]
+fn codex_delivery_ticker_runs_the_real_runner_under_isolated_python() {
+    if !Path::new(PYTHON).exists() {
+        return;
+    }
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/attended-codex/codex_runner.py");
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("launch.json"),
+        json!({"home": tmp.path().join("home"), "ship": "alpha", "state": "unbound"}).to_string(),
+    )
+    .unwrap();
+    let stderr = tmp.path().join("stderr");
+    let mut ticker = Ticker::new(script);
+    ticker.capture_stderr(stderr.clone());
+    ticker.poll(tmp.path());
+    let (child, _) = ticker.child.as_mut().expect("runner was not spawned");
+    let status = child.wait().unwrap();
+    ticker.child = None;
+    let output = fs::read_to_string(&stderr).unwrap();
+    assert!(status.success(), "runner exited {status}: {output}");
+    assert!(!output.contains("ModuleNotFoundError"), "{output}");
+    assert!(!output.contains("Traceback"), "{output}");
+}

@@ -352,7 +352,9 @@ impl Custody {
             "holder": holder, "ship": ship, "pid": self.pid, "process_identity": self.process,
             "executable": exe, "daemon": native, "supervisor_pid": std::process::id(),
             "supervisor_identity": identity(std::process::id())?,
-            "supervisor_executable": executable(std::process::id())?, "delivery_enabled": false});
+            "supervisor_executable": executable(std::process::id())?, "delivery_control": "captain_grant"});
+        // Legacy records may still carry `delivery_enabled`; readers ignore it and
+        // only the matching unpoisoned token authorizes delivery.
         // Never mint a fresh token on callbacks, daemon replacement or holder change.
         atomic(&self.dir, "custody.json", &held)?;
         self.held = Some(held);

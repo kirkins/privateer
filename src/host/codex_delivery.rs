@@ -243,6 +243,9 @@ pub(crate) struct Ticker {
     script: PathBuf,
     child: Option<(Child, Instant)>,
     last: Option<Instant>,
+    spawn_failure_logged: bool,
+    #[cfg(test)]
+    stderr: Option<PathBuf>,
 }
 
 const EVERY: Duration = Duration::from_secs(5);
@@ -252,11 +255,27 @@ const PYTHON: &str = "/usr/bin/python3";
 
 impl Ticker {
     pub(crate) fn new(script: PathBuf) -> Self {
-        Self {
+        #[cfg(test)]
+        let ticker = Self {
             script,
             child: None,
             last: None,
-        }
+            spawn_failure_logged: false,
+            stderr: None,
+        };
+        #[cfg(not(test))]
+        let ticker = Self {
+            script,
+            child: None,
+            last: None,
+            spawn_failure_logged: false,
+        };
+        ticker
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_stderr(&mut self, path: PathBuf) {
+        self.stderr = Some(path);
     }
 
     /// Reap a finished pass; a pass past its cap loses its process group.
@@ -288,13 +307,29 @@ impl Ticker {
             .env("LANG", "C.UTF-8")
             .current_dir(dir)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::null());
+        #[cfg(test)]
+        if let Some(path) = &self.stderr {
+            command.stderr(Stdio::from(
+                std::fs::File::create(path).expect("create runner stderr capture"),
+            ));
+        } else {
+            command.stderr(Stdio::null());
+        }
+        #[cfg(not(test))]
+        command.stderr(Stdio::null());
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
         match command.spawn() {
             Ok(child) => self.child = Some((child, Instant::now())),
-            Err(error) => eprintln!("Codex mail runner unavailable: {error}"),
+            Err(error) => {
+                // A missing interpreter or script is retried each pass; report
+                // it once per custody instead of every five seconds.
+                if !self.spawn_failure_logged {
+                    eprintln!("Codex mail runner unavailable: {error}");
+                    self.spawn_failure_logged = true;
+                }
+            }
         }
     }
 

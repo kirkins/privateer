@@ -18,6 +18,9 @@ import time
 import uuid
 
 sys.dont_write_bytecode = True
+# The supervisor runs this script under `python3 -I -B`, which omits the script's
+# own folder from sys.path; restore it before importing sibling modules.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from codex_binding import PATH_ENV, atomic, control, locked, require_fence
 import codex_mail
 from codex_receipts import (FINAL, MAX_LEDGER, MAX_SESSIONS, Ledger, anchor, checkpoint, digest,
