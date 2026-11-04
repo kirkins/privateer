@@ -50,4 +50,11 @@ fn pushed_reply_records_authenticated_origin_not_envelope_claim() {
     assert_eq!(out["ok"],true,"{out}");
     let origin: Option<String> = c.query_row("SELECT origin_machine FROM mail WHERE id='untrusted-reply'",[],|r|r.get(0)).unwrap();
     assert_eq!(origin,None);
+    // Local dispatch does not pass through the gateway's link validation.
+    // Even a claim naming a linked machine is not an agent's provenance.
+    let args = json!({"id":"agent-origin-claim","from":"survey","to":"relay","kind":"notice","body":"Local agent origin claim","via":"alpha"});
+    let out = b.command().args(["--role","agent","--actor","survey","--home",b.root.join("relay/.privateer").to_str().unwrap(),"mail.deliver","--json",&args.to_string()]).output().unwrap();
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let origin: Option<String> = c.query_row("SELECT origin_machine FROM mail WHERE id='agent-origin-claim'",[],|r|r.get(0)).unwrap();
+    assert_eq!(origin,None);
 }

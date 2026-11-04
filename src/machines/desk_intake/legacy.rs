@@ -135,6 +135,10 @@ pub(super) fn plan(c: &Connection, m: &Manifest, source: &str) -> Result<Value> 
     let mut homes = Vec::new();
     let mut total = 0;
     for (path, h) in paths.iter().zip(&vector.homes) {
+        ensure!(
+            h.home == crate::core::hash(&json!(path)),
+            "home changed during legacy plan"
+        );
         if h.state == "released" {
             // An absent released home has no observable mailbox/high-water.
             homes.push(HomeCut {

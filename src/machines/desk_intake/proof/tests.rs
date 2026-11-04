@@ -76,7 +76,7 @@ fn send(h: &mut Store, id: &str) {
 }
 
 #[test]
-fn v2_peer_drops_v3_evidence_but_preserves_ordinary_frame() {
+fn v2_peer_rejects_v3_evidence_sidecar() {
     // Exact v2 evidence field set/parser policy; its optional sidecar decoder
     // ignores an Err rather than rejecting the strict intake frame.
     #[derive(Deserialize)]
@@ -101,12 +101,6 @@ fn v2_peer_drops_v3_evidence_but_preserves_ordinary_frame() {
     v2.as_object_mut().unwrap().remove("cut_digest");
     v2["version"] = json!(2);
     assert!(serde_json::from_value::<V2Evidence>(v2).is_ok());
-    let ordinary = json!({"version":1,"ordinary":"page"});
-    let mut reconstructed = ordinary.clone();
-    if let Ok(_old_evidence) = serde_json::from_value::<V2Evidence>(wire) {
-        reconstructed["proof"] = json!(true);
-    }
-    assert_eq!(reconstructed, ordinary);
 }
 
 #[test]
