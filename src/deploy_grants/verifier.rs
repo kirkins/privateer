@@ -226,6 +226,11 @@ impl Verified {
         config::unpaused(&self.inputs)
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn artifact_file(&self) -> Result<File> {
+        Ok(self.artifact.file().try_clone()?)
+    }
+
     pub(super) fn value(&self) -> &Value {
         &self.value
     }

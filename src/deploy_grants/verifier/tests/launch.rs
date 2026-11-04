@@ -43,6 +43,32 @@ int main(int argc, char **argv) {
     int marker = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (marker < 0 || write(marker, "executed", 8) != 8) return 44;
     close(marker);
+    unsigned char prefix[4];
+    if (read(0, prefix, 4) != 4) return 45;
+    size_t length_in = ((size_t)prefix[0] << 24) | ((size_t)prefix[1] << 16) |
+        ((size_t)prefix[2] << 8) | prefix[3];
+    if (length_in == 0 || length_in > 16384) return 45;
+    char metadata[16385];
+    size_t offset = 0;
+    while (offset < length_in) {
+        ssize_t n = read(0, metadata + offset, length_in - offset);
+        if (n <= 0) return 45;
+        offset += (size_t)n;
+    }
+    metadata[length_in] = 0;
+    if (!strstr(metadata, "\"schema_version\":1") || strstr(metadata, "path") ||
+        strstr(metadata, "PRIVATEER_ADAPTER_CONFIG")) return 45;
+    char artifact[32];
+    offset = 0;
+    for (;;) {
+        ssize_t n = read(0, artifact + offset, sizeof(artifact) - offset);
+        if (n < 0 || offset == sizeof(artifact)) return 45;
+        if (n == 0) break;
+        offset += (size_t)n;
+    }
+    if (offset != 14 || memcmp(artifact, "alpha artifact", 14)) return 45;
+    const char reply[] = "\0\0\0\47{\"schema_version\":1,\"status\":\"success\"}";
+    if (write(1, reply, sizeof(reply) - 1) != (ssize_t)(sizeof(reply) - 1)) return 46;
     return 0;
 }
 "#;
@@ -327,6 +353,7 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
     }
 
     abort_ledger_tests(&binary);
+    final_release_tests(&binary);
 
     let Some(delegation) = std::env::var_os("PRIVATEER_TEST_CGROUP_DELEGATION") else {
         assert!(containment::qualify(root.path()).is_err());
@@ -343,6 +370,9 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
         "late-pause",
         "late-unreadable",
         "late-malformed",
+        "late-grant-pause",
+        "late-grant-revoke",
+        "late-audit",
     ] {
         let fixture = prepared_fixture(&binary);
         let (id, claim) = fresh(&fixture);
@@ -363,6 +393,7 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
             .expect("explicit isolated delegation must qualify");
         let pause = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap())
             .join("privateer/deployment-pause.json");
+        let lifecycle = Store::open(fixture.store.home()).unwrap();
         containment::RELEASE_OBSERVER.with(|observer| {
             *observer.borrow_mut() = Some(Box::new(move |stage| {
                 if (stage == "host_locked" && fault == "locked-pause")
@@ -373,6 +404,13 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
                     fs::remove_file(&pause).unwrap();
                 } else if stage == "before_release" && fault == "late-malformed" {
                     private(&pause, b"{");
+                } else if stage == "before_release" && fault == "late-grant-pause" {
+                    lifecycle.connection().execute_batch("UPDATE standing_deploy_grants SET paused_ms=1,revision=revision+1 WHERE id='alpha'").unwrap();
+                } else if stage == "before_release" && fault == "late-grant-revoke" {
+                    lifecycle.connection().execute_batch("UPDATE standing_deploy_grants SET revoked_ms=1,revision=revision+1 WHERE id='alpha'").unwrap();
+                } else if stage == "before_release" && fault == "late-audit" {
+                    private(&pause, b"{\"installation_id\":\"alpha\",\"paused\":true}");
+                    lifecycle.connection().execute_batch("CREATE TRIGGER fail_abort BEFORE INSERT ON audit WHEN NEW.kind='deployment.release_refused' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
                 }
             }));
         });
@@ -385,15 +423,28 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
         );
         let late = fault.starts_with("late-");
         if fault == "none" {
-            let status = result.unwrap();
+            let report = result.unwrap();
+            assert!(report.protocol_success, "{report:?}");
+            assert!(report.cleanup_proven_empty);
+            assert_eq!(report.artifact_bytes, 14);
+            assert_eq!(
+                report.artifact_sha256,
+                format!("{:x}", Sha256::digest(b"alpha artifact"))
+            );
+            let status = report.wait_status.unwrap();
             assert!(libc::WIFEXITED(status));
             assert_eq!(libc::WEXITSTATUS(status), 0);
         } else {
             assert!(result.is_err(), "{fault}");
+            if fault == "late-audit" {
+                assert!(
+                    format!("{:#}", result.unwrap_err()).contains("deployment release refused")
+                );
+            }
         }
         assert_eq!(
             state(&fixture, &id),
-            if fault == "none" {
+            if fault == "none" || fault == "late-audit" {
                 "started"
             } else if late {
                 "denied"
@@ -401,7 +452,7 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
                 "claimed"
             }
         );
-        if late {
+        if late && fault != "late-audit" {
             let outcome: String = fixture
                 .store
                 .connection()
@@ -450,6 +501,60 @@ fn consuming_spawn_bindings_and_fresh_claim_are_isolated() {
             assert_eq!(host_record, home_record);
         }
         boundary.dispose_test_boundary();
+    }
+}
+
+// Ordinary committed lifecycle reads, not positive containment evidence.
+fn final_release_tests(binary: &Path) {
+    for fault in [
+        "none",
+        "pause",
+        "revoke",
+        "revision",
+        "missing",
+        "unreadable",
+    ] {
+        let fixture = prepared_fixture(binary);
+        let (_id, claim) = fresh(&fixture);
+        let (held, metadata) = claim.protocol_input().unwrap();
+        assert_eq!(held.metadata().unwrap().len(), 14);
+        assert!(metadata["artifact"].get("path").is_none());
+        assert!(metadata.get("bindings").is_none());
+        let other = Store::open(fixture.store.home()).unwrap();
+        match fault {
+            "pause" => other
+                .connection()
+                .execute_batch("UPDATE standing_deploy_grants SET paused_ms=1 WHERE id='alpha'")
+                .unwrap(),
+            "revoke" => other
+                .connection()
+                .execute_batch("UPDATE standing_deploy_grants SET revoked_ms=1 WHERE id='alpha'")
+                .unwrap(),
+            "revision" => other
+                .connection()
+                .execute_batch(
+                    "UPDATE standing_deploy_grants SET revision=revision+1 WHERE id='alpha'",
+                )
+                .unwrap(),
+            "unreadable" => other
+                .connection()
+                .execute_batch("ALTER TABLE standing_deploy_grants RENAME TO unavailable_grants")
+                .unwrap(),
+            _ => {}
+        }
+        // Test a missing lookup via an empty standalone Store, without disabling
+        // the real ledger's foreign-key constraints.
+        if fault == "missing" {
+            let empty = tempfile::tempdir().unwrap();
+            let store = Store::open(empty.path()).unwrap();
+            assert!(claim.check_grant_lifecycle(&store).is_err());
+        } else {
+            assert_eq!(
+                claim.check_grant_lifecycle(&fixture.store).is_ok(),
+                fault == "none",
+                "{fault}"
+            );
+        }
     }
 }
 
