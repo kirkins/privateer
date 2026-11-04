@@ -6,6 +6,9 @@ mate's approved split, B1 implements only the pre-lock poison prerequisite and
 known-B0 dispatcher migration. B2 adds a dormant materialized receipt ledger
 and opt-in queue-promoter fixture. B3a fixes its review findings; B3b fixes
 rejected/abandoned history growth and adds negative attachment/receipt qualification.
+B4 addresses nonce-capacity diagnostics, qualifies one accepted queue input against
+an isolated loopback mock (captain-approved scope change), and proposes a
+Privateer-owned attended-pane proof for review, **design only**.
 No runner or B3c control/report integration is implemented; delivery stays disabled. The fresh
 reservation decision below is design only, not implementation approval.
 Goal: an explicitly launched Codex first-mate pane handles idle mail without
@@ -702,6 +705,181 @@ installs get no idle mail.** Gate outputs must report the native observations
 and zero provider requests; a passing negative probe does not mean activation
 passed.
 
+### B4: filter capacity and one-request fixture
+
+B3b's zero-request result above is historical. The captain approved exactly one
+queued turn per isolated fixture run reaching **only the fixture's own loopback mock provider** for B4.
+No real model, login, auth.json, production route/history edit or live daemon is
+permitted. All other turns still stop at trusted hooks. The nonce-selected
+UserPromptSubmit allowance is one-use (exclusive file creation); the mock returns
+a terminal canned response, with provider/stream retries disabled in the
+throwaway config. The fixture asserts exactly one request to its loopback port,
+and records the actual native events before checking the receipt contract.
+Neither this request nor a native accepted-input receipt qualifies attachment or
+live mail. Delivery remains disabled; no runner is authorized in B4.
+
+**Observed evidence:** serial admitted gate `9ed9bfa0-2204-4c56-864c-c0474b2cf8d9`
+passed all eight steps (Codex Rust units 2, Python 84, plugins 36, attended 24,
+bytecode guard 1, build, binding fixture and queue fixture). The binding fixture
+made zero requests; the queue fixture made exactly one POST to its own
+`127.0.0.1:<fixture port>/v1/responses`. Both CLI and owned daemon were 0.166.0.
+The real rollout recorded, in order:
+
+1. `event_msg/task_started` with `turn_id` and
+   `turn_attribution.turn_trigger:"queue"`.
+2. `event_msg/user_message` with a **canonical UUID `client_id`**, exact queued
+   `message`, and empty `images`, `local_images`, `audio`, `local_audio`,
+   `text_elements` arrays. It has **no `turn_id`**.
+3. `event_msg/task_complete` with the same native turn ID (with an intervening
+   token-count event for the canned mock response).
+
+The observed lifecycle/input/terminal payloads (token-count omitted) are pinned
+in `tests/fixtures/codex-queue-accepted.jsonl`; only fixture-generated values, no
+credentials or personal names. `native_client` requires that exact text-only
+input shape and canonical client UUID. A matching body with missing/aliased
+fields, multimedia, extra turn ID or unknown shape pauses with a clear
+`native text-only user_message schema unqualified` reason, not a guessed alias.
+Turn association still comes only from the anchored open lifecycle. The new
+native probe also prepares a real ledger anchor before the one request and
+reconstructs the reducer to prove receipt recovery without CLI output; it
+asserts accepted progress with **zero acknowledgement**. This replaces the old
+synthetic input contract; it does not qualify paginated receipts or attachment.
+A repeat of the permitted hook input is explicitly refused by the one-use guard.
+
+The non-deleting nonce filter now has **separate closed diagnostics**, not a
+blanket claim that every match proves nonce reuse:
+
+- Exact retained nonce/digest match: `receipt nonce reused`.
+- Filter-only match: `nonce_filter_possible_reuse` (could be an evicted real
+  nonce OR a false positive; do not assert which).
+- Fill >= 25%: `nonce_filter_saturated`, even for a nonce whose bits do not match.
+
+Both filter errors include the responsible session, fill ratio, 65,536-bit
+capacity and maximum fill. They close admission transactionally without changing
+the ledger or acceptance/ack cursors. With four independent indices this fixed
+8 KiB bitset (16 KiB hex JSON) reaches 25% fill at roughly 4,700 distinct admitted
+retirements per session; false-positive probability there is roughly 0.39%.
+This is an estimate, not an insert-count guarantee. Existing more-filled B3b
+filters are preserved and refused, never cleared automatically. Old digest-only
+ledgers migrate conservatively, including unknown historical rejection digests;
+we cannot subtract them from an existing non-deleting filter safely.
+
+Positively pre-request `rejected` offers no longer consume admission-filter
+capacity. Compaction counts them separately in `rejected_count`, retains the last
+256 exact rejection digests and drops their full bodies. Eviction of these exact
+digests is safe ONLY because the trusted rejection evidence proves no child or
+native request ever existed; there is no possible old native admission to
+correlate. Their old nonce may eventually be accepted as fresh, unlike any nonce
+that might have reached Codex. Prepared/uncertain/queued/presented/acked/operator
+resolved nonces do NOT get this exemption. The latest intent remains pinned.
+This intentionally supersedes B3b's all-retired-nonces-forever filter promise for
+never-spawned failures only. Existing uncertain facts and audits are unchanged.
+
+**Future runner backoff contract:** either filter diagnostic pauses new offers
+immediately and surfaces/coalesces a stable diagnostic per project/session/kind;
+it does not spend a native decline, manufacture progress, regenerate random
+nonces until one passes, retry every five seconds, switch session, clear the
+filter, or wait for the watchdog to explain the stall. Reconciliation/real ack
+of an existing offer remains possible. Resume requires explicit operator capacity
+review (a separately designed durable replay-preserving ledger rollover or
+capacity migration), not timer/captain chatter/rebind. No such rollover or runner
+is implemented here. Rejected-exec failures retain the existing one-minute/K=3
+retry contract; exemption from filter capacity is not permission to spin.
+
+### B4: Privateer-owned attended-pane proof (DESIGN ONLY, Opus review requested)
+
+0.166 loaded/idle is not ATTACHED. A future alternative can restrict attended
+mail to **Privateer's own hosted, supervised exact-resume pane**, rather than
+claiming a public Codex attachment detector. Manual terminals, merely loaded
+threads, app-server clients and stale launch records never qualify. This is a
+narrower local authorization proof, not proof that the daemon's queue promoter
+needs a TUI. It cannot enable delivery until independently reviewed and tested.
+
+**Recorded identity and ownership.** The one hosted supervisor owns the actual
+native child and its wait handle. After exec, require the absolute executable
+plus device/inode, PID, boot ID and `/proc` start time, and hold a Linux pidfd for
+that exact process (PID reuse cannot substitute). The native launch wrapper must
+exec, not leave a wrapper whose exit could hide a live payload. Inspect argv for
+immutable canonical `resume <UUID>` and the already approved shared-daemon route;
+never select by cwd, latest session or process name. The private launch record
+binds home/ship, hosted holder/custody epoch, launch generation, CODEX_HOME,
+canonical cwd, UUID, and this child identity. A trusted SessionStart **resume**
+callback must validate that tuple, exact loaded UUID, daemon peer/socket identity,
+project hook trust and transcript metadata, and commit callback generation plus
+its durable poison token. A callback alone cannot create ownership or authorize
+a different PID/UUID; fresh/fork/clear remain unbound.
+
+**Liveness acquisition and observation.** The supervisor acquires the pidfd while
+it still owns the unreaped child, verifies boot/start/executable again, and
+retains both pidfd and wait custody until exit has been consumed and durably
+recorded. Never reacquire by PID from an old registry snapshot alone. Observe
+pidfd readiness plus `waitid`/`waitpid` on the actual child; terminal/PTTY closure
+and killing a wrapper are not process-exit proof. On supervisor restart, missing
+wait custody is unqualified: keep delivery off and require an explicit hosted
+relaunch/rebind, not a `kill(pid, 0)` reconstruction. A successfully acquired pidfd
+pins identity, **not liveness forever**. Executable replacement, daemon replacement,
+supervision loss, holder change or child exit immediately revoke local eligibility.
+
+**Final spawn authorization.** Outside the lock obtain authenticated custody,
+read-only native idle/receipt evidence and a prepared bounded argv. The runner
+must share a serialized local authorization path with the hosted supervisor's
+custody/exit transitions (not a delayed asynchronous Boolean cached by Python).
+Under the project fence lock, reread launch and callback generations, bound and
+enabled flags, poison, exact UUID/intent, live holder/epoch, and the supervisor's
+owned handle/child identity; test pidfd exit readiness again immediately before
+creating the native queue child. Missing proof refuses. Save `invoking` durably
+and spawn under that same authorization, then unlock before any wait/RPC/report.
+Exit processing must publish poison before waiting for the lock, durably mark
+unbound/disabled and preserve old intents. Use a fixed lock order and bounded
+transactions; never hold the hook lock across supervisor RPC or child waiting.
+How Rust custody and the Python spawn path share this local boundary is an
+implementation prerequisite, not solved by trusting an environment variable.
+
+**Exit races and irreversible delivery.** If exit is observable before the final
+check, refuse; if observed after `invoking` but before a proved exec failure,
+keep the old UUID's offer uncertain and immediately pause/report. Check handle,
+generations/custody again after spawn and before reporting; an exited/replaced
+pane may not renew or report for its successor. Reconcile old native evidence or
+covering mailbox ack; never migrate/replay into a replacement UUID. Cleanup only
+the owned queue child with bounded wait/descendant identity checks; do not signal
+the shared daemon. A pane can die in the kernel **between the last liveness check
+and spawn/admission**. Neither a pidfd nor a state lock can atomically prevent
+that or retract an admitted queue item. In this mid-delivery case "fail closed"
+means no further offers, truthful uncertainty and immediate diagnostics, **not**
+a claim that no late unattended turn occurred. A request ordered before exit
+may still cost one nudge on the old thread. If review requires zero post-exit
+model turns, this local design is insufficient; it needs conditional native
+admission/cancel-before-promote, or separately approved unattended-turn budget
+accounting. Do not call a child kill cancellation or fabricate an ack.
+
+**UI continuity limitation.** Privateer can prove its hosted exact-resume child
+is alive and was bound by a trusted callback. It cannot currently prove that the
+child still displays that UUID: SessionStart is deferred to turn entry and an
+idle TUI may navigate/clear before a new callback. A second client can also
+resume the same UUID; project hooks are not per-pane authentication. No PID,
+loaded/idle status, source/originator or hook trust hash closes those gaps.
+Therefore this proposal proves an owned-live-pane authorization at invocation,
+not arbitrary current TUI subscription. Opus must explicitly accept that weaker
+attended boundary or require upstream proof; **no activation is implied**.
+
+**Upstream ask.** Provide an authenticated public TUI attachment identity:
+daemon-issued client/attachment ID bound to an OS peer/connection and exact
+thread UUID, with a launcher nonce echoed in SessionStart, current attach epoch,
+ordered attach/detach/navigation events and a read-only restart/reconnect
+snapshot. Queue admission should accept the expected attachment ID/epoch and
+refuse if detached before promotion; specify durable admission lookup by stable
+nonce and cancellation boundaries. Generic app-server subscribers and creation
+origin are not TUI attachment identities. No custom config/route flags, private
+SQLite inspection or patched Codex TUI substitute for that API.
+
+Before any implementation: deterministic barriers for exit before/after final
+check/spawn, PID reuse, exec identity change, wrapper-vs-payload, supervisor crash,
+custody replacement, poison lock timeout, same-UUID second client, idle navigation,
+daemon replacement and lost response; real PTY/owned subprocess boundary tests.
+Record late-admission/turn budget honestly. This design edits none of the
+Codex-owned Rust files and implements no supervisor, runner, control or activation.
+**Paginated installs get no idle mail**, and no history-mode setting is changed.
+
 ### B2 ledger and lost-response rule
 
 `plugins/attended-codex/codex_receipts.py` is dormant: no polling, queue child,
@@ -722,15 +900,16 @@ compaction/rollback or unsupported turn schema pauses; no anchor is reset.
 Native 0.166 rollout `event_msg/task_started` opens a turn, exact
 `event_msg/user_message` with the full saved body and native client ID records
 presentation within that open turn, and matching `task_complete`/`turn_aborted`
-closes it. This user-message/client-ID shape is still a synthetic fixture contract,
-**not native qualification**; B3b must verify it against real 0.166 records or
-refuse activation with a clear reason. Assistant prose, `response_item`, hook-stopped turn-start, queue echo
-and queue disappearance are not receipts. The exact queue schema uses
-`clientUserMessageId` and text `text_elements`. B3 must qualify any schema change,
-not guess an alias. Deterministic tests cover these native shapes; stopped native
-fixture turns deliberately cannot qualify accepted user-input receipts, because
-the fixture blocks input before provider use. Successful promoted-input receipt
-qualification remains a B3 acceptance requirement before activation.
+closes it. B4 now qualifies the text-only user-message/client-ID shape against
+real 0.166.0 records from its one-request loopback fixture, as recorded above;
+unsupported shapes still refuse with a clear reason. Assistant prose,
+`response_item`, hook-stopped turn-start, queue echo and queue disappearance are
+not receipts. The exact queue schema uses `clientUserMessageId` and text
+`text_elements`. Future changes must qualify schemas, not guess aliases.
+Stopped native fixture turns still cannot qualify accepted user-input receipts;
+the B4 scope change is what allowed that missing evidence. Positive ATTACHED
+proof, a reviewed runner and the remaining integration/activation gates are
+still absent; receipt qualification alone does not enable delivery.
 
 After a lost CLI result, on the very next reconciliation:
 
