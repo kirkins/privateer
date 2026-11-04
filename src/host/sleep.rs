@@ -33,11 +33,16 @@ pub(crate) struct Asleep {
 
 /// Whether this session's adapter has reported it idle, without a break, for
 /// `after_secs`, with nothing ready for it. Read only; `sleep` decides.
-pub(crate) fn due(store: &Store, ship: &str, holder: &str, after_secs: u64) -> Result<bool> {
+#[cfg(test)]
+fn due(store: &Store, ship: &str, holder: &str, after_secs: u64) -> Result<bool> {
+    due_at(store, ship, holder, after_secs, Store::now_ms())
+}
+
+fn due_at(store: &Store, ship: &str, holder: &str, after_secs: u64, now: i64) -> Result<bool> {
     if after_secs == 0 {
         return Ok(false);
     }
-    Ok(idle_for(store, ship, holder, after_secs)? && !unhandled_request(store, ship)?)
+    Ok(idle_for_at(store, ship, holder, after_secs, now)? && !unhandled_request(store, ship)?)
 }
 
 /// Whether a request or decision to the ship is still open past its
@@ -58,7 +63,10 @@ pub(crate) fn unhandled_request(store: &Store, ship: &str) -> Result<bool> {
 /// Whether this session's adapter has been idle for `secs` without a break,
 /// with nothing ready for it.
 pub(crate) fn idle_for(store: &Store, ship: &str, holder: &str, secs: u64) -> Result<bool> {
-    let now = Store::now_ms();
+    idle_for_at(store, ship, holder, secs, Store::now_ms())
+}
+
+fn idle_for_at(store: &Store, ship: &str, holder: &str, secs: u64, now: i64) -> Result<bool> {
     let idle_since: Option<i64> = store
         .connection()
         .query_row(
@@ -84,12 +92,23 @@ pub(crate) fn sleep(
     holder: &str,
     after_secs: u64,
 ) -> Result<Option<Asleep>> {
+    sleep_with_clock(store, ship, holder, after_secs, Store::now_ms)
+}
+
+fn sleep_with_clock(
+    store: &Store,
+    ship: &str,
+    holder: &str,
+    after_secs: u64,
+    clock: impl FnOnce() -> i64,
+) -> Result<Option<Asleep>> {
     let tx = store.write_transaction()?;
+    let now = clock();
     let presence = crate::presence::presence(store, ship)?;
     if presence["attended"] != true
         || presence["lease"]["holder"] != holder
         || crate::permissions::paused(store, ship)?
-        || !due(store, ship, holder, after_secs)?
+        || !due_at(store, ship, holder, after_secs, now)?
     {
         return Ok(None);
     }
@@ -97,7 +116,7 @@ pub(crate) fn sleep(
     crate::presence::hand_over(store, ship, holder, &asleep)?;
     tx.execute(
         "UPDATE presence SET asleep_holder=?2, asleep_since_ms=?3 WHERE ship=?1 AND holder=?2",
-        params![ship, asleep, crate::store::Store::now_ms()],
+        params![ship, asleep, now],
     )?;
     // Launch backoff follows the session from one holder to the next.
     tx.execute(
@@ -201,19 +220,32 @@ pub(crate) fn woke(
     ship: &str,
     reason: &str,
     continuation: Option<crate::host::Conversation>,
-) {
+) -> Result<()> {
+    woke_at(store, ship, reason, continuation, Store::now_ms())
+}
+
+fn woke_at(
+    store: &Store,
+    ship: &str,
+    reason: &str,
+    continuation: Option<crate::host::Conversation>,
+    now: i64,
+) -> Result<()> {
     // The pane keeps its holder when it takes the harness back, but its
-    // session begins again: its adapter has not reported yet.
-    let _ = store.connection().execute(
+    // session begins again: its adapter has not reported yet. Fail before
+    // starting a harness if clearing the asleep flag fails: a running harness
+    // must not retain the watchdog's sleeping-wrapper exemption.
+    store.connection().execute(
         "UPDATE presence SET asleep_holder=NULL, asleep_since_ms=NULL, holder_since_ms=?2 WHERE ship=?1",
-        params![ship, crate::store::Store::now_ms()],
-    );
-    let _ = store.audit(
+        params![ship, now],
+    )?;
+    store.audit(
         "host.woke",
         &json!({"ship": ship, "reason": reason,
             "continued": continuation.map(crate::host::Conversation::continues),
             "continuation": continuation.map(crate::host::Conversation::label)}),
-    );
+    )?;
+    Ok(())
 }
 
 /// How the native harness ended under `supervise`.

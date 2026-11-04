@@ -1702,7 +1702,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                 }
                 (profile, launch, continuation, sleep_after) = replan(&holder, None)?;
                 // Only a relaunch that is admitted again is a wake.
-                crate::host::sleep::woke(&store, &ship, reason, continuation);
+                crate::host::sleep::woke(&store, &ship, reason, continuation)?;
             }
         }
     };
