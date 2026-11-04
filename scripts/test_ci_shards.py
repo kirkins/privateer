@@ -103,6 +103,21 @@ class ShardCoverage(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "must end in '::'"):
                 shard.commands("rest")
 
+    def test_heavy_pair_never_shares_a_shard(self):
+        """The two ~2.2x-on-macOS suites together timed out a 25-minute job."""
+        for name, suites in shard.SHARDS.items():
+            with self.subTest(shard=name):
+                self.assertFalse(set(shard.HEAVY_PAIR) <= set(suites))
+        found = self.targets()
+        regrouped = {**shard.SHARDS,
+                     "slow-4": tuple(s for s in shard.SHARDS["slow-4"]
+                                     if s not in shard.HEAVY_PAIR),
+                     "slow-5": (*shard.SHARDS["slow-5"], "upgrade_linked")}
+        with patch.object(shard, "SHARDS", regrouped), \
+             patch.object(shard, "targets", return_value=found):
+            with self.assertRaisesRegex(SystemExit, "share shard"):
+                shard.commands("rest")
+
     def test_workflow_matrix_lists_every_shard(self):
         """The reusable workflow must run exactly the shards the script knows."""
         workflow = Path(__file__).resolve().parents[1] / ".github/workflows/test-shards.yml"

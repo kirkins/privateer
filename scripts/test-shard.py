@@ -18,16 +18,29 @@ import time
 SHARDS = {
     # slow-1 keeps the MCP door checks, the dashboard smoke, the pilot and the
     # minimal-build check (see test-shards.yml), so it takes only light suites.
-    "slow-1": ("activation", "attended", "files", "cli", "input", "watch"),
+    # machines (83s on Linux) and dashboard_fleet (47s) moved here from slow-4
+    # on 2026-11-04: macOS slow-1 measured 11m01s, room for ~2.2x130s more.
+    "slow-1": ("activation", "attended", "files", "cli", "input", "watch",
+               "machines", "dashboard_fleet"),
     "slow-2": ("door", "hosted", "permissions", "workspaces", "plugins",
                "tool_bundles", "crew_routes", "mail", "fleet", "jobs"),
-    "slow-3": ("crew_park", "upgrade_fetch", "mcp_broker", "review_gate",
+    # The library half `door::` (LIB_SHARD below) also runs here. crew_park
+    # (~115s on Linux, 4m12s measured on macOS) moved to slow-5 on 2026-11-04.
+    "slow-3": ("upgrade_fetch", "mcp_broker", "review_gate",
                "scheduling", "cross_ship_waits", "recovery_pilot"),
-    "slow-4": ("python_suites", "upgrade_linked", "machines", "dashboard_fleet",
-               "dashboard", "dashboard_yaml", "cursor_attended",
-               "cross_machine_waits", "pi_attention", "pi_calm", "pi_follow",
+    # upgrade_linked (310s on Linux) is one of the two suites macOS runs at
+    # roughly 2.2x Linux time, so it keeps only suites measured under 10s each
+    # and the four dashboard-flavoured light ones moved to rest.
+    "slow-4": ("upgrade_linked", "pi_attention", "pi_calm", "pi_follow",
                "pi_quiet"),
+    # python_suites (220s on Linux) is the other ~2.2x suite; it shares slow-5
+    # only with crew_park, keeping the projected macOS job under ~17 minutes.
+    "slow-5": ("python_suites", "crew_park"),
 }
+# macOS runs python_suites and upgrade_linked at roughly 2.2 times their Linux
+# time; together they timed out a 25-minute macOS job at 25m49s (PR 717, run
+# 41848822540). docs/ci.md records the numbers; they must never share a shard.
+HEAVY_PAIR = ("python_suites", "upgrade_linked")
 # The library is one `cargo test --lib` run's worth of time on its own, so it is
 # split in two by module-path filter: LIB_SHARD runs the tests whose full name
 # contains one of LIB_INCLUDE; LIB_SKIP_SHARD runs the complement (one --skip
@@ -76,6 +89,11 @@ def commands(shard):
     missing = sorted(set(named) - set(tests))
     if missing:
         raise SystemExit(f"test-shard: no such suite: {' '.join(missing)}")
+    sharing = sorted(name for name, suites in SHARDS.items()
+                     if set(HEAVY_PAIR) <= set(suites))
+    if sharing:
+        raise SystemExit(f"test-shard: {HEAVY_PAIR[0]} and {HEAVY_PAIR[1]} "
+                         f"share shard: {' '.join(sharing)}")
     base = ["cargo", "test", "--locked", "--all-features"]
     suite_args = [arg for name in SHARDS.get(shard, ()) for arg in ("--test", name)]
     lib_half = ["--lib", "--", *LIB_INCLUDE] if shard == LIB_SHARD else None
