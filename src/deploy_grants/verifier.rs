@@ -1,5 +1,7 @@
 //! Dormant evidence helper: no deployment authority, ledger writes or adapter
 //! invocation. See the 2b-i contract in docs/design/standing-deploy-grants.md.
+#[cfg(target_os = "linux")]
+pub(crate) mod adapter;
 mod artifact;
 mod config;
 mod process;
@@ -214,6 +216,11 @@ pub(super) struct Verified {
     inputs: config::Snapshot,
 }
 impl Verified {
+    #[cfg(target_os = "linux")]
+    pub(super) fn adapter(&self) -> Result<adapter::PreparedAdapter> {
+        adapter::PreparedAdapter::prepare(&self.inputs)
+    }
+
     pub(super) fn value(&self) -> &Value {
         &self.value
     }

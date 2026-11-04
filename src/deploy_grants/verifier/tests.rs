@@ -992,6 +992,8 @@ fn concurrent_consumers_serialize_idempotency_and_the_cross_revision_budget() {
 }
 
 mod claims;
+#[cfg(target_os = "linux")]
+mod launch;
 mod review;
 
 #[cfg(target_os = "linux")]

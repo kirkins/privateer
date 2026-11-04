@@ -6,7 +6,7 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub(crate) use linux::Qualified;
+pub(crate) use linux::{Qualified, SealedExecutable, SealedInput};
 
 #[derive(Debug)]
 pub(crate) struct Refusal {

@@ -2,7 +2,7 @@
 //! Status (including a replay saying `claimed`) is never permission to launch.
 use super::{ledger, verifier};
 use crate::store::Store;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use rusqlite::params;
 use serde_json::{Value, json};
 
@@ -10,9 +10,11 @@ use serde_json::{Value, json};
 /// admitted executor must require it, not a JSON status or saved authorization,
 /// and may move claimed -> started only while BOTH state and claim_identity
 /// still match. Possession alone does not override a changed durable claim.
-pub(super) struct Claim {
+pub(crate) struct Claim {
     id: String,
     identity: String,
+    proof: verifier::Verified,
+    used: ledger::Recorded,
 }
 
 impl Claim {
@@ -21,6 +23,59 @@ impl Claim {
     }
     pub(super) fn identity(&self) -> &str {
         &self.identity
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn adapter(&self) -> Result<verifier::adapter::PreparedAdapter> {
+        self.proof.adapter()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn value(&self) -> &Value {
+        self.used.value()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn binding(&self) -> Value {
+        json!({"deployment_id":self.id, "claim_identity":self.identity,
+            "use_sha256":crate::core::hash(self.used.value())})
+    }
+
+    // Only the consuming spawn calls this, inside its home transaction. Neither
+    // a historical started row nor a saved JSON binding reconstructs a token.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn record_started(&self, store: &Store, custody: &Value) -> Result<()> {
+        super::captain(store, "deployment spawn")?;
+        anyhow::ensure!(
+            !store.connection().is_autocommit(),
+            "spawn requires home writer lock"
+        );
+        let dispatcher = serde_json::from_str::<Value>(&self.identity)?;
+        anyhow::ensure!(
+            dispatcher["dispatcher"]
+                == serde_json::from_str::<Value>(&crate::jobs::own_identity()?)?,
+            "claim dispatcher changed"
+        );
+        anyhow::ensure!(
+            custody["claim"] == self.binding(),
+            "deployment custody claim mismatch"
+        );
+        self.used
+            .matches(ledger::recorded(store, &self.id)?.value())?;
+        verifier::recheck_claim(store, &self.proof, &self.used)?;
+        anyhow::ensure!(
+            store.connection().execute(
+                "UPDATE deployment_intents SET state='started',updated_ms=?3
+             WHERE use_id=?1 AND state='claimed' AND claim_identity=?2",
+                params![self.id, self.identity, Store::now_ms()]
+            )? == 1,
+            "deployment claim no longer matches"
+        );
+        store.connection().execute(
+            "INSERT INTO deployment_payloads(use_id,record) VALUES(?1,?2)",
+            params![self.id, custody.to_string()],
+        )?;
+        audit(store, &self.used, "deployment.started", custody.clone())
     }
 }
 
@@ -126,6 +181,8 @@ fn claim_with(
         Some(Claim {
             id: id.to_owned(),
             identity,
+            proof,
+            used,
         })
     } else {
         // Never persist arbitrary verifier diagnostics or credential-bearing
@@ -150,10 +207,11 @@ fn claim_with(
 
 /// Dormant executor boundary: a stale token cannot start a different claim or
 /// repeat a start. This transition alone never launches or proves a payload.
+#[cfg(test)]
 pub(super) fn mark_started(store: &Store, claim: Claim) -> Result<()> {
     super::captain(store, "deployment start transition")?;
     let tx = store.write_transaction()?;
-    ensure!(
+    anyhow::ensure!(
         tx.execute(
             "UPDATE deployment_intents SET state='started',updated_ms=?3
              WHERE use_id=?1 AND state='claimed' AND claim_identity=?2",
