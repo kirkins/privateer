@@ -18,13 +18,13 @@ fn isolated_boundary() -> Option<Qualified> {
     }
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     root: tempfile::TempDir,
-    executable: File,
+    pub(super) executable: SealedExecutable,
 }
 
 impl Fixture {
-    fn build() -> Self {
+    pub(super) fn build() -> Self {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("alpha.c");
         let binary = root.path().join("alpha");
@@ -36,8 +36,10 @@ impl Fixture {
             .status()
             .expect("static fixture requires a C compiler; no dynamic fallback");
         assert!(status.success(), "static fixture compilation failed");
-        let executable = File::open(binary).unwrap();
-        elf::validate(&executable).unwrap();
+        let source = File::open(&binary).unwrap();
+        use sha2::{Digest, Sha256};
+        let digest = format!("{:x}", Sha256::digest(std::fs::read(&binary).unwrap()));
+        let executable = SealedExecutable::copy(&source, &digest).unwrap();
         Self { root, executable }
     }
 
@@ -81,7 +83,7 @@ fn finish_child(pid: i32, pidfd: &File) -> i32 {
 #[test]
 fn native_static_fixture_is_accepted_without_a_loader_exception() {
     let fixture = Fixture::build();
-    elf::validate(&fixture.executable).unwrap();
+    elf::validate(fixture.executable.file()).unwrap();
     assert!(!fixture.marker().exists());
 }
 
@@ -198,6 +200,34 @@ fn child_resets_all_signals_mask_and_session_before_exec() {
 }
 
 #[test]
+fn pending_signal_never_runs_the_inherited_parent_handler() {
+    unsafe extern "C" fn inherited_handler(_: libc::c_int) {
+        unsafe { libc::_exit(89) }
+    }
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        unsafe {
+            // Poison only the disposable child, never the test runner. If the
+            // old unmask-before-reset ordering returns, this handler exits 89.
+            libc::signal(libc::SIGUSR1, inherited_handler as *const () as usize);
+            let Ok(_blocked) = super::super::signals::Blocked::new() else {
+                libc::_exit(90);
+            };
+            if libc::kill(libc::getpid(), libc::SIGUSR1) != 0 {
+                libc::_exit(91);
+            }
+            reset_signals_and_session();
+            libc::_exit(92);
+        }
+    }
+    let pidfd = child_pidfd(pid);
+    let status = finish_child(pid, &pidfd);
+    assert!(libc::WIFSIGNALED(status), "inherited handler ran: {status}");
+    assert_eq!(libc::WTERMSIG(status), libc::SIGUSR1);
+}
+
+#[test]
 fn real_gate_blocks_until_release_and_execs_with_fixed_policy() {
     let Some(mut held) = isolated_boundary() else {
         return;
@@ -292,12 +322,11 @@ fn real_gate_rechecks_boundary_and_rejects_scripts_before_clone() {
     let Some(mut held) = isolated_boundary() else {
         return;
     };
+    // Raw files cannot enter gate() at all; the sealed constructor must
+    // reject scripts before any child or containment operation.
     let temp = tempfile::tempfile().unwrap();
     (&temp).write_all(b"#!/bin/false\n").unwrap();
-    assert!(
-        held.gate(&temp, &[CString::new("alpha").unwrap()], 10_000)
-            .is_err()
-    );
+    assert!(SealedExecutable::copy(&temp, &"0".repeat(64)).is_err());
     assert!(!held.cleanup_unknown);
     open_at(&held.directory, c"pids.max", libc::O_WRONLY)
         .unwrap()

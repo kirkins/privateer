@@ -779,8 +779,8 @@ separate `PROBE_MS` bounds capped by the existing runtime deadline, not a fresh
 runtime allowance. Immediately before the release byte, re-read exact child
 membership; a previous check before durable recording is not sufficient.
 
-Before exec the child clears its blocked-signal mask, restores every catchable
-signal disposition to `SIG_DFL`, and calls `setsid()`. It has no controlling
+Before exec the child restores every catchable signal disposition to `SIG_DFL`,
+then clears its blocked-signal mask and calls `setsid()`. It has no controlling
 terminal and is not in the supervisor's session or process group. These are
 mandatory launch policy, not assumptions about the launching Rust runtime.
 
@@ -804,6 +804,42 @@ not by checking a marker in an already-deleted temporary working directory.
 No command registration, activation, deployment authority or restart hook is
 introduced by these refinements.
 
+### b2c-b2b-iii-b2a: immutable executable and pre-clone signal policy
+
+The first mate approved splitting b2 before implementation: b2a addresses the
+three PR 711 findings and records this contract; b2b will implement the sole
+consuming `Handoff` spawn, fresh `Claim` and durable cross-ledger binding. B3's
+bounded IO supervisor and six fake scenarios remain separate. **Neither b2b nor
+b3 is implemented in b2a.** No dispatcher, registration, activation or deployment
+authority is added. The executable primitive is private to the dormant Linux
+gate and is not a complete adapter/configuration authorization token.
+
+Copy at most 64 MiB from the held executable into a private `memfd`, set its
+execute permissions, then require `F_SEAL_WRITE`, `F_SEAL_GROW`, `F_SEAL_SHRINK`
+and `F_SEAL_SEAL`. Only after sealing, hash that same fd against the expected
+executable SHA-256 and run `elf::validate` on it. The gate accepts only this
+non-deserializable sealed type and duplicates that same fd for `execveat`.
+No writable private-copy pathname exists between validation and exec. A failed
+seal, digest mismatch or invalid ELF refuses before creating a gate. Source
+rewrites cannot alter the sealed copy. Tests must prove ordinary writes,
+truncate/grow and shared writable mappings are refused after sealing.
+
+Block every blockable signal on the calling thread immediately around each
+`clone3` (qualification as well as exec), restoring the exact parent mask after
+clone success or refusal. The child inherits the blocked mask and resets all
+catchable dispositions before unmasking; no inherited parent handler may run in
+the intervening child setup. This includes the kernel signal bits libc reserves.
+
+Two trusted-host/adapter assumptions remain explicit: `ET_DYN` without
+`PT_INTERP` also admits a dynamic loader itself, which can load another program
+from argv; this is not a structural proof that an ELF never loads code. The
+reviewed pinned adapter and fixed arguments must not do so. Also, a host
+`binfmt_misc` rule matching native ELF magic can run before `binfmt_elf` and
+substitute an interpreter. The trusted host must not install such a rule. These
+conditions are not runtime-qualified by this slice; immutable bytes do not
+establish either assumption. Refusing known loader paths alone cannot rule out
+a renamed loader, and this memfd primitive has no configured source pathname.
+
 ### b2c-b2b child-gate contract (supervisor not implemented here)
 
 Prepare and verify the private pinned adapter before giving it deployment
@@ -811,14 +847,20 @@ metadata or artifact bytes. The adapter inherits the verifier's launch contract:
 clear the environment, set only fixed protocol variables, use a fresh private
 working directory, set umask 077, and close inherited descriptors at exec
 (including home/host-ledger connections and retained artifact descriptors).
-Execute only a verified private copy made from the held executable inode, never
-a reopened configured path. Pin and verify all interpreter/script/config inputs
+Execute only a verified immutable memfd copy made from the held executable
+inode, never a reopened configured path or a writable private-copy inode. Hash
+and validate ELF on the same fully sealed fd that exec will consume, as specified
+in b2a above. B2b must derive the expected executable digest from the exact pinned
+adapter/configuration binding, not a caller-supplied digest. Pin and verify all
+interpreter/script/config inputs
 before launch; the adapter gate additionally requires native static ELF with
 no `PT_INTERP`, so neither a shebang, dynamic loader nor ambient PATH resolution
 may substitute another executable. No credentials or deployment metadata belong
 in argv or ambient env.
 
-The sole spawn method consumes `Handoff` and a fresh, nonserializable `Claim`.
+The sole spawn method (still unimplemented) consumes `Handoff` and a fresh,
+nonserializable `Claim`. B2b must retain the exact immutable adapter/configuration
+binding and all supporting inputs; the b2a executable token alone is insufficient.
 It must compare the entire durable host hold again and bind its canonical key,
 incarnation, claim identity and immutable deployment use, checking the same home,
 ship, task and admitted timeout. A historical JSON status cannot recreate either
