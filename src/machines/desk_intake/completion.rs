@@ -54,7 +54,9 @@ impl Drop for ReadOnly<'_> {
 }
 
 fn retained_facts(conn: &Connection, m: &Manifest, source: &str, out: &mut Value) -> Result<()> {
-    if let Some(cut) = proof::legacy_status(conn, m, source)? {
+    // Optional diagnostics cannot hide independently retained counts when
+    // identity/proof metadata is unavailable or malformed.
+    if let Ok(Some(cut)) = proof::legacy_status(conn, m, source) {
         out["legacy_cut"] = cut;
     }
     if let Some(mut homes) = proof::retained_homes(conn, m, source)? {

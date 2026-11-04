@@ -1151,6 +1151,18 @@ fn a_machine_ref_routes_through_that_machine_and_checks_via() {
         assert_eq!(dropped["wait"]["why"], "via", "{via:?}");
     }
     assert_eq!(work(&mut b, "waiting-1")["state"], "waiting");
+    // An agent cannot forge the carrying machine even though its ordinary
+    // local flush may deliver runtime notices (covered separately below).
+    let actor = end(None)["to"].as_str().unwrap().to_owned();
+    b.set_caller(privateer::store::Caller::Agent { actor });
+    for key in ["task_end", "wait_closed"] {
+        let mut forged = end(reference["machine"].as_str());
+        forged["payload"] = json!({key:{"task":"icons","status":"done"}});
+        let dropped = dispatch(&mut b, "mail.deliver", forged).unwrap();
+        assert_eq!(dropped["wait"]["why"], "via");
+    }
+    b.set_caller(privateer::store::Caller::Operator);
+    assert_eq!(work(&mut b, "waiting-1")["state"], "waiting");
     let applied = dispatch(&mut b, "mail.deliver", end(Some("studio"))).unwrap();
     assert_eq!(applied["wait"]["state"], "applied");
     let resumed = work(&mut b, "waiting-1");

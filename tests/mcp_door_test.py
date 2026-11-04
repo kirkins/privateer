@@ -68,7 +68,8 @@ class DeskContractTests(unittest.TestCase):
                     "sources": [source], "other_machines": "not_queried"}
         for name in DESK_TOOLS:
             shown = desk_result(name, {"ok": True, "result": {
-                "schema": "desk.subscription.v1", "coverage": coverage}})
+                "schema": "desk.subscription.v1", "coverage": coverage,
+                "operation_complete": True, "acknowledged": 0}})
             self.assertEqual(shown.structured_content["coverage"], coverage)
             self.assertIn("legacy, closed", shown.structured_content["delivery_notice"])
             self.assertIn("history_as_of", shown.model_dump_json())

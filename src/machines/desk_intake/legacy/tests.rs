@@ -181,7 +181,8 @@ fn cut_status_and_public_coverage_are_separate_dated_and_revocable() {
     assert_eq!(cut["released_homes"], json!([]));
     assert_eq!(cut["proof_holds"], true, "{status}");
     let shown = public(status.clone());
-    coverage::validate(&shown, &["survey", "alpha", "legacy"]).unwrap();
+    coverage::validate(&shown, &["alpha", "beta", "gamma"]).unwrap();
+    assert!(!shown["sources"][0].to_string().contains("survey"));
     let source = &shown["sources"][0];
     assert_eq!(source["history"], "legacy_cut");
     assert!(source["history_as_of"].as_i64().unwrap() > 0);
