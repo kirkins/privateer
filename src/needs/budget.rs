@@ -27,13 +27,83 @@ struct ClockReading {
 
 fn observation_clock() -> Result<ClockReading> {
     #[cfg(test)]
-    if let Some(reading) = tests::clock_override() {
+    if let Some(reading) = test_clock::override_reading() {
         return reading;
     }
     Ok(ClockReading {
         cpu: thread_cpu_time()?,
         wall: Instant::now(),
     })
+}
+
+/// The observation clock's wall reading, for callers that bound their own work
+/// beside the budget. It reads the same (test-injectable) clock, so an
+/// injected clock freezes every time bound, not only the budget's own.
+pub(crate) fn observation_wall() -> Result<Instant> {
+    Ok(observation_clock()?.wall)
+}
+
+/// The observation clock as tests inject it, crate-wide: frozen at install and
+/// moved only by `FakeClock::advance`, so budget-bound tests stay deterministic
+/// on a loaded runner and assume nothing about the passage of wall time.
+#[cfg(test)]
+pub(crate) mod test_clock {
+    use super::ClockReading;
+    use anyhow::{Result, ensure};
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy)]
+    struct Injected {
+        reading: ClockReading,
+        failed: bool,
+    }
+
+    thread_local! {
+        static CLOCK: Cell<Option<Injected>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn override_reading() -> Option<Result<ClockReading>> {
+        CLOCK.get().map(|clock| {
+            ensure!(!clock.failed, "injected observation clock failure");
+            Ok(clock.reading)
+        })
+    }
+
+    pub(crate) struct FakeClock;
+
+    impl FakeClock {
+        pub(crate) fn install() -> Self {
+            assert!(CLOCK.get().is_none());
+            CLOCK.set(Some(Injected {
+                reading: ClockReading {
+                    cpu: Duration::ZERO,
+                    wall: Instant::now(),
+                },
+                failed: false,
+            }));
+            Self
+        }
+
+        pub(crate) fn advance(cpu: Duration, wall: Duration) {
+            let mut clock = CLOCK.get().unwrap();
+            clock.reading.cpu += cpu;
+            clock.reading.wall += wall;
+            CLOCK.set(Some(clock));
+        }
+
+        pub(crate) fn fail() {
+            let mut clock = CLOCK.get().unwrap();
+            clock.failed = true;
+            CLOCK.set(Some(clock));
+        }
+    }
+
+    impl Drop for FakeClock {
+        fn drop(&mut self) {
+            CLOCK.set(None);
+        }
+    }
 }
 
 fn within_deadlines(cpu_deadline: Duration, wall_deadline: Instant) -> Result<bool> {

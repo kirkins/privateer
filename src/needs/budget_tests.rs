@@ -1,59 +1,8 @@
+use super::test_clock::FakeClock;
 use super::*;
 use crate::{needs::query, store::Store};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use serde_json::json;
-
-#[derive(Clone, Copy)]
-struct TestClock {
-    reading: ClockReading,
-    failed: bool,
-}
-
-thread_local! {
-    static CLOCK: Cell<Option<TestClock>> = const { Cell::new(None) };
-}
-
-pub(super) fn clock_override() -> Option<Result<ClockReading>> {
-    CLOCK.get().map(|clock| {
-        ensure!(!clock.failed, "injected observation clock failure");
-        Ok(clock.reading)
-    })
-}
-
-struct FakeClock;
-
-impl FakeClock {
-    fn install() -> Self {
-        assert!(CLOCK.get().is_none());
-        CLOCK.set(Some(TestClock {
-            reading: ClockReading {
-                cpu: Duration::ZERO,
-                wall: Instant::now(),
-            },
-            failed: false,
-        }));
-        Self
-    }
-
-    fn advance(cpu: Duration, wall: Duration) {
-        let mut clock = CLOCK.get().unwrap();
-        clock.reading.cpu += cpu;
-        clock.reading.wall += wall;
-        CLOCK.set(Some(clock));
-    }
-
-    fn fail() {
-        let mut clock = CLOCK.get().unwrap();
-        clock.failed = true;
-        CLOCK.set(Some(clock));
-    }
-}
-
-impl Drop for FakeClock {
-    fn drop(&mut self) {
-        CLOCK.set(None);
-    }
-}
 
 fn query_after_pause(pause: Duration, deadline: Option<Instant>) -> serde_json::Value {
     let dir = tempfile::tempdir().unwrap();

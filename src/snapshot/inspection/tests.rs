@@ -230,6 +230,10 @@ fn bounded_scan_filters_before_counting_and_reports_partial_windows() {
         add(&store, &format!("alpha-{n}"), "running");
     }
     tx.commit().unwrap();
+    // Freeze the observation clock so the page bound is the SCAN row bound,
+    // not this runner's load: the scan stops on its row cap whatever the
+    // machine is doing, and the exact assertions below stay meaningful.
+    let _clock = crate::needs::observation_clock::FakeClock::install();
     let none = scan(
         &store,
         "survey",
@@ -262,6 +266,83 @@ fn bounded_scan_filters_before_counting_and_reports_partial_windows() {
     .unwrap();
     assert_eq!(tail.jobs.len(), 5);
     assert!(!tail.complete);
+}
+
+#[test]
+fn a_time_bounded_stop_reports_a_partial_page_with_the_correct_last() {
+    let (_dir, store, c) = setup();
+    for n in 0..10 {
+        add(&store, &format!("alpha-{n}"), "running");
+    }
+    // Freeze the observation clock, then push it past every deadline from
+    // inside the scan's own statements: an authorizer fires once per prepared
+    // statement, so the stop lands mid-page without a sleep, a load
+    // assumption or any other wall-clock dependence.
+    let _clock = crate::needs::observation_clock::FakeClock::install();
+    let advanced = std::cell::Cell::new(false);
+    store
+        .connection()
+        .authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            if !advanced.get()
+                && matches!(
+                    context.action,
+                    rusqlite::hooks::AuthAction::Read {
+                        table_name: "wakes",
+                        ..
+                    }
+                )
+            {
+                advanced.set(true);
+                crate::needs::observation_clock::FakeClock::advance(
+                    std::time::Duration::ZERO,
+                    std::time::Duration::from_secs(60),
+                );
+            }
+            rusqlite::hooks::Authorization::Allow
+        }));
+    let page = scan(
+        &store,
+        "survey",
+        &c,
+        false,
+        0,
+        i64::MAX,
+        None,
+        None,
+        false,
+        1000,
+    )
+    .unwrap();
+    // The stop was the row loop's time bound, not the enrichment pass.
+    assert!(!page.enrichment_interrupted);
+    assert!(!page.complete);
+    assert!(!page.drained);
+    assert!(!page.jobs.is_empty(), "the stop must land mid-page");
+    assert!(page.jobs.len() < 10);
+    // The cursor is the last row the page really expanded: a gap-free prefix,
+    // so a retry from it repeats no row and loses none.
+    assert_eq!(page.last, page.jobs.last().unwrap().0);
+    for (n, (key, row)) in page.jobs.iter().enumerate() {
+        assert_eq!(*key, n as i64 + 1);
+        assert_eq!(row.state, "running");
+    }
+    let retry = scan(
+        &store,
+        "survey",
+        &c,
+        false,
+        page.last,
+        i64::MAX,
+        None,
+        None,
+        false,
+        1000,
+    )
+    .unwrap();
+    assert!(retry.drained);
+    assert_eq!(retry.jobs.len(), 10 - page.jobs.len());
+    assert_eq!(retry.jobs.first().unwrap().0, page.last + 1);
+    assert_eq!(retry.jobs.last().unwrap().0, 10);
 }
 
 #[test]

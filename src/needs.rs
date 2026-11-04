@@ -6,7 +6,9 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 
 mod budget;
-pub(crate) use budget::ObservationBudget;
+#[cfg(test)]
+pub(crate) use budget::test_clock as observation_clock;
+pub(crate) use budget::{ObservationBudget, observation_wall};
 
 /// Validate a correlated grant/denial inside core's authority transaction.
 pub(crate) fn approval_request(

@@ -734,7 +734,10 @@ pub(crate) fn scan_with_deadline(
     );
     let source = origin(store)?;
     let show = show && c.has("mail:read");
-    let started = Instant::now();
+    // Read every time bound from the observation clock: the budget's own
+    // deadlines and this page's backstop then move together, and a
+    // test-injected clock freezes the whole page bound, not half of it.
+    let started = observation_wall()?;
     let budget = ObservationBudget::with_deadline(store.connection(), deadline)?;
     let mut result = Scan {
         enrichment_interrupted: false,
@@ -791,7 +794,10 @@ pub(crate) fn scan_with_deadline(
         ))
     })?;
     for (n, row) in rows.enumerate() {
-        if n == SCAN || started.elapsed() >= LOCAL_BUDGET || budget.check().is_err() {
+        if n == SCAN
+            || observation_wall()?.saturating_duration_since(started) >= LOCAL_BUDGET
+            || budget.check().is_err()
+        {
             result.drained = false;
             result.complete = false;
             break;

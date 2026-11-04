@@ -12,7 +12,7 @@ pub(crate) mod inspection;
 pub(crate) mod scoped;
 
 use crate::jobs::TERMINAL_SQL;
-use crate::needs::ObservationBudget;
+use crate::needs::{ObservationBudget, observation_wall};
 use crate::store::{Caller, Store};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
