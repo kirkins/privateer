@@ -106,15 +106,19 @@ impl Handoff {
         record_host(&host, &self.record, &launched, &custody)?;
         host.commit()?;
         home.commit()?;
-        // Membership/deadline first, then the final authoritative pause read,
-        // with no lock wait or other observation between that read and release.
-        let mut pause_refused = false;
-        let release = pending.release_with(|| {
-            #[cfg(test)]
-            observe("before_release");
-            let result = claim.check_release(store);
-            pause_refused = result.is_err();
-            result
+        // The DB lifecycle read can wait for a writer. Recheck it BEFORE the
+        // final membership/deadline checks so that wait cannot silently age the
+        // release decision. The emergency file remains the LAST observation.
+        #[cfg(test)]
+        observe("before_release");
+        let lifecycle = claim.check_grant_lifecycle(store);
+        let mut pause_refused = lifecycle.is_err();
+        let release = lifecycle.and_then(|()| {
+            pending.release_with(|| {
+                let result = claim.check_pause();
+                pause_refused = result.is_err();
+                result
+            })
         });
         if let Err(error) = release {
             if pause_refused {

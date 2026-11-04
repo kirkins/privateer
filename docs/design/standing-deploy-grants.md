@@ -992,9 +992,11 @@ artifact reads are bounded positional operations, not a claim that filesystem
 IO itself has a kernel-enforced latency bound.
 
 PR 718 follow-ups: after custody commits, the final release decision re-reads the
-grant row (same revision, unpaused, unrevoked) and then the emergency pause file,
-with no intervening observation before the release write. Database unreadability
-also refuses. This must remain the production phone pause/revoke contract:
+grant row (same revision, unpaused, unrevoked), repeats the gate's final runtime
+and membership checks, then reads the emergency pause file as the last
+observation before the release write. The potentially blocking DB read must
+precede those runtime checks so a busy wait cannot silently outlive the admitted
+deadline. Database unreadability also refuses. This must remain the production phone pause/revoke contract:
 either that path commits this grant lifecycle row or writes this emergency file.
 The check narrows the decision window; a change after the last observation
 cannot recall the release byte. A failed abort-ledger write keeps the original

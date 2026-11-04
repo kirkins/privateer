@@ -547,10 +547,10 @@ fn final_release_tests(binary: &Path) {
         if fault == "missing" {
             let empty = tempfile::tempdir().unwrap();
             let store = Store::open(empty.path()).unwrap();
-            assert!(claim.check_release(&store).is_err());
+            assert!(claim.check_grant_lifecycle(&store).is_err());
         } else {
             assert_eq!(
-                claim.check_release(&fixture.store).is_ok(),
+                claim.check_grant_lifecycle(&fixture.store).is_ok(),
                 fault == "none",
                 "{fault}"
             );

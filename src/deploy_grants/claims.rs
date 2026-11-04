@@ -89,9 +89,10 @@ impl Claim {
     }
 
     // Final release check: a committed grant pause/revoke must be visible even
-    // after the earlier home transaction. File pause is the LAST observation.
+    // after the earlier home transaction. This potentially blocking DB read
+    // precedes the gate's final deadline/membership checks and file pause.
     #[cfg(target_os = "linux")]
-    pub(crate) fn check_release(&self, store: &Store) -> Result<()> {
+    pub(crate) fn check_grant_lifecycle(&self, store: &Store) -> Result<()> {
         let value = self.used.value();
         let (revision, paused, revoked): (i64, Option<i64>, Option<i64>) =
             store.connection().query_row(
@@ -105,7 +106,7 @@ impl Claim {
                 && revoked.is_none(),
             "final deployment grant lifecycle check refused"
         );
-        self.check_pause()
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
