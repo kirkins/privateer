@@ -17,6 +17,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins/attended-codex"))
 import codex_binding as binding
 import codex_receipts as receipts
+import codex_mail
 import codex_runner as runner
 from codex_socket import load, process_identity
 
@@ -53,6 +54,7 @@ class RunnerTests(unittest.TestCase):
         binding.atomic(codex / "app-server-daemon/daemon.pid", {
             "pid": self.daemon_process.pid, "processIdentity": process_identity(self.daemon_process.pid)})
         self.session = str(uuid.uuid4())
+        self.status = {"type": "idle"}
         token, custody_token = str(uuid.uuid4()), str(uuid.uuid4())
         self.rollout = codex / "rollout.jsonl"
         self.rollout.write_text(json.dumps({"type": "session_meta", "payload": {
@@ -62,7 +64,8 @@ class RunnerTests(unittest.TestCase):
             "session": self.session, "holder": "host:alpha", "ship": "alpha", "home": self.env["HOME"],
             "cwd": str(self.root), "codex_home": str(codex), "pid": self.pane.pid,
             "process_identity": process_identity(self.pane.pid), "executable": runner.executable(self.pane.pid)["path"],
-            "state": "bound", "hosted": True, "delivery_enabled": True, "path_env": self.env,
+            "state": "bound", "hosted": True, "delivery_enabled": False, "path_env": self.env,
+            "control": "/opt/privateer",
             "binding": {"session": self.session, "fence_version": 1, "invalidation_token": token,
                 "history_mode": "legacy", "transcript": str(self.rollout),
                 "transcript_identity": {"device": info.st_dev, "inode": info.st_ino},
@@ -105,7 +108,7 @@ class RunnerTests(unittest.TestCase):
                     return {"data": [fixture.session], "nextCursor": None}
                 if method == "thread/read":
                     return {"thread": {"id": fixture.session, "cwd": str(fixture.root), "historyMode": "legacy",
-                                       "status": {"type": "idle"}}}
+                                       "status": fixture.status}}
                 if method == "thread/queue/list":
                     return {"data": [], "nextCursor": None}
                 raise AssertionError(method)
@@ -113,14 +116,41 @@ class RunnerTests(unittest.TestCase):
         daemon_patch = patch.object(runner, "Daemon", FakeDaemon)
         daemon_patch.start()
         self.addCleanup(daemon_patch.stop)
+        # A stand-in for the Rust grant: per-nonce idempotent, never refunded.
+        self.grant = {"grant_id": str(uuid.uuid4()), "session": self.session, "budget": 200, "spent": 0}
+        self.reservations = {}
+        self.calls = []
+        self.pending = {"address": "alpha", "after_seq": 0, "acknowledged_through": 0, "count": 0,
+                        "through_seq": 0, "actionable": 0, "headers": [], "attention": None}
         def control(record, command, args):
-            self.assertEqual(command, 'ship.presence')
+            self.calls.append((command, copy.deepcopy(args)))
             with binding.locked(self.directory):
                 pass  # Runtime RPC must NEVER run under the project fence.
-            return {'attended': True, 'lease': {'holder': 'host:alpha', 'expires_ms': 10**18}}
+            if command == "ship.presence":
+                return {'attended': True, 'lease': {'holder': 'host:alpha', 'expires_ms': 10**18}}
+            if command == "attended.codex.status":
+                grant = self.grant and {**self.grant, "remaining": self.grant["budget"] - self.grant["spent"]}
+                return {"ship": "alpha", "grant": grant}
+            if command == "attended.codex.reserve":
+                if not self.grant or args["grant_id"] != self.grant["grant_id"]:
+                    raise ValueError("Privateer binding report refused")
+                if args["nonce"] not in self.reservations:
+                    if self.grant["spent"] >= self.grant["budget"]:
+                        raise ValueError("Privateer binding report refused")
+                    self.grant["spent"] += 1
+                    self.reservations[args["nonce"]] = self.grant["spent"]
+                return {"reserved": True, "grant_id": self.grant["grant_id"], "session": args["session"],
+                        "nonce": args["nonce"], "budget": self.grant["budget"],
+                        "spent": self.grant["spent"], "remaining": self.grant["budget"] - self.grant["spent"]}
+            if command == "mail.pending":
+                return copy.deepcopy(self.pending)
+            if command == "wake.hosted":
+                return {"recorded": True}
+            raise AssertionError(command)
         control_patch = patch.object(runner, 'control', side_effect=control)
         control_patch.start()
         self.addCleanup(control_patch.stop)
+        self.runner.reserve(self.record)
 
     def process(self):
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(90)"],
@@ -132,10 +162,13 @@ class RunnerTests(unittest.TestCase):
         self.addCleanup(cleanup)
         return child
 
-    def prepare(self, after=0):
+    def prepare(self, after=0, reserve=True):
         self.nonce = str(uuid.uuid4())
         self.body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, self.nonce, after, after + 1)) + "\nNotification, not acknowledgment."
-        return self.runner.ledger.prepare(self.record, self.body, after, after + 1, self.nonce)
+        intent = self.runner.ledger.prepare(self.record, self.body, after, after + 1, self.nonce)
+        if reserve and hasattr(self, "grant"):
+            self.runner.reserve(self.record)
+        return intent
 
     def mutate(self, change):
         return self.runner.ledger.transaction(change)
@@ -157,13 +190,18 @@ class RunnerTests(unittest.TestCase):
     def assert_not_invoked(self):
         self.assertFalse((self.root / "invoked.json").exists())
 
-    def test_no_enable_path_and_b0_fence_cannot_deliver(self):
-        self.record["delivery_enabled"] = False
-        binding.atomic(self.registry, self.record)
-        with self.assertRaisesRegex(ValueError, "disabled"):
+    def test_no_grant_reservation_and_b0_fence_cannot_deliver(self):
+        # launch.json's delivery_enabled is not authority; only the pinned
+        # captain-grant reservation for this exact offer is.
+        self.runner.ledger.reconcile(self.session, self.nonce, {"data": [], "nextCursor": None}, 1)
+        self.prepare(1, reserve=False)
+        with self.assertRaisesRegex(ValueError, "not granted"):
             self.runner.dispatch()
         self.assert_not_invoked()
-        self.record["delivery_enabled"] = True
+        with self.assertRaisesRegex(ValueError, "not granted"):
+            self.runner._spawn(self.record, self.custody, self.daemon_class(None))
+        self.assert_not_invoked()
+        self.runner.reserve(self.record)
         self.record["binding"].pop("fence_version")
         binding.atomic(self.registry, self.record)
         with self.assertRaisesRegex(ValueError, "fence"):
@@ -256,6 +294,7 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(result['report_eligible'])
 
     def test_three_invocations_exhaust_budget_even_with_real_progress_and_restart(self):
+        self.grant["budget"] = 3
         for i in range(3):
             self.runner.dispatch()
             self.promoted()
@@ -265,10 +304,21 @@ class RunnerTests(unittest.TestCase):
             if i < 2:
                 self.prepare(i + 1)
             self.runner = runner.Runner(self.registry)
-        self.prepare(3)
+        with self.assertRaisesRegex(ValueError, "refused"):
+            self.prepare(3)
+        with self.assertRaisesRegex(ValueError, "not granted"):
+            self.runner.dispatch()
+        self.assertEqual(self.runner.report(self.session)["diagnostic"], "codex-turn-budget-exhausted")
+        self.assertTrue(self.runner.report(self.session)["paused"])
+        self.assert_grant_floor_holds_against_a_reset_runtime()
+
+    def assert_grant_floor_holds_against_a_reset_runtime(self):
+        # A runtime that forgot its count cannot widen the grant locally.
+        self.grant["spent"] = 0
+        self.runner.ledger.transaction(lambda v: runner.accounting(v).pop("budget_exhausted", None))
+        self.runner.reserve(self.record)
         with self.assertRaisesRegex(ValueError, "budget exhausted"):
             self.runner.dispatch()
-        self.assertTrue(result["paused"])
 
     def test_exec_failure_only_rejection_retry_minute_and_k3_bound(self):
         for i in range(3):
@@ -278,6 +328,8 @@ class RunnerTests(unittest.TestCase):
             value = self.runner.ledger.read()
             self.assertEqual(value["sessions"][self.session]["intent"]["state"], "rejected")
             self.assertEqual(value["runner"]["declines"], i + 1)
+            # Exec failure never refunds the reserved possibly-unattended turn.
+            self.assertEqual(value["runner"]["possibly_unattended_spent"], i + 1)
             if i < 2:
                 self.prepare()
                 with self.assertRaisesRegex(ValueError, "paused"):
@@ -564,6 +616,195 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(self.runner.report(self.session)["paused"])
         self.assert_not_invoked()
 
+
+    def test_poison_published_during_final_pidfd_check_still_refuses_spawn(self):
+        # PR 710 carry-in: the poison reads follow handles.check(), so a revoke
+        # landing while the pidfds are checked still stops the Popen.
+        self.runner._observe_lifecycle(self.record)
+        original = runner.Handles.check
+        def check(handles):
+            original(handles)
+            binding.publish_request(self.registry, "custody-poison.json", reason="barrier")
+        with patch.object(runner.Handles, "check", new=check):
+            with self.assertRaisesRegex(ValueError, "poison"):
+                self.runner._spawn(self.record, self.custody, self.daemon_class(None))
+        self.assert_not_invoked()
+        self.assertEqual(self.runner.report(self.session)["diagnostic"], "codex-uncertain-" + self.nonce)
+
+    def test_partial_ack_does_not_use_a_synthetic_empty_queue(self):
+        self.runner.ledger.reconcile(self.session, self.nonce, {"data": [], "nextCursor": None}, 1)
+        self.prepare(4)  # Range (4, 5].
+        self.runner.ledger.invoking(self.session, self.nonce)
+        seen = []
+        original = self.runner.ledger.reconcile
+        def reconcile(session, nonce, queue, acknowledged_through=0, **kw):
+            seen.append((queue, acknowledged_through))
+            return original(session, nonce, queue, acknowledged_through, **kw)
+        with patch.object(self.runner.ledger, "reconcile", side_effect=reconcile), \
+                patch.object(self.daemon_class, "call", side_effect=ConnectionError("fixture daemon gone")):
+            self.runner.observe(acknowledged_through=4)
+        self.assertEqual(seen, [])  # Partial ack: no synthetic queue absence.
+        with patch.object(self.runner.ledger, "reconcile", side_effect=reconcile), \
+                patch.object(self.daemon_class, "call", side_effect=ConnectionError("fixture daemon gone")):
+            self.runner.observe(acknowledged_through=5)
+        self.assertEqual(seen, [({"data": [], "nextCursor": None}, 5)])
+        self.assertEqual(self.runner.ledger.read()["sessions"][self.session]["intent"]["state"], "acked")
+
+    def test_progress_on_an_empty_ledger_is_zero(self):
+        value = {"sessions": {}}
+        runner.progress(value)
+        self.assertEqual(value["runner"]["accepted_through"], 0)
+
+    def test_custody_loss_and_cleanup_failure_keep_both_sticky_diagnostics(self):
+        original = subprocess.Popen
+        def spawn(*args, **kwargs):
+            binding.publish_request(self.registry)
+            return original(*args, **kwargs)
+        with patch.object(runner.subprocess, "Popen", side_effect=spawn), \
+                patch.object(runner, "drain", return_value=False):
+            result = self.runner.dispatch()
+        self.assertEqual(result["diagnostics"], ["codex-custody-lost-after-invocation",
+                                                 "codex-queue-cleanup-unproven"])
+        # A later native-evidence gap never hides either sticky diagnostic.
+        with patch.object(self.daemon_class, "call", side_effect=ConnectionError("fixture disconnect")):
+            result = self.runner.observe()
+        self.assertEqual(result["diagnostics"], ["codex-custody-lost-after-invocation",
+                                                 "codex-queue-cleanup-unproven"])
+        self.assertTrue(result["paused"])
+
+    def test_legacy_single_sticky_diagnostic_migrates_without_loss(self):
+        def legacy(value):
+            value["runner"] = {"possibly_unattended_spent": 0, "declines": 0, "accepted_through": 0,
+                               "retry_after_ms": 0, "human_paused": False,
+                               "diagnostic": "codex-queue-cleanup-unproven"}
+        self.mutate(legacy)
+        result = self.runner.report(self.session)
+        self.assertEqual(result["diagnostics"], ["codex-queue-cleanup-unproven"])
+        self.assertEqual(result["diagnostic"], "codex-queue-cleanup-unproven")
+        self.assertTrue(result["paused"])
+
+    # ---- Activation: the supervisor's tick, grant budget and mail body ----
+
+    def settle_setup_offer(self):
+        self.runner.ledger.reconcile(self.session, self.nonce, {"data": [], "nextCursor": None}, 1)
+        self.pending.update(after_seq=1, acknowledged_through=1, through_seq=1)
+
+    def mail(self, through, actionable=1):
+        after = self.pending["after_seq"]
+        headers = [{"seq": seq, "id": f"m{seq}", "from": "captain", "kind": "request", "urgency": "normal",
+                    "task_id": None} for seq in range(through, after, -1)][:6]
+        self.pending.update(count=through - after, actionable=actionable, through_seq=through, headers=headers)
+
+    def commands(self, name):
+        return [args for command, args in self.calls if command == name]
+
+    def test_tick_offers_once_reports_receipt_as_mail_wake_and_settles(self):
+        self.settle_setup_offer()
+        self.mail(3)
+        self.calls.clear()
+        self.assertEqual(runner.tick(self.registry), {"tick": "invoked"})
+        invoked = json.loads((self.root / "invoked.json").read_text())
+        message = invoked["argv"][-1]
+        intent = self.runner.ledger.read()["sessions"][self.session]["intent"]
+        self.assertEqual(message.split("\n", 1)[0], receipts.encode(receipts.marker(
+            self.record["home"], "alpha", self.session, intent["nonce"], 1, 3)))
+        self.assertIn("This is a notification, not an acknowledgement.", message)
+        self.assertIn('\\"after_seq\\":1,\\"limit\\":40', message)
+        self.assertEqual(len(self.commands("attended.codex.reserve")), 1)
+        # The lost CLI result is uncertain at once (C3), reported paused/other.
+        delivery = [a for a in self.commands("wake.hosted") if a["trigger"] == "delivery"][-1]
+        self.assertEqual((delivery["paused"], delivery["decline_reason"], delivery["accepted_through"]),
+                         (True, "other", 1))
+        self.assertFalse(any(a["trigger"] == "mail" for a in self.commands("wake.hosted")))
+        # The native promoted input is the receipt: one mail wake for (1, 3].
+        self.body = message
+        self.promoted()
+        self.calls.clear()
+        self.assertEqual(runner.tick(self.registry), {"tick": "idle"})
+        wakes = [a for a in self.commands("wake.hosted") if a["trigger"] == "mail"]
+        self.assertEqual([(w["after_seq"], w["through_seq"], w["session"]) for w in wakes], [(1, 3, self.session)])
+        delivery = [a for a in self.commands("wake.hosted") if a["trigger"] == "delivery"][-1]
+        self.assertEqual((delivery["paused"], delivery["accepted_through"], delivery["busy"]), (False, 3, False))
+        self.calls.clear()
+        self.pending.update(after_seq=3, count=0, actionable=0, through_seq=3, headers=[])
+        runner.tick(self.registry)
+        self.assertFalse(any(a["trigger"] == "mail" for a in self.commands("wake.hosted")))
+        self.assertEqual(self.grant["spent"], 2)  # setUp's offer plus this one; no refund.
+
+    def test_tick_never_offers_low_only_mail_or_without_a_grant(self):
+        self.settle_setup_offer()
+        self.mail(3, actionable=0)
+        self.assertEqual(runner.tick(self.registry), {"tick": "idle"})
+        self.mail(3)
+        self.grant = None
+        self.calls.clear()
+        self.assertEqual(runner.tick(self.registry), {"tick": "not granted"})
+        self.assertEqual(self.commands("attended.codex.reserve"), [])
+        self.assertEqual(self.runner.ledger.read()["sessions"][self.session]["intent"]["state"], "acked")
+        self.assert_not_invoked()
+
+    def test_tick_holds_a_prepared_offer_while_busy_without_spending(self):
+        self.settle_setup_offer()
+        self.prepare(1, reserve=False)
+        self.runner._observe_lifecycle(self.record)
+        self.start(turn="captain-turn")
+        self.status = {"type": "active", "activeFlags": []}
+        self.mail(2)
+        self.calls.clear()
+        self.assertEqual(runner.tick(self.registry), {"tick": "held"})
+        self.assertEqual(self.commands("attended.codex.reserve"), [])
+        self.assert_not_invoked()
+        delivery = [a for a in self.commands("wake.hosted") if a["trigger"] == "delivery"][-1]
+        self.assertEqual((delivery["busy"], delivery["turn_started_ms"]), (True, 123000))
+
+    def test_tick_budget_exhaustion_pauses_until_a_new_captain_grant(self):
+        self.settle_setup_offer()
+        self.grant["budget"] = 1  # setUp already spent it.
+        self.mail(2)
+        self.assertEqual(runner.tick(self.registry), {"tick": "not granted"})
+        self.prepare(1, reserve=False)
+        with self.assertRaisesRegex(ValueError, "refused"):
+            runner.tick(self.registry)
+        result = self.runner.report(self.session)
+        self.assertTrue(result["paused"])
+        self.assertEqual(result["diagnostic"], "codex-turn-budget-exhausted")
+        self.assertEqual(runner.tick(self.registry), {"tick": "held"})  # Time and mail clear nothing.
+        self.grant = {"grant_id": str(uuid.uuid4()), "session": self.session, "budget": 5, "spent": 0}
+        self.assertEqual(runner.tick(self.registry), {"tick": "invoked"})
+        self.assertEqual(self.grant["spent"], 1)
+
+    def test_tick_unbound_or_unhosted_does_nothing(self):
+        for change in ({"state": "unbound"}, {"hosted": False}):
+            binding.atomic(self.registry, {**self.record, **change})
+            self.calls.clear()
+            self.assertEqual(runner.tick(self.registry), {"tick": "unbound"})
+            self.assertEqual(self.calls, [])
+        self.assertEqual(runner.main(["codex_runner.py"]), 2)
+
+    def test_publish_withholds_delivery_without_a_truthful_busy_start(self):
+        self.calls.clear()
+        self.runner.publish(self.record, {"report_eligible": True, "busy_available": False})
+        self.assertEqual(self.commands("wake.hosted"), [])
+        self.runner.publish(self.record, {"report_eligible": False, "busy_available": True})
+        self.assertEqual(self.commands("wake.hosted"), [])
+
+    def test_mail_snapshot_validation_and_body_carries_only_headers(self):
+        good = {"address": "alpha", "after_seq": 2, "acknowledged_through": 2, "count": 1, "through_seq": 3,
+                "actionable": 1, "headers": [{"seq": 3, "id": "m3"}], "attention": None}
+        codex_mail.snapshot(good, "alpha")
+        for bad in ({"address": "beta"}, {"count": -1}, {"actionable": 2}, {"through_seq": 1},
+                    {"headers": [{"seq": 9}]}, {"headers": [{"seq": 3}] * 7, "count": 7},
+                    {"attention": 3}, {"after_seq": True}):
+            with self.assertRaises(ValueError):
+                codex_mail.snapshot({**good, **bad}, "alpha")
+        self.assertFalse(codex_mail.actionable({**good, "actionable": 0}))
+        record = {**self.record, "control": "/opt/privateer"}
+        text = codex_mail.body(record, self.nonce, good)
+        head, rest = text.split("\n", 1)
+        self.assertEqual(json.loads(head), receipts.marker(self.record["home"], "alpha", self.session,
+                                                           self.nonce, 2, 3))
+        self.assertIn('["/opt/privateer","--home"', rest)
+        self.assertIn('Headers: [{"seq":3,"id":"m3"}]', rest)
 
 if __name__ == "__main__":
     unittest.main()

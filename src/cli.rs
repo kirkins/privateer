@@ -1399,6 +1399,17 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             },
         ))
     };
+    // The exact native session a hosted Codex pane resumes (validate_start
+    // refuses hosted Codex without one).
+    let codex_session = |launch: &Launch, profile: &Value| -> Option<String> {
+        (hosted && launch.harness == "codex")
+            .then(|| {
+                profile["first_mate"]["codex_session"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .flatten()
+    };
     // The launch command, the captain approvals it carries for the first
     // time (announced once the harness has spawned), and the fleet policy it
     // read, for the authorizations that launch carries.
@@ -1451,6 +1462,12 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             .arg(&policy)
             .arg(&launch.harness)
             .arg(&launch.binary);
+        // A hosted Codex pane resumes its one exact captain-set session, first
+        // in argv as the binding grammar requires; never a fresh or newest one.
+        if let Some(session) = codex_session(launch, profile) {
+            command.arg("resume").arg(session);
+            command.env("PRIVATEER_CODEX_ATTENDED", "1");
+        }
         if matches!(launch.harness.as_str(), "pi" | "pi-signed" | "omp") {
             command.arg("-e").arg(plugins.join("attended/mail.ts"));
             command.arg("-e").arg(plugins.join("attended/captain.ts"));
@@ -1610,12 +1627,11 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                     return Err(error);
                 }
             };
-            let mut codex_custody = if hosted
-                && launch.harness == "codex"
-                && std::env::var("PRIVATEER_CODEX_ATTENDED").as_deref() == Ok("1")
-            {
+            let mut codex_custody = if codex_session(&launch, &profile).is_some() {
                 match crate::host::codex_custody::Custody::new(&child, folder) {
-                    Ok(custody) => Some(custody),
+                    Ok(custody) => {
+                        Some(custody.with_runner(plugins.join("attended-codex/codex_runner.py")))
+                    }
                     Err(error) => {
                         eprintln!(
                             "Codex custody unavailable; delivery remains disabled: {error:#}"
@@ -1632,6 +1648,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                 let _ = crate::host::started(&store, &ship, &holder);
                 let _ = crate::host::upgrade::harness(&store, &ship, child.id());
                 let continued = continuation.is_some_and(crate::host::Conversation::continues)
+                    || codex_session(&launch, &profile).is_some()
                     || launch
                         .pi_session
                         .as_ref()

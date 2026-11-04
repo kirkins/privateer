@@ -1,8 +1,14 @@
 # Codex attended binding (experimental, exact-UUID resume only)
 
 This is the binding boundary of the [attended-mail design](../../docs/design/codex-attended-mail.md).
-It does **not** deliver mail, enable hosted eligibility, implement scheduled work,
-or qualify native autonomy. The main attended-support table is unchanged.
+ACT1 (Linux) makes a hosted Codex first mate resume the captain-set
+`first_mate.codex_session` (an existing legacy-history UUID). Its supervisor runs
+`codex_runner.py tick` every 5 s, and delivers mail through `codex queue --remote
+… --thread <UUID>` **only under a captain grant** (`attended.codex.grant`, budget
+1..1000, default 200 possibly-unattended turns, never refunded;
+`attended.codex.revoke` poisons custody). No code grants delivery by itself.
+It does not implement scheduled work, qualify native autonomy or claim ATTACHED.
+The main attended-support table is unchanged until live qualification (PR C).
 
 Explicit opt-in: set `PRIVATEER_CODEX_ATTENDED=1` for a Privateer attended Codex
 launch **with `codex resume <exact UUID>`**. Fresh launches are refused before

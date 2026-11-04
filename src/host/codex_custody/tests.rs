@@ -95,7 +95,7 @@ impl Fixture {
         let held = self.held();
         assert_eq!(held["state"], "revoked");
         assert_ne!(held["token"], self.token());
-        assert_eq!(held["delivery_enabled"], false);
+        assert_eq!(held["delivery_control"], "captain_grant");
     }
 }
 impl Drop for Fixture {
@@ -327,7 +327,7 @@ fn codex_custody_home_comparison_resolves_symlink_alias_and_refuses_other_home()
     f.save();
     f.observe().unwrap();
     assert_eq!(f.held()["state"], "owned");
-    assert_eq!(f.held()["delivery_enabled"], false);
+    assert_eq!(f.held()["delivery_control"], "captain_grant");
     f.observe().unwrap();
     assert_eq!(f.held()["state"], "owned");
 

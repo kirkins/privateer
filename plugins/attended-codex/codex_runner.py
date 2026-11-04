@@ -1,8 +1,9 @@
-"""Dormant queue consumer. Not imported by a launcher; no CLI or enable path.
+"""Codex attended-mail queue runner, one bounded pass per supervisor tick.
 
-No native attachment claim. Every invocation reserves a possibly-unattended
-turn, including lost responses. Runtime controls/report dispatch are later work.
-Lock order: SQLite/presence outside project flock; no RPC/wait under flock.
+The hosted supervisor runs `tick` as its own child while pane custody holds.
+No native attachment claim: every invocation reserves a possibly-unattended
+turn from the captain's grant (Rust, never refunded), including lost responses.
+Lock order: SQLite/presence/RPC outside project flock; no RPC/wait under flock.
 """
 import copy
 import json
@@ -14,15 +15,20 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 
 sys.dont_write_bytecode = True
+# The supervisor runs this script under `python3 -I -B`, which omits the script's
+# own folder from sys.path; restore it before importing sibling modules.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from codex_binding import PATH_ENV, atomic, control, locked, require_fence
-from codex_receipts import (FINAL, MAX_LEDGER, Ledger, anchor, checkpoint, digest,
+import codex_mail
+from codex_receipts import (FINAL, MAX_LEDGER, MAX_SESSIONS, Ledger, anchor, checkpoint, digest,
                             encode, exact_uuid, marker, open_rollout, scan)
 from codex_socket import Daemon, LIMIT, load, process_identity, safe
 
 K = 3
-TURN_BUDGET = 3  # Cumulative per project, never reset by ack/rebind/restart.
+STICKY = ("codex-custody-lost-after-invocation", "codex-queue-cleanup-unproven")
 
 
 def require(condition, message):
@@ -209,14 +215,46 @@ def accounting(value):
     require(isinstance(result, dict), "invalid runner accounting")
     for key in ("possibly_unattended_spent", "declines", "accepted_through", "retry_after_ms"):
         require(type(result.get(key)) is int and result[key] >= 0, "invalid runner accounting")
-    require(result["possibly_unattended_spent"] <= TURN_BUDGET and result["declines"] <= K
-            and type(result.get("human_paused")) is bool, "invalid runner budget/pause")
+    require(result["declines"] <= K and type(result.get("human_paused")) is bool,
+            "invalid runner budget/pause")
+    # Local per-grant floor beside the Rust count: never decremented, so a
+    # reset or replayed runtime answer cannot widen a grant here either.
+    grants = result.setdefault("grants", {})
+    require(isinstance(grants, dict) and all(
+        isinstance(g, dict) and type(g.get("spent")) is int and type(g.get("budget")) is int
+        and 0 <= g["spent"] <= g["budget"] for g in grants.values()), "invalid runner grant accounting")
+    # Sticky diagnostics survive the transient native-evidence one. Older
+    # ledgers stored a sticky name in "diagnostic"; move it, never drop it.
+    sticky = result.setdefault("sticky", [])
+    require(isinstance(sticky, list) and all(name in STICKY for name in sticky), "invalid runner diagnostics")
+    if result.get("diagnostic") in STICKY:
+        name = result.pop("diagnostic")
+        if name not in sticky:
+            sticky.append(name)
     return result
+
+
+def diagnostic(a):
+    return a["sticky"][0] if a["sticky"] else a.get("diagnostic")
+
+
+def diagnostics_pause(a):
+    return bool(a["sticky"]) or "diagnostic" in a
+
+
+def reserved(intent, record):
+    """The captain grant's reservation for exactly this offer, or refuse."""
+    r = intent.get("reservation")
+    require(isinstance(r, dict) and r.get("session") == record["session"] == intent.get("session", record["session"])
+            and r.get("nonce") == intent.get("nonce") and type(r.get("budget")) is int
+            and type(r.get("spent")) is int and 1 <= r["spent"] <= r["budget"], "Codex delivery not granted")
+    exact_uuid(r["grant_id"])
+    return r
 
 
 def progress(value):
     a = accounting(value)
-    accepted = max(s.get("accepted_through", 0) for s in value["sessions"].values())
+    accepted = max((s.get("accepted_through", 0) for s in value["sessions"].values()), default=0)
     if accepted > a["accepted_through"]:
         a.update(accepted_through=accepted, declines=0, retry_after_ms=0)
 
@@ -268,6 +306,82 @@ class Runner:
         record = load(self.registry)
         self.ledger = Ledger(self.registry, record["home"], record["ship"])
 
+    def ensure_session(self, record):
+        """The bound UUID's watermarks, before any offer exists. Same bound."""
+        session = exact_uuid(record["session"])
+        def change(value):
+            if session not in value["sessions"]:
+                require(len(value["sessions"]) < MAX_SESSIONS, "receipt session index full; pinned facts not evicted")
+                value["sessions"][session] = {"accepted_through": 0, "acknowledged_through": 0}
+            return value["sessions"][session]
+        return self.ledger.transaction(change)
+
+    def reserve(self, record):
+        """Spend one grant turn for the prepared offer, before any flock.
+
+        The Rust reservation is idempotent per nonce: a lost response retried
+        next tick never spends twice. It is pinned in the intent and re-read
+        under the lock; a revoke poisons custody, which the final fence reads.
+        """
+        session = exact_uuid(record["session"])
+        intent = self.ledger.read()["sessions"][session]["intent"]
+        if intent.get("reservation"):
+            return reserved(intent, record)
+        require(intent["state"] == "prepared", "only a prepared offer reserves a turn")
+        status = control(record, "attended.codex.status", {"ship": record["ship"]})
+        grant = status.get("grant") if isinstance(status, dict) else None
+        require(isinstance(grant, dict) and grant.get("session") == session, "Codex delivery not granted")
+        try:
+            result = control(record, "attended.codex.reserve", {
+                "ship": record["ship"], "holder": record["holder"], "session": session,
+                "grant_id": exact_uuid(grant["grant_id"]), "nonce": intent["nonce"]})
+        except ValueError:
+            if grant.get("remaining") == 0:
+                self.ledger.transaction(lambda v: accounting(v).update(budget_exhausted=grant["grant_id"]))
+            raise
+        require(isinstance(result, dict) and result.get("reserved") is True and result.get("session") == session
+                and result.get("nonce") == intent["nonce"] and result.get("grant_id") == grant["grant_id"],
+                "invalid Codex turn reservation")
+        reservation = {key: result[key] for key in ("grant_id", "session", "nonce", "budget", "spent")}
+        def change(value):
+            current = Ledger.intent(value, session, intent["nonce"])
+            require(current["state"] == "prepared" and not current.get("reservation"), "offer changed while reserving")
+            current["reservation"] = reservation
+            accounting(value).pop("budget_exhausted", None)
+            return reserved(current, record)
+        return self.ledger.transaction(change)
+
+    def publish(self, record, result):
+        """wake.hosted for the current holder only: delivery state, and a mail
+        wake for each promoted native receipt. Queue admission is not progress."""
+        if not result.get("report_eligible"):
+            return
+        session = exact_uuid(record["session"])
+        state = self.ledger.read()["sessions"][session]
+        intent = state.get("intent", {})
+        if intent.get("state") == "presented" and not intent.get("wake_reported"):
+            reply = control(record, "wake.hosted", {
+                "ship": record["ship"], "holder": record["holder"], "session": session, "trigger": "mail",
+                "after_seq": intent["after_seq"], "through_seq": intent["through_seq"]})
+            require(reply.get("recorded") is True, "hosted mail wake not recorded")
+            def change(value):
+                current = value["sessions"][session].get("intent", {})
+                if current.get("nonce") == intent["nonce"]:
+                    current["wake_reported"] = True
+            self.ledger.transaction(change)
+        # Without a truthful native busy start, withhold the report rather
+        # than claim idle; the Rust watchdog still bounds blocked mail.
+        if not result.get("busy_available"):
+            return
+        report = {"ship": record["ship"], "holder": record["holder"], "session": session, "trigger": "delivery",
+                  "accepted_through": result["accepted_through"], "paused": result["paused"],
+                  "decline_reason": result["decline_reason"] or "other", "decline_count": result["decline_count"],
+                  "busy": result["busy"]}
+        if result["busy"]:
+            report["turn_started_ms"] = result["turn_started_ms"]
+        reply = control(record, "wake.hosted", report)
+        require(reply.get("recorded") is True, "hosted delivery report not recorded")
+
     def report(self, session, expected=None, expected_custody=None):
         """Dormant report data, never wake.hosted or a fabricated mail wake."""
         lease = None
@@ -284,23 +398,28 @@ class Runner:
             intent = state.get("intent", {})
             cursor = state.get("lifecycle", {})
             uncertain = intent.get("state") in ("invoking", "uncertain")
+            grant = a["grants"].get(intent.get("reservation", {}).get("grant_id"), {})
             paused = (uncertain or state.get("native_stop", False) or a["human_paused"] or a["declines"] >= K
-                      or a["possibly_unattended_spent"] >= TURN_BUDGET or "diagnostic" in a)
+                      or diagnostics_pause(a) or "budget_exhausted" in a)
             eligible = False
             handles = None
             try:
                 record = load(self.registry)
                 require(expected is None or record == expected, "superseded observation")
                 require(record == snapshot and record["session"] == session and record["state"] == "bound"
-                        and record["delivery_enabled"] is True, "stale report")
+                        and record.get("hosted") is True, "stale report")
                 presence_check(lease, record)
-                for key in ("generation", "callback_generation", "holder"):
-                    require(record[key] == intent[key], "stale report generation")
+                # An outstanding offer belongs to its own launch; a settled
+                # one from an earlier launch cannot block this launch's reports.
+                if intent and intent.get("state") not in FINAL:
+                    for key in ("generation", "callback_generation", "holder"):
+                        require(record[key] == intent[key], "stale report generation")
                 require_fence(self.registry, record)
                 custody = load(self.registry.with_name("custody.json"))
                 require(expected_custody is None or custody == expected_custody, "superseded custody")
                 custody_check(self.registry, record, custody)
-                require(intent.get("custody_epoch", custody["epoch"]) == custody["epoch"], "stale report epoch")
+                require(intent.get("state") in FINAL or intent.get("custody_epoch", custody["epoch"]) == custody["epoch"],
+                        "stale report epoch")
                 handles = Handles(custody)
                 native_check(record, custody)
                 eligible = True
@@ -317,8 +436,10 @@ class Runner:
                     "busy_available": "lifecycle" in state and not a.get("observation_lost", True)
                                       and (not cursor.get("open_turn") or cursor.get("turn_started_ms") is not None),
                     "possibly_unattended_spent": a["possibly_unattended_spent"],
-                    "possibly_unattended_budget": TURN_BUDGET,
-                    "diagnostic": ("codex-uncertain-" + intent["nonce"]) if uncertain else a.get("diagnostic")}
+                    "grant_spent": grant.get("spent"), "grant_budget": grant.get("budget"),
+                    "diagnostic": ("codex-uncertain-" + intent["nonce"]) if uncertain else (
+                        diagnostic(a) or ("codex-turn-budget-exhausted" if "budget_exhausted" in a else None)),
+                    "diagnostics": list(a["sticky"])}
 
     def observe(self, acknowledged_through=0):
         """Read-only native evidence; no queue mutation and no enable path."""
@@ -331,7 +452,9 @@ class Runner:
         if acknowledged_through:
             value = self.ledger.read()
             intent = value["sessions"].get(session, {}).get("intent")
-            if intent:
+            # A synthetic empty queue is safe only when the ack alone settles
+            # the whole range; otherwise wait for real queue evidence below.
+            if intent and acknowledged_through >= intent["through_seq"]:
                 self.ledger.reconcile(session, intent["nonce"], {"data": [], "nextCursor": None},
                                       acknowledged_through)
         try:
@@ -365,8 +488,12 @@ class Runner:
                 aborts = candidate.get("native_abort_count", 0) - state.get("native_abort_count", 0)
                 a["declines"] = min(K, a["declines"] + aborts)
                 state.update(candidate)  # Commit bounded forward progress too.
-                available = caught_up and (status is None or (
-                    status == {"type": "idle"} and not state["lifecycle"]["open_turn"]))
+                # Native status must agree with the rollout lifecycle: idle with
+                # no open turn, or active with one. Anything else is unknown.
+                open_turn = state["lifecycle"]["open_turn"]
+                available = caught_up and (status is None or (status == {"type": "idle"} and not open_turn)
+                                           or (isinstance(status, dict) and status.get("type") == "active"
+                                               and bool(open_turn)))
                 a["observation_lost"] = not available
                 if available and a.get("diagnostic") == "codex-native-evidence-unavailable":
                     a.pop("diagnostic", None)
@@ -386,8 +513,8 @@ class Runner:
         A test may supply a fixture-owned enabled registry; no code writes one.
         """
         record = load(self.registry)
-        require(record.get("delivery_enabled") is True, "Codex delivery disabled")
         session = exact_uuid(record["session"])
+        reserved(self.ledger.read()["sessions"].get(session, {}).get("intent", {}), record)
         custody = load(self.registry.with_name("custody.json"))
         with Daemon(record["codex_home"]) as daemon:
             # Every RPC precedes flock. Native queue serializes an idle->busy race.
@@ -414,8 +541,7 @@ class Runner:
             safe(self.registry, private=True)
             current = load(self.registry)
             require(current == record and current.get("state") == "bound"
-                    and current.get("hosted") is True and current.get("delivery_enabled") is True,
-                    "binding changed or disabled")
+                    and current.get("hosted") is True, "binding changed or disabled")
             presence_check(lease, current)
             binding = current["binding"]
             require(binding["session"] == current["session"], "binding UUID changed")
@@ -425,10 +551,13 @@ class Runner:
             state = value["sessions"][current["session"]]
             intent = state["intent"]
             a = accounting(value)
+            r = reserved(intent, current)
+            g = a["grants"].setdefault(r["grant_id"], {"spent": 0, "budget": r["budget"]})
+            g["budget"] = min(g["budget"], r["budget"])  # Never widened locally.
+            require(g["spent"] < g["budget"], "Codex possibly-unattended turn budget exhausted")
             require(not a["human_paused"] and a["declines"] < K
-                    and a["possibly_unattended_spent"] < TURN_BUDGET
                     and time.time_ns() // 1_000_000 >= a["retry_after_ms"]
-                    and not a.get("observation_lost", True) and "diagnostic" not in a,
+                    and not a.get("observation_lost", True) and not diagnostics_pause(a),
                     "runner paused, unavailable or budget exhausted")
             require(intent["state"] == "prepared" and not state["lifecycle"]["open_turn"]
                     and not state.get("native_stop", False), "outstanding attempt, native stop or native busy")
@@ -452,16 +581,18 @@ class Runner:
             require(Path(argv[0]).is_absolute(), "queue executable not absolute")
             intent.update(state="invoking", custody_epoch=custody["epoch"], possibly_unattended=True)
             a["possibly_unattended_spent"] += 1
+            g["spent"] += 1
             save(self.ledger, value)  # Crash thereafter = uncertain, never refund.
             # After durable invoking, immediately at the real spawn boundary.
             require(load(self.registry) == current, "binding changed before spawn")
-            require_fence(self.registry, current)
-            custody_check(self.registry, current, custody)
             daemon_check(daemon, current, custody)
             handles = Handles(custody)
             try:
                 handles.check()
                 presence_check(lease, current)  # No stale lease after slow fsync.
+                # Both fences last: the poison read is the final step before Popen.
+                require_fence(self.registry, current)
+                custody_check(self.registry, current, custody)
                 try:
                     child = subprocess.Popen(argv, cwd=current["cwd"], env=env, stdin=subprocess.DEVNULL,
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -500,9 +631,69 @@ class Runner:
                 for saved in [state.get("intent", {}), *state.get("history", [])]:
                     if saved.get("nonce") == intent["nonce"] and saved["state"] == "invoking":
                         saved["state"] = "uncertain"
-                if post_spawn_lost:
-                    accounting(value)["diagnostic"] = "codex-custody-lost-after-invocation"
-                if not cleaned:
-                    accounting(value)["diagnostic"] = "codex-queue-cleanup-unproven"
+                a = accounting(value)
+                for name, failed in (("codex-custody-lost-after-invocation", post_spawn_lost),
+                                     ("codex-queue-cleanup-unproven", not cleaned)):
+                    if failed and name not in a["sticky"]:
+                        a["sticky"].append(name)  # Both kept; neither hides the other.
                 save(self.ledger, value)
         return self.report(record["session"], record, custody)
+
+
+def tick(path):
+    """One supervisor pass. Every RPC precedes the project flock; one offer."""
+    runner = Runner(path)
+    record = load(runner.registry)
+    if record.get("state") != "bound" or record.get("hosted") is not True:
+        return {"tick": "unbound"}
+    session = exact_uuid(record["session"])
+    runner.ensure_session(record)
+    presence_check(control(record, "ship.presence", {"ship": record["ship"]}), record)
+    exhausted = accounting(runner.ledger.read()).get("budget_exhausted")
+    if exhausted:
+        # Only a new captain grant clears exhaustion; never time or mail.
+        grant = control(record, "attended.codex.status", {"ship": record["ship"]}).get("grant") or {}
+        if grant.get("session") == session and grant.get("grant_id") not in (None, exhausted):
+            runner.ledger.transaction(lambda v: accounting(v).pop("budget_exhausted", None))
+    state = runner.ledger.read()["sessions"][session]
+    seen = max(state["accepted_through"], state["acknowledged_through"], state.get("suppressed_through", 0))
+    pending = codex_mail.snapshot(control(record, "mail.pending", {"address": record["ship"], "after_seq": seen}),
+                                  record["ship"])
+    result = runner.observe(acknowledged_through=pending["acknowledged_through"])
+    runner.publish(record, result)
+    value = runner.ledger.read()
+    intent = value["sessions"][session].get("intent")
+    if intent is None or intent["state"] in FINAL:
+        if intent is not None and intent["state"] == "presented" and not intent.get("wake_reported"):
+            return {"tick": "mail wake unreported"}
+        if (result["paused"] or result["busy"] or not result["report_eligible"]
+                or pending["after_seq"] < result["accepted_through"] or not codex_mail.actionable(pending)):
+            return {"tick": "idle"}
+        grant = control(record, "attended.codex.status", {"ship": record["ship"]}).get("grant") or {}
+        if grant.get("session") != session or not grant.get("remaining"):
+            return {"tick": "not granted"}  # No offer, no nonce, nothing spent.
+        nonce = str(uuid.uuid4())
+        runner.ledger.prepare(record, codex_mail.body(record, nonce, pending),
+                              pending["after_seq"], pending["through_seq"], nonce)
+    elif intent["state"] != "prepared":
+        return {"tick": "outstanding"}
+    elif result["paused"] or result["busy"] or not result["report_eligible"]:
+        return {"tick": "held"}  # A prepared offer waits; nothing is spent.
+    runner.reserve(record)
+    runner.publish(record, runner.dispatch())
+    return {"tick": "invoked"}
+
+
+def main(argv):
+    if len(argv) != 3 or argv[1] != "tick":
+        print("usage: codex_runner.py tick <launch.json>", file=sys.stderr)
+        return 2
+    try:
+        tick(argv[2])
+    except Exception:  # Bounded pass: diagnostics live in the ledger, not the pane.
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

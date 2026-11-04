@@ -1,4 +1,5 @@
-//! Dormant Codex hosted-pane custody. No queue, enable path or attachment claim.
+//! Codex hosted-pane custody, the attendance boundary for queued mail. No
+//! attachment claim: every delivered queue turn is possibly unattended.
 //! Lock order: SQLite writer (if needed), then project flock. Poison publication
 //! precedes flock. Never perform RPC, wait/reap a child, or acquire SQLite under
 //! that flock. A future runner must recheck both pidfds/identities under it.
@@ -167,6 +168,15 @@ fn live(fd: &OwnedFd) -> Result<bool> {
 /// Synchronous holder revocation, called while the SQLite writer is held.
 /// Other ships/homes and projects without a custody record are untouched.
 pub(crate) fn holder_changed(store: &Store, ship: &str) -> Result<()> {
+    revoke_ship(store, ship, "holder_changed")
+}
+
+/// A captain revoke (or a grant for another session), in its writer transaction.
+pub(crate) fn delivery_revoked(store: &Store, ship: &str) -> Result<()> {
+    revoke_ship(store, ship, "delivery_disabled")
+}
+
+fn revoke_ship(store: &Store, ship: &str, reason: &str) -> Result<()> {
     if crate::presence::folder_ship(store).as_deref() != Some(ship) {
         return Ok(());
     }
@@ -176,7 +186,7 @@ pub(crate) fn holder_changed(store: &Store, ship: &str) -> Result<()> {
         .context("ship folder")?
         .join(".codex/privateer-attended");
     if dir.join("launch.json").try_exists()? || dir.join("custody.json").try_exists()? {
-        revoke(&dir, "holder_changed")?;
+        revoke(&dir, reason)?;
     }
     Ok(())
 }
@@ -218,6 +228,7 @@ pub(crate) struct Custody {
     fd: OwnedFd,
     held: Option<Value>,
     revoked: bool,
+    ticker: Option<super::codex_delivery::Ticker>,
 }
 
 impl Custody {
@@ -232,10 +243,21 @@ impl Custody {
             fd,
             held: None,
             revoked: false,
+            ticker: None,
         })
     }
 
+    /// Run the mail runner while this custody is valid. Without it the pane
+    /// is still supervised, with no delivery.
+    pub(crate) fn with_runner(mut self, script: PathBuf) -> Self {
+        self.ticker = Some(super::codex_delivery::Ticker::new(script));
+        self
+    }
+
     pub(crate) fn observe(&mut self, store: &Store, ship: &str, holder: &str) -> Result<()> {
+        if let Some(ticker) = self.ticker.as_mut() {
+            ticker.reap();
+        }
         if self.revoked {
             return Ok(());
         }
@@ -273,6 +295,9 @@ impl Custody {
             drop(_lock);
             if !valid {
                 self.revoke("identity_or_daemon_changed")?;
+            } else if let Some(ticker) = self.ticker.as_mut() {
+                // Outside flock: the runner takes it itself, after its RPCs.
+                ticker.poll(&self.dir);
             }
             return Ok(());
         }
@@ -327,7 +352,9 @@ impl Custody {
             "holder": holder, "ship": ship, "pid": self.pid, "process_identity": self.process,
             "executable": exe, "daemon": native, "supervisor_pid": std::process::id(),
             "supervisor_identity": identity(std::process::id())?,
-            "supervisor_executable": executable(std::process::id())?, "delivery_enabled": false});
+            "supervisor_executable": executable(std::process::id())?, "delivery_control": "captain_grant"});
+        // Legacy records may still carry `delivery_enabled`; readers ignore it and
+        // only the matching unpoisoned token authorizes delivery.
         // Never mint a fresh token on callbacks, daemon replacement or holder change.
         atomic(&self.dir, "custody.json", &held)?;
         self.held = Some(held);
@@ -337,6 +364,10 @@ impl Custody {
     pub(crate) fn retire(&mut self, reason: &str) {
         if let Err(error) = self.revoke(reason) {
             eprintln!("Codex custody revocation failed; delivery must refuse: {error:#}");
+        }
+        // Poison first, so an in-flight pass refuses to spawn; then let it end.
+        if let Some(ticker) = self.ticker.as_mut() {
+            ticker.finish();
         }
     }
 
@@ -356,6 +387,9 @@ impl Custody {
 impl Drop for Custody {
     fn drop(&mut self) {
         let _ = self.revoke("supervision_lost");
+        if let Some(ticker) = self.ticker.as_mut() {
+            ticker.finish();
+        }
     }
 }
 

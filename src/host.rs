@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 pub(crate) mod approvals;
 pub mod bridge;
 pub(crate) mod codex_custody;
+pub(crate) mod codex_delivery;
 mod delivery;
 pub(crate) mod pi_sessions;
 pub(crate) mod restored;
@@ -743,10 +744,23 @@ pub(crate) fn validate_start(store: &mut Store, ship: &str, profile: &Value) -> 
     }
     ensure!(hosted(profile), "ship is no longer hosted");
     let harness = bundled.context("hosting requires a bundled native harness")?;
-    ensure!(
-        LIVE_HARNESSES.contains(&harness.as_str()),
-        "{harness} cannot be hosted: its attended adapter does not start turns on mail"
-    );
+    if harness == "codex" {
+        // Codex mail rides the native queue on one exact session, under
+        // Linux pane custody; fresh pane identity is unproven.
+        ensure!(
+            profile["codex_session"].is_string(),
+            "codex cannot be hosted without first_mate.codex_session, an existing legacy-history session UUID"
+        );
+        ensure!(
+            cfg!(target_os = "linux"),
+            "hosted Codex mail requires Linux process custody"
+        );
+    } else {
+        ensure!(
+            LIVE_HARNESSES.contains(&harness.as_str()),
+            "{harness} cannot be hosted: its attended adapter does not start turns on mail"
+        );
+    }
     let folder = store
         .home()
         .parent()
