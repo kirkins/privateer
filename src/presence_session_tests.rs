@@ -3,7 +3,13 @@ use super::*;
 #[test]
 fn only_the_current_hosted_claude_lease_records_the_pane_session() {
     let temp = tempfile::tempdir().unwrap();
-    let store = Store::open(temp.path()).unwrap();
+    let mut store = Store::open(temp.path()).unwrap();
+    crate::dispatch(
+        &mut store,
+        "ship.put",
+        json!({"name":"alpha","location":"here","scope":"Publish beta"}),
+    )
+    .unwrap();
     store
         .connection()
         .execute(

@@ -109,8 +109,8 @@ fn checkpoint(store: &Store, ship: &str) -> Result<Option<String>> {
     Ok(store
         .connection()
         .query_row(
-            "SELECT state FROM captain_approval_cursors WHERE ship=?1",
-            [ship],
+            "SELECT value FROM metadata WHERE key=?1",
+            [format!("captain_approval_cursor:{ship}")],
             |r| r.get(0),
         )
         .optional()?)
@@ -230,9 +230,9 @@ fn record_retries(
     }
     if let Some((_, next)) = progress {
         tx.execute(
-            "INSERT INTO captain_approval_cursors(ship,state) VALUES(?1,?2)
-             ON CONFLICT(ship) DO UPDATE SET state=excluded.state",
-            params![ship, next],
+            "INSERT INTO metadata(key,value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![format!("captain_approval_cursor:{ship}"), next],
         )?;
     }
     tx.commit()?;
