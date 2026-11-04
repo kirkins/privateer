@@ -696,7 +696,7 @@ mod tests {
             Some("scheduled work")
         );
 
-        crate::host::sleep::woke(&store, SHIP, "scheduled work", None);
+        crate::host::sleep::woke(&store, SHIP, "scheduled work", None).unwrap();
         tick(&mut store).unwrap();
         assert_waiting(&store, "accept ready work when idle");
 

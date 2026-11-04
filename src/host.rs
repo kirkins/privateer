@@ -485,7 +485,7 @@ pub(crate) fn alert_blocked(store: &Store, observed: &[(String, String, String)]
          (SELECT ship FROM presence WHERE expires_ms>?1 AND holder LIKE 'host:%')",
         [now],
     )?;
-    let mut alerts = delivery::alert(&tx, now)?;
+    let mut alerts = delivery::alert(store, now)?;
     for (ship, status, _) in observed {
         match status.as_str() {
             "blocked" => {

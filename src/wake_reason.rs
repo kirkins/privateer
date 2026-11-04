@@ -170,8 +170,14 @@ pub(crate) fn hosted(store: &Store, args: &Value) -> Result<Value> {
         "wake.hosted requires the current hosted presence lease"
     );
     let custody = crate::presence::session(store, ship)?.context("hosted session")?;
+    // Acceptance is a ship-level receipt, not a holder-local diagnostic. A
+    // wake changes the custody epoch even when it keeps the holder: retain
+    // real receipts so sleep and the watchdog cannot regress to the ack cursor.
+    // Reset only session-local state, never promoting report_accepted.
     tx.execute(
-        "DELETE FROM hosted_delivery WHERE ship=?1 AND (holder<>?2 OR holder_since_ms<>?3)",
+        "UPDATE hosted_delivery SET holder=?2, holder_since_ms=?3,
+         session=NULL, report_accepted=0, paused=0, reason=NULL, declines=0, busy_since_ms=NULL
+         WHERE ship=?1 AND (holder<>?2 OR holder_since_ms<>?3)",
         params![ship, holder, custody.since_ms],
     )?;
     tx.execute(
