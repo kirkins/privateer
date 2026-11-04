@@ -49,7 +49,7 @@ impl Fixture {
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
         assert!(fd >= 0);
         let guard = Child {
-            pid,
+            process: child,
             pidfd: unsafe { File::from_raw_fd(fd as i32) },
             reaped: false,
         };
@@ -81,7 +81,7 @@ impl Fixture {
 }
 
 struct Child {
-    pid: i32,
+    process: std::process::Child,
     pidfd: File,
     reaped: bool,
 }
@@ -98,7 +98,12 @@ impl Child {
         }
     }
     fn reap(mut self) -> i32 {
-        let status = reap(self.pid, &self.pidfd, boottime_ms().unwrap() + CLEANUP_MS).unwrap();
+        let status = reap(
+            self.process.id() as i32,
+            &self.pidfd,
+            boottime_ms().unwrap() + CLEANUP_MS,
+        )
+        .unwrap();
         self.reaped = true;
         status
     }
@@ -112,7 +117,7 @@ impl Drop for Child {
         if !self.reaped {
             self.kill();
             let _ = reap(
-                self.pid,
+                self.process.id() as i32,
                 &self.pidfd,
                 boottime_ms().unwrap_or(0).saturating_add(CLEANUP_MS),
             );
