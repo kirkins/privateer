@@ -71,6 +71,15 @@ fn sealed_digest(
     Ok(digest)
 }
 impl Snapshot {
+    #[cfg(target_os = "linux")]
+    pub(super) fn input(&self, path: &Path) -> Result<&super::artifact::Seal> {
+        self.inputs
+            .iter()
+            .find(|i| i.path == path)
+            .map(|i| &i.seal)
+            .context("adapter input absent from verified snapshot")
+    }
+
     pub fn bindings(&self) -> Value {
         json!({"verifier":{"id":self.configuration.verifier.id,"sha256":self.verifier_sha256},
             "adapter":{"id":self.configuration.adapter.id,"sha256":self.adapter_sha256}})

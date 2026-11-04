@@ -1,5 +1,5 @@
-//! Dormant host-admission/custody bridge. No job, grant use, command, adapter or
-//! process is created here. The future dispatcher must admit BEFORE consuming a use.
+//! Dormant host-admission/custody bridge. Admission creates no job, grant use,
+//! command, adapter or process. A future dispatcher must admit BEFORE consuming a use.
 //! A dropped token deliberately retains capacity: a vanished owner does not
 //! prove that an unrecorded payload never started. Captain-only resource.recover
 //! can explicitly release pre-handoff holds after inspection, even if their
@@ -17,17 +17,19 @@ pub(crate) struct Admitted {
     conn: Connection,
     reservation: Reservation,
     record: String,
+    charter_digest: String,
 }
 /// Process-local custody after a committed host handoff, NOT upload authority.
 /// Only Admitted::handoff creates this token; no status/JSON reconstruction or
 /// Drop-based release. The future sole spawn method must consume this token,
 /// CAS its exact record again and bind a fresh claim before releasing authority
-/// bytes. No spawn method exists in this slice.
+/// bytes. The Linux-only dormant spawn retains capacity even after local exit.
 #[derive(Debug)]
 pub(crate) struct Handoff {
     conn: Connection,
     reservation: Reservation,
     record: String,
+    charter_digest: String,
 }
 
 /// A failure before the host writer lock was acquired returns custody for
@@ -94,6 +96,7 @@ impl Admitted {
                 conn: self.conn,
                 reservation: self.reservation,
                 record,
+                charter_digest: self.charter_digest,
             }),
             Err(cause) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
@@ -250,6 +253,7 @@ fn admit_with(
         conn,
         reservation,
         record,
+        charter_digest: crate::core::hash(&charter),
     };
     if let Err(error) = tx.commit() {
         admitted.release_unlaunched().context(
@@ -330,6 +334,11 @@ pub(super) fn recover_reserved(
         json!({"released":held.key,"job_id":held.job_id,"forced":true,
         "payload_absence_proven":false,"audit":"resource_recovery_audit"}),
     )
+}
+
+#[cfg(test)]
+pub(crate) fn admit_for_test(store: &Store) -> Result<Admitted> {
+    tests::admit_fake(store)
 }
 
 #[cfg(test)]

@@ -21,7 +21,13 @@ pub(super) fn init(store: &Store) -> Result<()> {
             use_id TEXT PRIMARY KEY REFERENCES deployment_uses(id),
             state TEXT NOT NULL CHECK(state IN ('pending','claimed','started','denied','completed','unknown')),
             request_thread TEXT NOT NULL UNIQUE, updated_ms INTEGER NOT NULL,
-            claim_identity TEXT, outcome TEXT);",
+            claim_identity TEXT, outcome TEXT);
+         CREATE TABLE IF NOT EXISTS deployment_payloads(
+            use_id TEXT PRIMARY KEY REFERENCES deployment_uses(id),record TEXT NOT NULL);
+         CREATE TRIGGER IF NOT EXISTS deployment_payloads_no_update BEFORE UPDATE ON deployment_payloads
+            BEGIN SELECT RAISE(ABORT,'deployment custody is immutable'); END;
+         CREATE TRIGGER IF NOT EXISTS deployment_payloads_no_delete BEFORE DELETE ON deployment_payloads
+            BEGIN SELECT RAISE(ABORT,'deployment custody is immutable'); END;",
     )?;
     Ok(())
 }

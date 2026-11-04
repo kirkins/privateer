@@ -558,7 +558,7 @@ pub fn cli(home: &Path, args: Value, caller: Caller) -> Result<Value> {
     dead_code,
     reason = "Dormant claim/recovery; no deployment dispatcher is registered"
 )]
-mod claims;
+pub(crate) mod claims;
 mod ledger;
 pub mod verifier;
 
