@@ -561,7 +561,9 @@ fn validate_domain(map: &Map<String, Value>, complete: bool) -> Result<()> {
                     "received_at",
                     "age_ms",
                     "max_source_age_ms",
-                    "as_of"
+                    "as_of",
+                    "history",
+                    "history_as_of"
                 ]
                 .contains(&key.as_str()),
                 "unexpected source field {key}"
@@ -597,8 +599,24 @@ fn validate_domain(map: &Map<String, Value>, complete: bool) -> Result<()> {
             }
         } else {
             ensure!(
-                s.len() == 3 + usize::from(s.contains_key("as_of")),
+                s.len()
+                    == 3 + usize::from(s.contains_key("as_of"))
+                        + 2 * usize::from(s.contains_key("history")),
                 "barrier fields need a barrier mode"
+            );
+        }
+        if let Some(history) = s.get("history") {
+            ensure!(history == "legacy_cut", "invalid history boundary");
+            ensure!(
+                s.get("history_as_of")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|t| t >= 0),
+                "legacy history needs a desk observation time"
+            );
+        } else {
+            ensure!(
+                !s.contains_key("history_as_of"),
+                "history date without a boundary"
             );
         }
         if let Some(as_of) = s.get("as_of") {
@@ -972,6 +990,16 @@ pub(crate) fn subscription_coverage(
                 .is_some_and(|s| SOURCE_STATES.contains(&s))
             {
                 source["state"] = json!("history_gap");
+            }
+            // Deliberate scalar projection: never forward the operator's cut
+            // object (digest, home handles, counts or released-home inventory).
+            if status["legacy_cut"]["digest"].is_string()
+                && let Some(at) = status["legacy_cut"]["observed_at"]
+                    .as_i64()
+                    .filter(|t| *t >= 0)
+            {
+                source["history"] = json!("legacy_cut");
+                source["history_as_of"] = json!(at);
             }
             // Local/collect evidence here is a dated barrier, NOT a new
             // on-demand contact initiated by this subscription read.

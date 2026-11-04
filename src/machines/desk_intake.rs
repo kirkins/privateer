@@ -88,6 +88,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         "desk_home_missing",
         "desk_legacy_cut",
         "desk_legacy_pin",
+        "desk_legacy_time",
     ];
     let has_original_columns = |c: &Connection| -> Result<bool> {
         Ok(c.query_row(

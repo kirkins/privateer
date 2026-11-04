@@ -96,6 +96,10 @@ fn v2_peer_rejects_v3_evidence_sidecar() {
     let (_, e) = issued(&r, &m);
     let wire = json!(e.unwrap());
     assert_eq!(wire["version"], 3);
+    assert!(
+        wire.get("legacy").is_none(),
+        "uncut v3 wire remains unchanged"
+    );
     assert!(serde_json::from_value::<V2Evidence>(wire.clone()).is_err());
     let mut v2 = wire.clone();
     v2.as_object_mut().unwrap().remove("cut_digest");

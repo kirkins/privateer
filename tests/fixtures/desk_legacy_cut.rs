@@ -31,6 +31,11 @@ fn legacy_plan_is_agent_callable_without_opening_a_home_and_operator_can_apply()
     let plan: Value = serde_json::from_slice(&out.stdout).unwrap();
     m.ok("machine.desk.legacy.apply",json!({"source":source,"digest":plan["digest"],"reason":"Explicit closed history boundary"}));
     assert!(db.query_row("SELECT EXISTS(SELECT 1 FROM desk_legacy_cut)",[],|r|r.get::<_,bool>(0)).unwrap());
+    let status = m.ok("machine.desk.status",json!({}));
+    assert!(status["source_status"][0]["legacy_cut"]["homes"].is_array(),"{status}");
+    let denied = m.command().args(["--role","agent","--actor","survey","machine.desk.status","--json","{}"]).output().unwrap();
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("operator"),"{}",String::from_utf8_lossy(&denied.stderr));
     m.ok("machine.desk.legacy.revoke",json!({"source":source,"reason":"Withdraw boundary"}));
     assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM desk_legacy_cut)",[],|r|r.get::<_,bool>(0)).unwrap());
 }

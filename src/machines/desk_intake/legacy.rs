@@ -17,7 +17,20 @@ pub(super) fn init(c: &Connection) -> Result<()> {
         PRIMARY KEY(domain,source));
         CREATE TABLE IF NOT EXISTS desk_legacy_pin(
         domain TEXT NOT NULL, source TEXT NOT NULL, mailbox TEXT NOT NULL, id TEXT NOT NULL,
-        PRIMARY KEY(domain,source,mailbox,id));",
+        PRIMARY KEY(domain,source,mailbox,id));
+        CREATE TABLE IF NOT EXISTS desk_legacy_time(
+        domain TEXT NOT NULL, source TEXT NOT NULL, digest TEXT NOT NULL, cut_at_ms INTEGER,
+        PRIMARY KEY(domain,source));
+        CREATE TRIGGER IF NOT EXISTS desk_legacy_time_revoke AFTER DELETE ON desk_legacy_cut
+        BEGIN DELETE FROM desk_legacy_time WHERE domain=old.domain AND source=old.source; END;",
+    )?;
+    // Preserve old cuts without inventing a date when their bounded audit has
+    // already expired. This metadata never participates in the cut digest.
+    c.execute_batch(
+        "INSERT OR IGNORE INTO desk_legacy_time
+        SELECT domain,source,digest,(SELECT MAX(at_ms) FROM desk_intake_audit
+          WHERE stage='legacy.apply' AND json_extract(body,'$.decision.cut.digest')=digest)
+        FROM desk_legacy_cut;",
     )?;
     Ok(())
 }
@@ -51,6 +64,53 @@ pub(super) fn load(c: &Connection, m: &Manifest, source: &str) -> Result<Option<
         );
     }
     Ok(cut)
+}
+
+/// Operator-only facts carried beside proof, never copied into coverage.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Summary {
+    pub(super) digest: String,
+    cut_at_ms: Option<i64>,
+    homes: Vec<HomeCount>,
+    released_homes: Vec<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct HomeCount {
+    home: String,
+    count: usize,
+}
+pub(super) fn summary(c: &Connection, m: &Manifest, source: &str) -> Result<Option<Summary>> {
+    let Some((digest, cut)) = load(c, m, source)? else {
+        return Ok(None);
+    };
+    let cut_at_ms = c
+        .query_row(
+            "SELECT cut_at_ms FROM desk_legacy_time WHERE domain=?1 AND source=?2 AND digest=?3",
+            params![m.domain, source, digest],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(Some(Summary {
+        digest,
+        cut_at_ms,
+        homes: cut
+            .homes
+            .iter()
+            .map(|h| HomeCount {
+                home: h.home.clone(),
+                count: h.count,
+            })
+            .collect(),
+        released_homes: cut
+            .homes
+            .iter()
+            .filter(|h| h.mailbox.is_none())
+            .map(|h| h.home.clone())
+            .collect(),
+    }))
 }
 
 fn load_raw(c: &Connection, m: &Manifest, source: &str) -> Result<Option<(String, Cut)>> {
@@ -234,6 +294,15 @@ pub(super) fn apply(
             source,
             required(args, "digest")?,
             current["plan"].to_string()
+        ],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO desk_legacy_time VALUES(?1,?2,?3,?4)",
+        params![
+            m.domain,
+            source,
+            required(args, "digest")?,
+            crate::store::Store::now_ms()
         ],
     )?;
     for (mailbox, id) in cut.pins {

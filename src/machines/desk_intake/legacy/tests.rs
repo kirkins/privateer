@@ -145,6 +145,143 @@ fn closed_legacy_cut_is_read_only_digest_bound_revocable_and_never_projected() {
     assert_eq!(f.r.query_row("SELECT COUNT(*) FROM desk_intake_audit WHERE stage IN ('legacy.apply','legacy.revoke')",[],|r|r.get::<_,i64>(0)).unwrap(),2);
 }
 #[test]
+fn cut_status_and_public_coverage_are_separate_dated_and_revocable() {
+    let f = Fixture::new();
+    coverage::install_placement_manifest(
+        &f.r,
+        &f.m.domain,
+        900000,
+        &[(ALPHA.into(), vec!["survey".into()])],
+    )
+    .unwrap();
+    let context = crate::door::scoped::DelegatedContext::from_gateway(&json!({
+        "version":1,"client":uuid::Uuid::new_v4().to_string(),"resource":"door:alpha",
+        "scopes":["mail:read"],"ships":null,"result_id":uuid::Uuid::new_v4().to_string()
+    }))
+    .unwrap();
+    let clock = Clock {
+        session: "alpha",
+        wall_ms: 1000,
+        tick_ms: 1000,
+    };
+    let snapshot = || completion::snapshot(&f.r, &f.m, ALPHA, &clock, deadline()).unwrap();
+    let public = |status| coverage::subscription_coverage(&f.r, &f.m, &context, &[status]).unwrap();
+    let absent = public(snapshot());
+    coverage::validate(&absent, &[]).unwrap();
+    assert!(absent["sources"][0].get("history").is_none());
+    f.apply();
+    let e = f.evidence();
+    let before = f.r.total_changes();
+    let status = snapshot();
+    assert_eq!(f.r.total_changes(), before, "status is read only");
+    let cut = &status["legacy_cut"];
+    assert_eq!(cut["digest"], json!(e)["cut_digest"]);
+    assert!(cut["cut_at_ms"].as_i64().unwrap() > 0);
+    assert_eq!(cut["homes"][0]["count"], 1);
+    assert_eq!(cut["released_homes"], json!([]));
+    assert_eq!(cut["proof_holds"], true, "{status}");
+    let shown = public(status.clone());
+    coverage::validate(&shown, &["alpha", "beta", "gamma"]).unwrap();
+    assert!(!shown["sources"][0].to_string().contains("survey"));
+    let source = &shown["sources"][0];
+    assert_eq!(source["history"], "legacy_cut");
+    assert!(source["history_as_of"].as_i64().unwrap() > 0);
+    for field in [
+        "legacy_cut",
+        "homes",
+        "count",
+        "digest",
+        "released_homes",
+        "cut_at_ms",
+    ] {
+        assert!(source.get(field).is_none(), "{shown}");
+    }
+    for bad in [json!({"count":1}), json!("alpha"), json!("/var/tmp/alpha")] {
+        let mut invalid = shown.clone();
+        invalid["sources"][0]["history"] = bad;
+        assert!(coverage::validate(&invalid, &[]).is_err());
+    }
+    let mut undated = shown.clone();
+    undated["sources"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("history_as_of");
+    assert!(coverage::validate(&undated, &[]).is_err());
+    // The owner receives only sanitized cut metadata on the existing proof
+    // sidecar; its observation date is its own checkpoint receipt clock.
+    f.r.execute(
+        "UPDATE door_reader_identity SET id=?1",
+        ["00000000-0000-4000-8000-00000000000b"],
+    )
+    .unwrap();
+    let remote = proof::legacy_status(&f.r, &f.m, ALPHA).unwrap().unwrap();
+    assert_eq!(remote["observed_at"], 1000);
+    assert_eq!(remote["homes"], cut["homes"]);
+    proof::receive(&f.r, &f.m, ALPHA, None).unwrap();
+    let withdrawn = proof::legacy_status(&f.r, &f.m, ALPHA).unwrap().unwrap();
+    assert!(withdrawn["observed_at"].is_null());
+    let withdrawn_public = public(json!({"id":ALPHA,"state":"history_gap","legacy_cut":withdrawn}));
+    assert!(withdrawn_public["sources"][0].get("history").is_none());
+    proof::receive(&f.r, &f.m, ALPHA, Some(e.clone())).unwrap();
+    f.r.execute("UPDATE desk_intake_checkpoint SET barrier='newer'", [])
+        .unwrap();
+    assert!(
+        proof::legacy_status(&f.r, &f.m, ALPHA).unwrap().unwrap()["observed_at"].is_null(),
+        "old cut evidence must not borrow a newer barrier's date"
+    );
+    f.r.execute("UPDATE door_reader_identity SET id=?1", [ALPHA])
+        .unwrap();
+    revoke(
+        &f.r,
+        &Caller::Operator,
+        &f.m,
+        ALPHA,
+        &json!({"reason":"Withdraw boundary"}),
+    )
+    .unwrap();
+    let removed = public(snapshot());
+    coverage::validate(&removed, &[]).unwrap();
+    assert!(removed["sources"][0].get("history").is_none(), "{removed}");
+    assert!(snapshot().get("legacy_cut").is_none());
+    // Durable time is not lost when the bounded transport audit is trimmed.
+    f.apply();
+    f.r.execute("DELETE FROM desk_intake_audit", []).unwrap();
+    assert!(
+        summary(&f.r, &f.m, ALPHA)
+            .unwrap()
+            .unwrap()
+            .cut_at_ms
+            .is_some()
+    );
+}
+
+#[test]
+fn strict_v3_interop_omits_uncut_metadata_and_fails_closed_for_cut_metadata() {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OldV3 {
+        #[serde(rename = "version")]
+        _version: u8,
+        #[serde(rename = "cut_digest")]
+        _cut_digest: Option<String>,
+        #[serde(rename = "checkpoint")]
+        _checkpoint: Checkpoint,
+        #[serde(rename = "vector")]
+        _vector: reconcile::Proof,
+        #[serde(rename = "valid")]
+        _valid: bool,
+    }
+    let f = Fixture::new();
+    f.apply();
+    let cut_wire = json!(f.evidence());
+    assert!(serde_json::from_value::<OldV3>(cut_wire.clone()).is_err());
+    let mut uncut_wire = cut_wire;
+    uncut_wire.as_object_mut().unwrap().remove("legacy");
+    uncut_wire["cut_digest"] = Value::Null;
+    assert!(serde_json::from_value::<OldV3>(uncut_wire).is_ok());
+}
+
+#[test]
 fn stale_digest_integrity_and_agents_are_refused() {
     let f = Fixture::new();
     let args = f.args();

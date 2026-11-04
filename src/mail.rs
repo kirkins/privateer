@@ -3366,7 +3366,9 @@ fn deliver_inner(store: &Store, args: &Value, provenance: &source::Provenance) -
         if payload.get("wait_subscribe").is_some() || payload.get("wait_unsubscribe").is_some() {
             return crate::waits::deliver_notice(store, id, from, to, &payload);
         }
-        let via = optional_str(args, "via")?;
+        // Local agent flushes may carry runtime notices, but only operator
+        // transport can assert a carrying machine (as for origin below).
+        let via = optional_str(args, "via")?.filter(|_| matches!(store.caller(), Caller::Operator));
         return crate::scheduling::remote_notice(store, id, from, to, via, &payload);
     }
     // Files cross a link only on the captain's mail to a ship, and this home,
