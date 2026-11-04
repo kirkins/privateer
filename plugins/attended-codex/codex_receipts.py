@@ -76,7 +76,7 @@ def seen_nonce(state, nonce_hash):
                                                for bit in nonce_bits(nonce_hash))))
 
 
-def check_nonce(sessions, nonce):
+def check_nonce(sessions, nonce, target_session):
     nonce_hash = digest(nonce.encode())
     for state in sessions.values():
         if (nonce_hash in state.get("nonce_digests", [])
@@ -87,7 +87,7 @@ def check_nonce(sessions, nonce):
     for session, state in sessions.items():
         bits = nonce_filter(state)
         fill = bin(bits).count("1") / NONCE_FILTER_BITS
-        if fill >= NONCE_FILTER_MAX_FILL:
+        if session == target_session and fill >= NONCE_FILTER_MAX_FILL:
             raise NonceFilterClosed("nonce_filter_saturated", session, fill)
         if all(bits & (1 << bit) for bit in nonce_bits(nonce_hash)):
             raise NonceFilterClosed("nonce_filter_possible_reuse", session, fill)
@@ -173,12 +173,14 @@ def open_turn_at(stream, offset):
                 turn = event.get("turn_id")
                 if not isinstance(turn, str) or not turn:
                     raise ValueError("native anchor lifecycle lacks turn ID")
-                return turn if kind == "task_started" else None
+                attribution = event.get("turn_attribution")
+                trigger = attribution.get("turn_trigger") if isinstance(attribution, dict) else None
+                return (turn, trigger) if kind == "task_started" else (None, None)
             if kind in ("context_compacted", "thread_rolled_back", "turn_started", "turn_complete"):
                 raise ValueError("native anchor lifecycle/schema needs reconciliation")
     if position:
         raise ValueError("native open-turn anchor exceeds lookup budget")
-    return None
+    return None, None
 
 
 def anchor(binding, cwd):
@@ -195,9 +197,10 @@ def anchor(binding, cwd):
             raise ValueError("receipt anchor has an incomplete native record")
         if binding.get("transcript_identity") != {"device": info.st_dev, "inode": info.st_ino}:
             raise ValueError("binding rollout identity changed")
+        turn, trigger = open_turn_at(stream, offset)
         return {"path": path, "device": info.st_dev, "inode": info.st_ino,
                 "offset": offset, "meta_hash": meta, "boundary_hash": checkpoint(stream, offset),
-                "open_turn": open_turn_at(stream, offset)}
+                "open_turn": turn, "open_turn_trigger": trigger}
 
 
 class NativeInputUnqualified(ValueError):
@@ -227,8 +230,9 @@ def scan(intent, session, cwd):
 
     task_started/task_complete are the native v1 rollout spellings on 0.166.
     A user_message has no turn_id; associate it only with the unambiguous open
-    task_started in this same anchored stream. Assistant/response_item text and
-    mere turn-start/queue removal are never presentation evidence.
+    queue-triggered task_started in this same anchored stream. Queue and
+    promoted client IDs are separate facts; equality is unqualified.
+    Assistant/response_item text and queue removal are never presentation evidence.
     """
     a = intent["scan"]
     stream, info, meta = open_rollout(a["path"], session, cwd)
@@ -237,10 +241,10 @@ def scan(intent, session, cwd):
                 or info.st_size < a["offset"] or meta != a["meta_hash"]
                 or checkpoint(stream, a["offset"]) != a["boundary_hash"]):
             raise ValueError("receipt anchor lost: replacement, truncation or rewrite")
-        # B2 anchors lacked the lifecycle seed. Recover it from the validated
-        # saved boundary, never from today's EOF or by ignoring a terminal.
-        if "open_turn" not in intent:
-            intent["open_turn"] = a.get("open_turn") if "open_turn" in a else open_turn_at(stream, a["offset"])
+        # Older checkpoints lack trigger provenance. Recover BOTH facts at
+        # the validated scan boundary, never infer queue origin from the body.
+        if "open_turn" not in intent or "open_turn_trigger" not in intent:
+            intent["open_turn"], intent["open_turn_trigger"] = open_turn_at(stream, a["offset"])
         stream.seek(a["offset"])
         data = stream.read(LIMIT)
         complete = data.rfind(b"\n") + 1
@@ -261,17 +265,21 @@ def scan(intent, session, cwd):
                 if not isinstance(turn, str) or not turn or intent.get("open_turn"):
                     raise ValueError("ambiguous native turn association")
                 intent["open_turn"] = turn
+                attribution = event.get("turn_attribution")
+                intent["open_turn_trigger"] = (attribution.get("turn_trigger")
+                                               if isinstance(attribution, dict) else None)
             elif kind in ("task_complete", "turn_aborted"):
                 if event.get("turn_id") != intent.get("open_turn"):
                     raise ValueError("native terminal turn mismatch")
                 intent["open_turn"] = None
+                intent["open_turn_trigger"] = None
             elif kind == "user_message" and event.get("message") == intent["body"]:
                 turn = intent.get("open_turn")
                 client = native_client(event)
                 if not turn:
                     raise ValueError("native mail input lacks open-turn association")
-                if intent.get("client_id") not in (None, client):
-                    raise ValueError("native mail client ID mismatch")
+                if intent.get("open_turn_trigger") != "queue":
+                    raise ValueError("native mail input lacks queue-triggered turn association")
                 receipt = {"turn_id": turn, "client_id": client}
                 if intent.get("receipt") not in (None, receipt):
                     raise ValueError("duplicate native mail promotion")
@@ -400,7 +408,7 @@ class Ledger:
             state = sessions[session]
             if after_seq < max(state["accepted_through"], state.get("suppressed_through", 0)):
                 raise ValueError("receipt range would replay accepted mail or operator-abandoned offer")
-            check_nonce(sessions, nonce)
+            check_nonce(sessions, nonce, session)
             if state.get("intent"):
                 state.setdefault("history", []).append(state["intent"])
             intent = {"state": "prepared", "nonce": nonce, "body": body, "body_hash": digest(body.encode()),
@@ -449,13 +457,17 @@ class Ledger:
             elif intent["state"] not in FINAL:
                 candidate = copy.deepcopy(intent)
                 try:
+                    # B4 stored queue IDs in client_id too. Preserve that fact
+                    # separately before scan records the native promotion ID.
+                    if candidate.get("queue_id") and "queue_client_id" not in candidate:
+                        candidate["queue_client_id"] = exact_uuid(candidate.pop("client_id"))
                     caught_up = scan(candidate, session, candidate["cwd"])
                     match = queued_match(queue, candidate)
                     if match:
-                        client = match["clientUserMessageId"]
-                        if candidate.get("client_id") not in (None, client):
+                        client = exact_uuid(match["clientUserMessageId"])
+                        if candidate.get("queue_client_id") not in (None, client):
                             raise ValueError("queued mail client ID changed")
-                        candidate.update(client_id=client, queue_id=match["id"])
+                        candidate.update(queue_client_id=client, queue_id=match["id"])
                         if candidate["state"] != "presented":
                             candidate["state"] = "queued"
                     elif pre_request_failure and candidate["state"] in ("prepared", "invoking"):
@@ -464,6 +476,7 @@ class Ledger:
                         candidate["state"] = "uncertain"
                     candidate["scan_caught_up"] = caught_up
                     candidate.pop("pause_reason", None)
+                    intent.clear()
                     intent.update(candidate)
                 except (OSError, ValueError, KeyError, TypeError) as error:
                     # Commit only the last good checkpoint; never reset an

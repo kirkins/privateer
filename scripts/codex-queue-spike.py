@@ -192,7 +192,8 @@ class Fixture(binding_fixture.Fixture):
                 "attached_queue_reached_prompt_hook": True,
                 "loaded_without_tui_queue_promoted_by_daemon": True,
                 "detached_native_queue_turns": len(native_starts),
-                "requires_attached_for_future_delivery": True,
+                "requires_hosted_custody_for_future_delivery": True,
+                "future_delivered_turns_possibly_unattended": True,
                 "hook_stopped_is_not_presentation": True,
                 "attachment_observations": {"owned_tui": attached, "never_tui": never_tui,
                                             "after_owned_tui_exit": detached},
@@ -211,11 +212,26 @@ class Fixture(binding_fixture.Fixture):
         call = {"path": handler.path, "peer": handler.client_address[0],
                 "host": handler.headers["Host"], "method": handler.command, "allowed_body": False}
         self.calls.append(call)  # count even malformed/unexpected requests
-        assert len(self.calls) == 1, "more than the one captain-approved mock request"
-        assert call["peer"] == "127.0.0.1" and call["host"] == f"127.0.0.1:{self.server.server_port}"
-        size = int(handler.headers.get("Content-Length", "0"))
-        assert 0 < size <= 1 << 20
-        request = json.loads(handler.rfile.read(size))
+        def refuse(reason):
+            # socketserver swallows handler exceptions. Retain the violation
+            # for the main-thread check and return an explicit failure instead.
+            call["violation"] = reason
+            handler.send_response(500)
+            handler.send_header("Content-Length", "0")
+            handler.end_headers()
+
+        if len(self.calls) != 1:
+            return refuse("more than the one captain-approved mock request")
+        if (call["peer"] != "127.0.0.1" or call["host"] != f"127.0.0.1:{self.server.server_port}"
+                or call["path"] != "/v1/responses" or call["method"] != "POST"):
+            return refuse("unexpected loopback mock endpoint")
+        try:
+            size = int(handler.headers.get("Content-Length", "0"))
+            if not 0 < size <= 1 << 20:
+                return refuse("invalid mock request size")
+            request = json.loads(handler.rfile.read(size))
+        except (ValueError, OSError):
+            return refuse("malformed mock request")
         def contains_body(value):
             if isinstance(value, str):
                 return self.allow_body is not None and self.allow_body in value
@@ -223,7 +239,8 @@ class Fixture(binding_fixture.Fixture):
                 return any(contains_body(item) for item in value.values())
             return isinstance(value, list) and any(contains_body(item) for item in value)
         call["allowed_body"] = contains_body(request)
-        assert call["allowed_body"]
+        if not call["allowed_body"]:
+            return refuse("request lacks the one permitted notification")
         response = {"id": "resp_fixture", "object": "response", "status": "completed",
                     "output": [], "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1}}
         data = "event: response.completed\ndata: " + json.dumps({"type": "response.completed", "response": response}) + "\n\n"
@@ -238,6 +255,7 @@ class Fixture(binding_fixture.Fixture):
         assert self.calls[0]["peer"] == "127.0.0.1"
         assert self.calls[0]["host"] == f"127.0.0.1:{self.server.server_port}"
         assert self.calls[0]["path"] == "/v1/responses" and self.calls[0]["method"] == "POST"
+        assert not any("violation" in call for call in self.calls), self.calls
         assert self.calls[0]["allowed_body"] is True
 
     def qualify_receipt(self, record):

@@ -9,6 +9,8 @@ rejected/abandoned history growth and adds negative attachment/receipt qualifica
 B4 addresses nonce-capacity diagnostics, qualifies one accepted queue input against
 an isolated loopback mock (captain-approved scope change), and proposes a
 Privateer-owned attended-pane proof for review, **design only**.
+B5a fixes the B4 review findings below. The first mate approved separate B5b
+custody and B5c dormant-runner slices; neither is implemented here.
 No runner or B3c control/report integration is implemented; delivery stays disabled. The fresh
 reservation decision below is design only, not implementation approval.
 Goal: an explicitly launched Codex first-mate pane handles idle mail without
@@ -718,9 +720,11 @@ and records the actual native events before checking the receipt contract.
 Neither this request nor a native accepted-input receipt qualifies attachment or
 live mail. Delivery remains disabled; no runner is authorized in B4.
 
-**Observed evidence:** serial admitted gate `9ed9bfa0-2204-4c56-864c-c0474b2cf8d9`
-passed all eight steps (Codex Rust units 2, Python 84, plugins 36, attended 24,
-bytecode guard 1, build, binding fixture and queue fixture). The binding fixture
+**Observed evidence:** exact-head serial admitted gate
+`1e1b983a-90d6-48e6-a43b-f6867ae624da` at
+`b2e3e7789b25fb8e9e04d6e14b82ff5482026954` passed all eight steps
+(Codex Rust units 2, Python 86, plugins 36, attended 24, bytecode guard 1,
+build, binding fixture and queue fixture). The binding fixture
 made zero requests; the queue fixture made exactly one POST to its own
 `127.0.0.1:<fixture port>/v1/responses`. Both CLI and owned daemon were 0.166.0.
 The real rollout recorded, in order:
@@ -752,7 +756,9 @@ blanket claim that every match proves nonce reuse:
 - Exact retained nonce/digest match: `receipt nonce reused`.
 - Filter-only match: `nonce_filter_possible_reuse` (could be an evicted real
   nonce OR a false positive; do not assert which).
-- Fill >= 25%: `nonce_filter_saturated`, even for a nonce whose bits do not match.
+- Fill >= 25% in the **session being prepared**: `nonce_filter_saturated`, even
+  for a nonce whose bits do not match. Other sessions still participate in exact
+  and possible-reuse checks, but their capacity alone does not block this session.
 
 Both filter errors include the responsible session, fill ratio, 65,536-bit
 capacity and maximum fill. They close admission transactionally without changing
@@ -760,7 +766,8 @@ the ledger or acceptance/ack cursors. With four independent indices this fixed
 8 KiB bitset (16 KiB hex JSON) reaches 25% fill at roughly 4,700 distinct admitted
 retirements per session; false-positive probability there is roughly 0.39%.
 This is an estimate, not an insert-count guarantee. Existing more-filled B3b
-filters are preserved and refused, never cleared automatically. Old digest-only
+filters are preserved and refuse new inserts into their own session, never
+cleared automatically; negative cross-session membership checks still work. Old digest-only
 ledgers migrate conservatively, including unknown historical rejection digests;
 we cannot subtract them from an existing non-deleting filter safely.
 
@@ -785,6 +792,43 @@ review (a separately designed durable replay-preserving ledger rollover or
 capacity migration), not timer/captain chatter/rebind. No such rollover or runner
 is implemented here. Rejected-exec failures retain the existing one-minute/K=3
 retry contract; exemption from filter capacity is not permission to spin.
+
+### B5a: B4 review fixes (delivery disabled)
+
+The first mate approved this limited slice on 2026-11-04. Saturation now refuses
+prepare only for the target session; a different session's saturated filter
+still checks possible reuse and retains all watermarks. This is not rollover or
+permission for a runner to switch UUIDs to evade capacity. No rollover exists;
+explicit operator capacity review is still required for the full session.
+
+The fixture has **not** observed a queue item's `clientUserMessageId` before
+promotion, so equality with the promoted native `user_message.client_id` is
+**unqualified and no longer required**. Queue and promoted client IDs must each
+be canonical UUIDs and are stored as separate facts (`queue_client_id` versus
+receipt `client_id`). A queue ID changing across observations still pauses.
+B4 queued checkpoints migrate their saved queue ID separately before scanning;
+no fact is lost when promotion supplies a different ID. Exact saved body/nonce
+plus the anchored native **queue-triggered** open turn is the receipt proof,
+not presumed ID equality. A matching mail body under a missing/unknown/non-queue
+trigger refuses. Busy lifecycle tracking can still observe ordinary captain
+turns; it does not turn them into mail receipts. Older checkpoints lacking
+trigger provenance recover it with the bounded lifecycle lookup at their saved
+scan offset, not today's EOF. A lookup gap pauses, never guesses queue origin.
+
+The HTTP mock handler records each validation violation and answers 500 rather
+than relying on assertions swallowed by the server thread. Main-thread checks
+still fail the fixture on any violation. Deterministic tests exercise malformed
+and excess requests as well as the one allowed request without provider access.
+
+B5b will implement Rust hosted-supervisor custody/poison and barrier tests; B5c
+will implement the dormant runner. **Every future delivered turn must be counted
+and reported as possibly unattended against K=3 and the budget.** Hosted-pane
+custody is the authorization boundary; no public native attachment discriminator
+is claimed or required as a substitute. Neither future slice may add an enable
+path here. Before activation, filter rollover, remaining native queue
+qualification and all documented barriers still need qualification/review.
+Delivery remains false, no Rust supervision path changes, no live qualification.
+**Paginated installs get no idle mail**, and no history-mode setting changes.
 
 ### B4: Privateer-owned attended-pane proof (DESIGN ONLY, Opus review requested)
 
@@ -897,9 +941,10 @@ This assumes native append-only history; it does not cryptographically verify
 every earlier byte on every scan. Replacement/truncation at the checkpoint,
 compaction/rollback or unsupported turn schema pauses; no anchor is reset.
 
-Native 0.166 rollout `event_msg/task_started` opens a turn, exact
+Native 0.166 rollout `event_msg/task_started` opens a turn; a mail receipt
+requires its `turn_attribution.turn_trigger` to be exactly `queue`. Exact
 `event_msg/user_message` with the full saved body and native client ID records
-presentation within that open turn, and matching `task_complete`/`turn_aborted`
+presentation within that queue-triggered open turn, and matching `task_complete`/`turn_aborted`
 closes it. B4 now qualifies the text-only user-message/client-ID shape against
 real 0.166.0 records from its one-request loopback fixture, as recorded above;
 unsupported shapes still refuse with a clear reason. Assistant prose,
