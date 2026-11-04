@@ -36,7 +36,7 @@ fn intake_barrier_vectors_cross_real_gateways_revalidate_and_preserve_old_peer_m
             let loss: Vec<String>=intake_db(source).prepare("SELECT state FROM desk_intake_loss").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
             panic!("{owner}: no received proof; saved={saved:?}; loss={loss:?}")
         });
-        assert_eq!(proof["version"],2);
+        assert_eq!(proof["version"],3);
         assert_eq!(proof["vector"]["candidate"],true);
         assert_eq!(proof["checkpoint"]["source"],core);
         let cp=&proof["checkpoint"];

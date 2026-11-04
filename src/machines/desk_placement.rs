@@ -1057,14 +1057,28 @@ pub(super) fn routing(conn: &Connection) -> Result<Option<String>> {
 /// not a second independently configured source/owner list.
 pub(super) fn intake_manifest(conn: &Connection) -> Result<(fs::File, Manifest)> {
     let fence = lock_mode(false, true)?;
+    Ok((fence, active_intake_manifest(conn)?))
+}
+
+/// Planning must not create even the placement lock file on an incomplete
+/// restore. A missing fence is an unavailable plan, never inferred authority.
+pub(super) fn intake_manifest_readonly(conn: &Connection) -> Result<(fs::File, Manifest)> {
+    let fence = fs::File::open(path("desk-placement.lock")?)?;
+    ensure!(
+        unsafe { libc::flock(fence.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0,
+        "desk placement lock unavailable"
+    );
+    Ok((fence, active_intake_manifest(conn)?))
+}
+
+fn active_intake_manifest(conn: &Connection) -> Result<Manifest> {
     routing(conn)?.context("intake requires explicit placement")?;
-    let manifest = records(conn)?
+    Ok(records(conn)?
         .into_iter()
         .find(|r| r.state == "active")
         .context("missing active placement")?
         .proposal
-        .manifest;
-    Ok((fence, manifest))
+        .manifest)
 }
 
 /// Hold the placement fence until the subscription transaction commits. No

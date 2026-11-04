@@ -2,6 +2,47 @@ use super::*;
 use crate::{mail::source, store::Store};
 use std::time::Duration;
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
+#[test]
+fn replay_accepts_only_still_released_retired_homes() {
+    let f = Fixture::new();
+    let absent = f.dir.path().join("gamma");
+    f.source
+        .execute(
+            "INSERT INTO ships VALUES('retired',?1,1)",
+            [absent.to_str().unwrap()],
+        )
+        .unwrap();
+    let mut args = json!({"home":absent,"ship":"retired","operation":"release","reason":"Absent retired test home"});
+    args["digest"] =
+        crate::machines::desk_intake::release::plan(&f.source, &args).unwrap()["digest"].clone();
+    crate::machines::desk_intake::release::apply(
+        &f.source,
+        &crate::store::Caller::Operator,
+        "release",
+        &args,
+    )
+    .unwrap();
+    let e = f.evidence();
+    let live = homes(&f.source, &f.m, ALPHA, &e, deadline()).unwrap();
+    assert_eq!(live.len(), 1, "released homes have no witness tuple");
+    let mut batch = Batch {
+        vector_digest: crate::core::hash(&json!(e)["vector"]),
+        evidence: e.clone(),
+        homes: live,
+        witnesses: Vec::new(),
+        digest: String::new(),
+    };
+    batch.digest = batch_digest(&batch);
+    assert!(valid_batch(&f.desk, &f.m, ALPHA, &batch).unwrap());
+    let _reappeared = Store::open(&absent).unwrap();
+    assert!(homes(&f.source, &f.m, ALPHA, &e, deadline()).is_err());
+    assert!(
+        proof::outgoing(&f.source, &f.m, &e.checkpoint, deadline())
+            .unwrap()
+            .is_some_and(|e| !e.is_valid())
+    );
+}
+
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(86_400)
 }

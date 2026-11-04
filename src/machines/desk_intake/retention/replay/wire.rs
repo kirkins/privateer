@@ -244,6 +244,15 @@ fn homes(
             "backpressure: replay homes"
         );
         let handle = crate::core::hash(&json!(Path::new(path)));
+        if old["state"] == "released" {
+            ensure!(
+                old["home"] == handle
+                    && super::super::super::release::state(c, Path::new(path), Some(deadline))?
+                        == "released",
+                "replay released home reappeared"
+            );
+            continue;
+        }
         let load = || -> Result<Option<Home>> {
             let raw: Option<String> = c.query_row(
                 "SELECT body FROM desk_replay_home_cache WHERE domain=?1 AND source=?2 AND binding=?3 AND home=?4",
@@ -508,10 +517,16 @@ fn valid_batch(c: &Connection, m: &Manifest, source: &str, b: &Batch) -> Result<
     let expected = evidence["vector"]["homes"]
         .as_array()
         .context("missing replay homes")?;
-    if expected.len() != b.homes.len() {
+    // Released homes have no live mailbox tuple and can never witness mail.
+    // Evidence eligibility still requires their retired/released census state.
+    let imported: Vec<_> = expected
+        .iter()
+        .filter(|h| h["state"] != "released")
+        .collect();
+    if imported.len() != b.homes.len() {
         return Ok(false);
     }
-    for (h, old) in b.homes.iter().zip(expected) {
+    for (h, old) in b.homes.iter().zip(imported) {
         if old["home"] != h.home
             || old["mailbox"] != h.mailbox
             || old["nonce"] != h.nonce

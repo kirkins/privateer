@@ -144,6 +144,8 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "fleet.snapshot",
     "machine.desk.home.release",
     "machine.desk.home.readmit",
+    "machine.desk.legacy.apply",
+    "machine.desk.legacy.revoke",
     "report.get",
     "file.put",
     "usage.summary",

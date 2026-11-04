@@ -265,6 +265,10 @@ fn run() -> Result<()> {
     if privateer::operator_only(&caller, &command) || command == "serve" {
         caller.require_operator(&command)?;
     }
+    if command == "machine.desk.legacy.plan" {
+        println!("{}", privateer::machines::desk_legacy_plan(&args)?);
+        return Ok(());
+    }
     if command == "machine.desk.home.plan" {
         println!("{}", privateer::machines::desk_home_plan(&args)?);
         return Ok(());

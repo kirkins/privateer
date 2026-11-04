@@ -3519,7 +3519,7 @@ fn deliver_inner(store: &Store, args: &Value, provenance: &source::Provenance) -
             because_of,
             // Only the runtime names the delivering machine: the gateway keeps
             // `via` only for a machine linked to it, and collect stamps it.
-            via.filter(|_| from == CAPTAIN)
+            via
         ],
     )?;
     audit_captain_send(
