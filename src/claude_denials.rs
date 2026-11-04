@@ -23,6 +23,8 @@
 //! path with every other character a dash, so `web-app` and `web_app` share
 //! one: only records whose `cwd` is the pane's folder, or inside it, are read
 //! as the pane's. The raw input is handed to `block_ask`, which masks it.
+pub(crate) mod receipts;
+
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};

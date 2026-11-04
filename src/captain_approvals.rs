@@ -881,9 +881,14 @@ fn capacity_notice(store: &Store, ship: &str, now: i64) -> Result<Option<String>
         .iter()
         .map(|row| {
             format!(
-                "{}: {} (expires {})",
+                "{}: {}{} (expires {})",
                 row.id,
                 row.action.chars().take(90).collect::<String>(),
+                if row.action.chars().count() > 90 {
+                    "…"
+                } else {
+                    ""
+                },
                 crate::routes::utc_time(row.expires_ms)
             )
         })

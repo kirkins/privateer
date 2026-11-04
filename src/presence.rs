@@ -416,6 +416,10 @@ fn renewed_binding(
 #[path = "presence_binding_tests.rs"]
 mod binding_tests;
 
+#[cfg(test)]
+#[path = "presence_session_tests.rs"]
+mod session_tests;
+
 /// Whether the live session aboard is one the dispatcher hosts.
 pub fn hosted(store: &Store, ship: &str) -> Result<bool> {
     Ok(store.connection().query_row(
@@ -565,6 +569,33 @@ pub fn claude_hook(home: Option<&Path>, event: &str, caller: Result<crate::store
     }
 }
 
+// A direct interactive session in the same folder has no hosted lease and
+// cannot name the pane's receipt evidence. This changes no approval authority.
+fn record_hosted_claude_session(
+    store: &Store,
+    ship: &str,
+    holder: &str,
+    session: &str,
+) -> Result<()> {
+    if !holder.starts_with(HOSTED)
+        || session.is_empty()
+        || session.len() > 200
+        || !session
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Ok(());
+    }
+    store.connection().execute(
+        "UPDATE hosted_panes SET session_id=?3,
+           fresh_id=CASE WHEN fresh_route LIKE 'claude/%' THEN ?3 ELSE fresh_id END
+         WHERE ship=?1 AND EXISTS(SELECT 1 FROM presence
+           WHERE ship=?1 AND holder=?2 AND expires_ms>?4 AND harness='claude')",
+        params![ship, holder, session, Store::now_ms()],
+    )?;
+    Ok(())
+}
+
 fn claude_hook_inner(
     home: &Path,
     event: &str,
@@ -601,6 +632,9 @@ fn claude_hook_inner(
     });
     if wrapped.is_some() && !refresh(&store, &ship, &holder, 90)? {
         return Ok(0);
+    }
+    if let (Some(holder), Some(session)) = (wrapped.as_deref(), input["session_id"].as_str()) {
+        record_hosted_claude_session(&store, &ship, holder, session)?;
     }
     // The native mod sets this only after it has loaded and verified this
     // session's lease. A refused/disabled mod never disables the old hooks;

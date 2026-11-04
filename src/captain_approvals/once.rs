@@ -23,15 +23,16 @@ pub(super) fn used(conn: &Connection, id: &str) -> Result<bool> {
 
 // Include process identity and the byte-exact carried set in the fence. A
 // refreshed pane cannot lend its new approvals to a result of the old one.
-type Pane = (i64, String, i64, String);
+type Pane = (i64, String, i64, String, String);
 fn pane(store: &Store, ship: &str) -> Result<Option<Pane>> {
     Ok(store
         .connection()
         .query_row(
-            "SELECT pid,started,approvals_loaded_ms,approvals_ids FROM hosted_panes
-         WHERE ship=?1 AND approvals_ids IS NOT NULL AND approvals_loaded_ms IS NOT NULL",
+            "SELECT pid,started,approvals_loaded_ms,approvals_ids,session_id FROM hosted_panes
+         WHERE ship=?1 AND approvals_ids IS NOT NULL AND approvals_loaded_ms IS NOT NULL
+           AND session_id IS NOT NULL AND session_id<>''",
             [ship],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?)
 }
@@ -53,20 +54,66 @@ pub(crate) fn observe_retries(
         return Ok(());
     };
     let carried: Vec<String> = serde_json::from_str(&before.3).unwrap_or_default();
-    let Some(since) = rows
-        .iter()
-        .filter(|r| carried.contains(&r.id))
-        .map(|r| r.created_ms)
-        .min()
-    else {
+    if !rows.iter().any(|r| carried.contains(&r.id)) {
         return Ok(());
-    };
+    }
+    // Never pick the newest interactive conversation in the folder: it may
+    // be the captain's. Only the lease-fenced hosted harness names this ID.
+    if !before
+        .4
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Ok(());
+    }
+    let dir = projects.join(crate::host::claude_project_name(folder));
+    if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+        return Ok(());
+    }
+    let path = dir.join(format!("{}.jsonl", before.4));
+    let previous = checkpoint(store, ship)?;
+    let fence = crate::core::hash(&json!(before));
+    let mut saved: Saved = previous
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .filter(|s: &Saved| s.fence == fence)
+        .unwrap_or_else(|| Saved {
+            fence,
+            cursor: Default::default(),
+        });
     let Some(scan) =
-        crate::claude_denials::since(projects, folder, since - MAX_TTL_SECS as i64 * 1000)
+        crate::claude_denials::receipts::read(&path, folder, &before.4, &mut saved.cursor)
     else {
         return Ok(());
     };
-    record_retries(store, ship, &before, &scan)
+    let next = serde_json::to_string(&saved)?;
+    if previous.as_deref() == Some(&next) {
+        return Ok(());
+    }
+    record_retries(
+        store,
+        ship,
+        &before,
+        &scan,
+        Some((previous.as_deref(), &next)),
+    )
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Saved {
+    fence: String,
+    cursor: crate::claude_denials::receipts::Cursor,
+}
+
+fn checkpoint(store: &Store, ship: &str) -> Result<Option<String>> {
+    Ok(store
+        .connection()
+        .query_row(
+            "SELECT state FROM captain_approval_cursors WHERE ship=?1",
+            [ship],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 fn record_retries(
@@ -74,9 +121,15 @@ fn record_retries(
     ship: &str,
     before: &Pane,
     scan: &crate::claude_denials::Scan,
+    progress: Option<(Option<&str>, &str)>,
 ) -> Result<()> {
     let tx = store.write_transaction()?;
     if pane(store, ship)?.as_ref() != Some(before) {
+        return Ok(());
+    }
+    if let Some((old, _)) = progress
+        && checkpoint(store, ship)?.as_deref() != old
+    {
         return Ok(());
     }
     // Authority can change during transcript I/O or while waiting for the
@@ -100,6 +153,7 @@ fn record_retries(
         if session.is_empty()
             || session != passed_session
             || scan.session.as_deref() != Some(session)
+            || session != before.4
             || started < before.2
             || passed < started
             || passed > now
@@ -174,6 +228,13 @@ fn record_retries(
             }
         }
     }
+    if let Some((_, next)) = progress {
+        tx.execute(
+            "INSERT INTO captain_approval_cursors(ship,state) VALUES(?1,?2)
+             ON CONFLICT(ship) DO UPDATE SET state=excluded.state",
+            params![ship, next],
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -237,8 +298,8 @@ mod tests {
 
     fn pane_with(store: &Store, ids: &[&str]) {
         store.connection().execute(
-            "INSERT OR REPLACE INTO hosted_panes(ship,pid,started,executable,recorded_ms,approvals_ids,approvals_loaded_ms)
-             VALUES('alpha',123,'alpha','alpha',?1,?2,?1)", params![base()+4000,json!(ids).to_string()],
+            "INSERT OR REPLACE INTO hosted_panes(ship,pid,started,executable,recorded_ms,approvals_ids,approvals_loaded_ms,session_id)
+             VALUES('alpha',123,'alpha','alpha',?1,?2,?1,'alpha')", params![base()+4000,json!(ids).to_string()],
         ).unwrap();
     }
 
@@ -265,7 +326,8 @@ mod tests {
                 "content":if failed {"Permission for this action was denied by the Claude Code auto mode classifier"} else {"Published beta"}}]}});
             out.push_str(&format!("{call}\n{result}\n"));
         }
-        std::fs::write(dir.join("alpha.jsonl"), out).unwrap();
+        std::fs::write(dir.join("beta.tmp"), out).unwrap();
+        std::fs::rename(dir.join("beta.tmp"), dir.join("alpha.jsonl")).unwrap();
     }
 
     #[test]
@@ -390,6 +452,88 @@ mod tests {
     }
 
     #[test]
+    fn cursor_survives_restart_and_reads_only_new_bytes_before_retiring() {
+        use std::io::Write;
+        let _clock = FrozenWallClock::at(base() + 10000);
+        let (temp, store) = fixture();
+        let alpha = grant(&store, 0, true);
+        let id = alpha["id"].as_str().unwrap();
+        pane_with(&store, &[id]);
+        let projects = temp.path().join("projects");
+        let folder = temp.path().canonicalize().unwrap();
+        transcript(&folder, &projects, "make release", "alpha", 6, false);
+        let path = projects
+            .join(crate::host::claude_project_name(&folder))
+            .join("alpha.jsonl");
+        let all = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = all.split_inclusive('\n').collect();
+        // Tick one: refusal only, no success yet.
+        let first = lines[..2].concat();
+        let retry = lines[2..].concat();
+        std::fs::write(&path, &first).unwrap();
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        assert!(!used(store.connection(), id).unwrap());
+        let saved: Saved =
+            serde_json::from_str(&checkpoint(&store, "alpha").unwrap().unwrap()).unwrap();
+        assert_eq!(saved.cursor.end, first.len() as u64);
+        assert_eq!(saved.cursor.read_bytes, 0); // Test-only metric is not persisted.
+        let home = store.home().to_path_buf();
+        drop(store);
+        let store = Store::open(&home).unwrap();
+        let mut saved: Saved =
+            serde_json::from_str(&checkpoint(&store, "alpha").unwrap().unwrap()).unwrap();
+        crate::claude_denials::receipts::read(&path, &folder, "alpha", &mut saved.cursor).unwrap();
+        assert_eq!(saved.cursor.read_bytes, 0); // No historical bytes on tick two.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(retry.as_bytes())
+            .unwrap();
+        crate::claude_denials::receipts::read(&path, &folder, "alpha", &mut saved.cursor).unwrap();
+        assert_eq!(saved.cursor.read_bytes, retry.len());
+        // Production observer uses the persisted refusal and the new retry.
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        assert!(used(store.connection(), id).unwrap());
+    }
+
+    #[test]
+    fn foreign_interactive_session_cannot_retire_the_hosted_panes_grant() {
+        let _clock = FrozenWallClock::at(base() + 10000);
+        let (temp, store) = fixture();
+        let alpha = grant(&store, 0, true);
+        let id = alpha["id"].as_str().unwrap();
+        pane_with(&store, &[id]);
+        let projects = temp.path().join("projects");
+        let folder = temp.path().canonicalize().unwrap();
+        transcript(&folder, &projects, "make release", "alpha", 6, false);
+        let dir = projects.join(crate::host::claude_project_name(&folder));
+        let alpha_path = dir.join("alpha.jsonl");
+        let foreign = std::fs::read_to_string(&alpha_path)
+            .unwrap()
+            .replace("\"sessionId\":\"alpha\"", "\"sessionId\":\"gamma\"");
+        std::fs::rename(&alpha_path, dir.join("beta.tmp")).unwrap();
+        std::fs::write(dir.join("gamma.jsonl"), &foreign).unwrap();
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        assert!(!used(store.connection(), id).unwrap());
+        // Even under the expected filename, foreign records are not evidence.
+        std::fs::write(&alpha_path, &foreign).unwrap();
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        assert!(!used(store.connection(), id).unwrap());
+        // No recorded session is ambiguous, never an invitation to guess.
+        store
+            .connection()
+            .execute("UPDATE hosted_panes SET session_id=NULL", [])
+            .unwrap();
+        transcript(&folder, &projects, "make release", "alpha", 6, false);
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        assert!(!used(store.connection(), id).unwrap());
+        pane_with(&store, &[id]);
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        assert!(used(store.connection(), id).unwrap());
+    }
+
+    #[test]
     fn cap_yes_tells_captain_and_agent_the_holders_without_recording_a_grant() {
         let _clock = FrozenWallClock::at(base() + 10000);
         let (_temp, mut store) = fixture();
@@ -428,6 +572,17 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert_eq!(error, body);
+        store
+            .connection()
+            .execute(
+                "UPDATE captain_approvals SET action=?1 WHERE request_id='alpha-0'",
+                ["beta ".repeat(25)],
+            )
+            .unwrap();
+        let shortened = capacity_notice(&store, "alpha", Store::now_ms())
+            .unwrap()
+            .unwrap();
+        assert!(shortened.contains(&format!("{}… (expires", "beta ".repeat(18))));
         let count: i64 = store
             .connection()
             .query_row("SELECT COUNT(*) FROM captain_approvals", [], |r| r.get(0))
@@ -503,6 +658,18 @@ mod tests {
         let folder = temp.path().canonicalize().unwrap();
         transcript(&folder, &projects, "make release", "alpha", 6, false);
         let scan = crate::claude_denials::since(&projects, &folder, base()).unwrap();
+        // A competing tick advanced the cursor: a stale reader cannot write
+        // either receipts or a checkpoint over it.
+        record_retries(
+            &store,
+            "alpha",
+            &before,
+            &scan,
+            Some((Some("beta"), "gamma")),
+        )
+        .unwrap();
+        assert!(!used(store.connection(), id).unwrap());
+        assert!(checkpoint(&store, "alpha").unwrap().is_none());
         store
             .connection()
             .execute(
@@ -510,11 +677,11 @@ mod tests {
                 [],
             )
             .unwrap();
-        record_retries(&store, "alpha", &before, &scan).unwrap();
+        record_retries(&store, "alpha", &before, &scan, None).unwrap();
         assert!(!used(store.connection(), id).unwrap());
         pane_with(&store, &[id]);
         dispatch(&mut store, "captain_approval.revoke", json!({"id":id})).unwrap();
-        record_retries(&store, "alpha", &before, &scan).unwrap();
+        record_retries(&store, "alpha", &before, &scan, None).unwrap();
         assert!(!used(store.connection(), id).unwrap());
         let count: i64 = store
             .connection()

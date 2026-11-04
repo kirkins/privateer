@@ -317,7 +317,9 @@ impl Store {
         migrate.execute_batch(
             "CREATE TABLE IF NOT EXISTS captain_approval_once(
                approval_id TEXT PRIMARY KEY REFERENCES captain_approvals(id),
-               used_ms INTEGER, evidence TEXT);",
+               used_ms INTEGER, evidence TEXT);
+             CREATE TABLE IF NOT EXISTS captain_approval_cursors(
+               ship TEXT PRIMARY KEY, state TEXT NOT NULL);",
         )?;
         migrate.commit()?;
         connection.execute("INSERT OR IGNORE INTO metadata VALUES('schema','1')", [])?;
