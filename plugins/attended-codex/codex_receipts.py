@@ -173,14 +173,21 @@ def open_turn_at(stream, offset):
                 turn = event.get("turn_id")
                 if not isinstance(turn, str) or not turn:
                     raise ValueError("native anchor lifecycle lacks turn ID")
-                attribution = event.get("turn_attribution")
-                trigger = attribution.get("turn_trigger") if isinstance(attribution, dict) else None
+                trigger = turn_trigger(event) if kind == "task_started" else None
                 return (turn, trigger) if kind == "task_started" else (None, None)
             if kind in ("context_compacted", "thread_rolled_back", "turn_started", "turn_complete"):
                 raise ValueError("native anchor lifecycle/schema needs reconciliation")
     if position:
         raise ValueError("native open-turn anchor exceeds lookup budget")
     return None, None
+
+
+def turn_trigger(event):
+    attribution = event.get("turn_attribution")
+    trigger = attribution.get("turn_trigger") if isinstance(attribution, dict) else None
+    if trigger == "queue" and attribution.get("turn_id") != event.get("turn_id"):
+        raise ValueError("native queue turn attribution mismatch")
+    return trigger
 
 
 def anchor(binding, cwd):
@@ -243,8 +250,10 @@ def scan(intent, session, cwd):
             raise ValueError("receipt anchor lost: replacement, truncation or rewrite")
         # Older checkpoints lack trigger provenance. Recover BOTH facts at
         # the validated scan boundary, never infer queue origin from the body.
-        if "open_turn" not in intent or "open_turn_trigger" not in intent:
+        if (intent.get("lifecycle_version") != 2
+                or "open_turn" not in intent or "open_turn_trigger" not in intent):
             intent["open_turn"], intent["open_turn_trigger"] = open_turn_at(stream, a["offset"])
+            intent["lifecycle_version"] = 2
         stream.seek(a["offset"])
         data = stream.read(LIMIT)
         complete = data.rfind(b"\n") + 1
@@ -265,9 +274,7 @@ def scan(intent, session, cwd):
                 if not isinstance(turn, str) or not turn or intent.get("open_turn"):
                     raise ValueError("ambiguous native turn association")
                 intent["open_turn"] = turn
-                attribution = event.get("turn_attribution")
-                intent["open_turn_trigger"] = (attribution.get("turn_trigger")
-                                               if isinstance(attribution, dict) else None)
+                intent["open_turn_trigger"] = turn_trigger(event)
             elif kind in ("task_complete", "turn_aborted"):
                 if event.get("turn_id") != intent.get("open_turn"):
                     raise ValueError("native terminal turn mismatch")
@@ -415,6 +422,8 @@ class Ledger:
                       "after_seq": after_seq, "through_seq": through_seq, "generation": record["generation"],
                       "callback_generation": record["callback_generation"], "holder": record["holder"],
                       "cwd": record["cwd"], "scan": anchor(record["binding"], record["cwd"])}
+            intent.update(open_turn=intent["scan"]["open_turn"],
+                          open_turn_trigger=intent["scan"]["open_turn_trigger"], lifecycle_version=2)
             state["intent"] = intent
             return intent
         return self.transaction(change)
@@ -465,8 +474,9 @@ class Ledger:
                     match = queued_match(queue, candidate)
                     if match:
                         client = exact_uuid(match["clientUserMessageId"])
-                        if candidate.get("queue_client_id") not in (None, client):
-                            raise ValueError("queued mail client ID changed")
+                        if (candidate.get("queue_client_id") not in (None, client)
+                                or candidate.get("queue_id") not in (None, match["id"])):
+                            raise ValueError("queued mail item/client ID changed")
                         candidate.update(queue_client_id=client, queue_id=match["id"])
                         if candidate["state"] != "presented":
                             candidate["state"] = "queued"

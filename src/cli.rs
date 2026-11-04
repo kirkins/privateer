@@ -1610,6 +1610,22 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                     return Err(error);
                 }
             };
+            let mut codex_custody = if hosted
+                && launch.harness == "codex"
+                && std::env::var("PRIVATEER_CODEX_ATTENDED").as_deref() == Ok("1")
+            {
+                match crate::host::codex_custody::Custody::new(&child, folder) {
+                    Ok(custody) => Some(custody),
+                    Err(error) => {
+                        eprintln!(
+                            "Codex custody unavailable; delivery remains disabled: {error:#}"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             if hosted {
                 // A failure to record readiness leaves the conservative reserved retry
                 // in place; never abandon an already spawned native process over it.
@@ -1638,7 +1654,14 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             // ended authorizations ask was told to retry after; a notice in
             // the ask's thread says the session now carries them.
             let _ = crate::block_ask::announce_reauthorized(&store, &ship, &carried);
-            crate::host::sleep::supervise(&store, &ship, &holder, &mut child, sleep_after)?
+            crate::host::sleep::supervise(
+                &store,
+                &ship,
+                &holder,
+                &mut child,
+                sleep_after,
+                codex_custody.as_mut(),
+            )?
         };
         match ended {
             crate::host::sleep::Ended::Exited(status) => break status,

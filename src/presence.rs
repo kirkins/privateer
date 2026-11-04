@@ -165,6 +165,9 @@ fn attend_with_capture(
         .as_ref()
         .filter(|b| b.holder == holder && b.expires_ms > now);
     let binding = renewed_binding(renewing.and_then(|b| b.binding.as_deref()), captured)?;
+    if renewing.is_none() {
+        crate::host::codex_custody::holder_changed(store, ship)?;
+    }
     store.connection().execute(
         "INSERT INTO presence(ship, holder, harness, started_ms, expires_ms, binding, holder_since_ms) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?4)
          ON CONFLICT(ship) DO UPDATE SET
@@ -223,19 +226,43 @@ pub const HOSTED: &str = "host:";
 
 /// Release the lease if this holder still has it.
 pub fn leave(store: &Store, ship: &str, holder: &str) -> Result<bool> {
-    Ok(store.connection().execute(
+    let tx = store
+        .connection()
+        .is_autocommit()
+        .then(|| store.write_transaction())
+        .transpose()?;
+    let changed = store.connection().execute(
         "DELETE FROM presence WHERE ship=?1 AND holder=?2",
         params![ship, holder],
-    )? == 1)
+    )? == 1;
+    if changed {
+        crate::host::codex_custody::holder_changed(store, ship)?;
+    }
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
+    Ok(changed)
 }
 
 /// Move the lease from `from` to the runtime's new holder `to`, in the
 /// caller's transaction. Its session begins now. Returns whether it moved.
 pub(crate) fn hand_over(store: &Store, ship: &str, from: &str, to: &str) -> Result<bool> {
-    Ok(store.connection().execute(
+    let tx = store
+        .connection()
+        .is_autocommit()
+        .then(|| store.write_transaction())
+        .transpose()?;
+    let changed = store.connection().execute(
         "UPDATE presence SET holder=?3, holder_since_ms=?4 WHERE ship=?1 AND holder=?2",
         params![ship, from, to, Store::now_ms()],
-    )? == 1)
+    )? == 1;
+    if changed && from != to {
+        crate::host::codex_custody::holder_changed(store, ship)?;
+    }
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
+    Ok(changed)
 }
 
 /// The current holder's session as the dispatcher judges its adapter: who

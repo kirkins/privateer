@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) mod approvals;
 pub mod bridge;
+pub(crate) mod codex_custody;
 mod delivery;
 pub(crate) mod pi_sessions;
 pub(crate) mod restored;
