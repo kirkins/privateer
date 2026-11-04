@@ -365,5 +365,6 @@ fn daemon(record: &Value, expected: &Value) -> Result<bool> {
         && json!(meta.ino()) == expected["inode"])
 }
 
-#[cfg(test)]
+// Custody needs pidfd_open and /proc, so its tests run only where custody can exist.
+#[cfg(all(test, target_os = "linux"))]
 mod tests;
