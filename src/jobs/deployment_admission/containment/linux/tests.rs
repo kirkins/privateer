@@ -26,15 +26,25 @@ fn only_a_successful_open_and_write_enoent_qualifies() {
 // control files are used only to observe an unconditional kill attempt.
 #[test]
 fn clock_read_failure_still_attempts_cgroup_kill_and_pidfd_kill_and_reaps() {
+    clock_failure_cleanup(false);
+}
+
+#[test]
+fn both_clock_reads_failing_retains_custody_and_still_kills() {
+    clock_failure_cleanup(true);
+}
+
+fn clock_failure_cleanup(both: bool) {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("cgroup.kill"), "").unwrap();
     std::fs::write(temp.path().join("cgroup.events"), "populated 0\n").unwrap();
-    let held = Qualified {
+    let mut held = Qualified {
         directory: File::open(temp.path()).unwrap(),
         parent: File::open(temp.path()).unwrap(),
         name: CString::new("alpha").unwrap(),
         identity: json!({}),
-        cleanup_unknown: true,
+        // Start known, so the assertion below tests a production transition.
+        cleanup_unknown: false,
     };
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0);
@@ -48,11 +58,31 @@ fn clock_read_failure_still_attempts_cgroup_kill_and_pidfd_kill_and_reaps() {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     assert!(fd >= 0, "test requires pidfd support");
     let pidfd = unsafe { File::from_raw_fd(fd as i32) };
-    let error = cleanup_child(&held, pid, &pidfd, || {
-        anyhow::bail!("injected clock read failure")
+    let mut reads = 0;
+    let error = cleanup_child(&mut held, pid, &pidfd, || {
+        reads += 1;
+        if both || reads == 1 {
+            anyhow::bail!("injected clock read failure")
+        }
+        boottime_ms()
     })
     .unwrap_err();
-    assert!(error.to_string().contains("injected clock"));
+    assert_eq!(reads, 2);
+    if !both {
+        assert!(error.to_string().contains("injected clock"));
+    }
+    assert!(
+        held.cleanup_unknown,
+        "clock failure must acquire/retain custody"
+    );
+    // With both reads failing, production is allowed only one nonblocking reap.
+    // The test separately finishes reaping under a healthy, bounded clock; this
+    // hygiene is NOT a production custody discharge.
+    if both && held.identity.get("last_wait_status").is_none() {
+        let status = reap(pid, &pidfd, boottime_ms().unwrap() + CLEANUP_MS).unwrap();
+        assert!(libc::WIFSIGNALED(status));
+        assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+    }
     assert_eq!(
         std::fs::read(temp.path().join("cgroup.kill")).unwrap(),
         b"1"
@@ -68,7 +98,7 @@ fn clock_read_failure_still_attempts_cgroup_kill_and_pidfd_kill_and_reaps() {
     );
     assert!(
         held.cleanup_unknown,
-        "clock failure cannot discharge custody"
+        "test hygiene cannot discharge custody"
     );
 }
 

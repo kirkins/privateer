@@ -751,7 +751,9 @@ inspection. The child has no authority while gated. It uses an empty environment
 except a fixed protocol version, a fresh private cwd, umask 077, null standard
 streams, empty capabilities and no-new-privileges. Only its explicit gate/ack
 pipes and held native executable survive setup; all close at exec. Execution
-uses `execveat(AT_EMPTY_PATH)` on the held inode, never a pathname or interpreter.
+uses `execveat(AT_EMPTY_PATH)` on the held inode. The iii-b1 refinement below
+requires a static ELF with no `PT_INTERP`: an ordinary dynamic ELF would otherwise
+load its interpreter and shared libraries by ambient path, outside that digest.
 The private primitive does not itself establish the executable's sealed digest;
 that is iii-b's mandatory pinned-adapter check before it may create any gate.
 
@@ -762,6 +764,46 @@ primitive records no deployment outcome or capacity release; `Qualified` and
 all inconclusive cleanup retain local custody. Positive tests require the
 explicit isolated real-kernel delegation, otherwise they assert refusal.
 
+### b2c-b2b-iii-b1: gate hardening before consuming spawn
+
+The approved split is iii-b1 (all PR 707 findings, static-ELF validation and
+policy/cleanup fixtures), iii-b2 (sole consuming Handoff spawn, fresh Claim,
+sealed adapter and durable cross-ledger binding), and iii-b3 (bounded hashed IO
+supervisor and all six fake scenarios). Later review may combine b2/b3; neither
+is implemented here. All slices remain dormant and unavailable for deployment.
+
+PR 707 follow-ups precede the larger spawn/supervisor surface. The parent must
+explicitly drop the original acknowledgement pipe writer after duplicating it,
+so a setup exit is observable as EOF. Setup and exec acknowledgement reads have
+separate `PROBE_MS` bounds capped by the existing runtime deadline, not a fresh
+runtime allowance. Immediately before the release byte, re-read exact child
+membership; a previous check before durable recording is not sufficient.
+
+Before exec the child clears its blocked-signal mask, restores every catchable
+signal disposition to `SIG_DFL`, and calls `setsid()`. It has no controlling
+terminal and is not in the supervisor's session or process group. These are
+mandatory launch policy, not assumptions about the launching Rust runtime.
+
+Require a supported, native, structurally bounded ELF executable and reject
+`PT_INTERP` before creating any gate. No dynamic-loader exception or shebang is
+permitted. Positive policy fixtures are statically linked native test programs;
+Linux fixture validation requires `cc` and static C libraries. Unavailable static
+compilation is a test failure, never a dynamic fallback. Rejection, native fixture
+validation and child setup-exit tests run without a qualified cgroup; positive
+containment tests still require the
+explicit isolated real-kernel delegation. Static ELF is not a sandbox against
+a malicious adapter deliberately loading other code; the pinned adapter remains
+reviewed/trusted under the IPC limitation below.
+
+Cleanup tests must check mutable custody through the production cleanup path,
+not assert an unchanged boolean passed by shared reference. If both BOOTTIME
+reads fail, both kills still run, only nonblocking reaping is allowed, and
+custody stays unknown even when the child is later reaped. A dropped unreleased
+gate is proven not to have executed by its child's signal termination status,
+not by checking a marker in an already-deleted temporary working directory.
+No command registration, activation, deployment authority or restart hook is
+introduced by these refinements.
+
 ### b2c-b2b child-gate contract (supervisor not implemented here)
 
 Prepare and verify the private pinned adapter before giving it deployment
@@ -771,8 +813,10 @@ working directory, set umask 077, and close inherited descriptors at exec
 (including home/host-ledger connections and retained artifact descriptors).
 Execute only a verified private copy made from the held executable inode, never
 a reopened configured path. Pin and verify all interpreter/script/config inputs
-before launch; no shebang or ambient PATH resolution may substitute another
-executable. No credentials or deployment metadata belong in argv or ambient env.
+before launch; the adapter gate additionally requires native static ELF with
+no `PT_INTERP`, so neither a shebang, dynamic loader nor ambient PATH resolution
+may substitute another executable. No credentials or deployment metadata belong
+in argv or ambient env.
 
 The sole spawn method consumes `Handoff` and a fresh, nonserializable `Claim`.
 It must compare the entire durable host hold again and bind its canonical key,

@@ -393,7 +393,6 @@ fn probe(held: &mut Qualified) -> Result<()> {
     // attempt. Such migration always refuses qualification, even after cleanup.
     let cleanup = cleanup_child(held, pid as i32, &pidfd, boottime_ms);
     cleanup?;
-    held.cleanup_unknown = false;
     result
 }
 
@@ -418,16 +417,17 @@ fn validate_report(report: &[u8; 12]) -> Result<()> {
 // Persistent clock failure permits only nonblocking reap/observation. Never
 // reuse the runtime deadline: an early drop could otherwise wait up to an hour.
 fn cleanup_child(
-    held: &Qualified,
+    held: &mut Qualified,
     pid: i32,
     pidfd: &File,
-    clock: impl FnOnce() -> Result<u64>,
+    mut clock: impl FnMut() -> Result<u64>,
 ) -> Result<i32> {
-    let clock = clock();
-    let deadline = clock
+    held.cleanup_unknown = true;
+    let first_clock = clock();
+    let deadline = first_clock
         .as_ref()
         .copied()
-        .or_else(|_| boottime_ms())
+        .or_else(|_| clock())
         .map_or(0, |now| now + CLEANUP_MS);
     let killed_cgroup = held.kill();
     let killed = unsafe {
@@ -441,6 +441,9 @@ fn cleanup_child(
     };
     let kill_error = std::io::Error::last_os_error().raw_os_error();
     let reaped = reap(pid, pidfd, deadline);
+    if let Ok(status) = &reaped {
+        held.identity["last_wait_status"] = json!(status);
+    }
     let empty = held.empty(deadline);
     ensure!(
         killed == 0 || kill_error == Some(libc::ESRCH),
@@ -449,7 +452,8 @@ fn cleanup_child(
     killed_cgroup?;
     let status = reaped?;
     empty?;
-    clock?;
+    first_clock?;
+    held.cleanup_unknown = false;
     Ok(status)
 }
 
