@@ -1,6 +1,8 @@
 use super::*;
 use crate::{mail::source, store::Store};
 use std::{path::Path, time::Duration};
+#[path = "release_tests.rs"]
+mod release_tests;
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 const BETA: &str = "00000000-0000-4000-8000-00000000000b";
 fn deadline() -> Instant {

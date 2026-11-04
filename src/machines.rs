@@ -3778,6 +3778,15 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
     ("machine.desk.reject", &["proposal_id", "manifest_hash"]),
     ("machine.desk.commit", &["proposal_id", "manifest_hash"]),
     ("machine.desk.status", &[]),
+    ("machine.desk.home.plan", &["home", "ship", "operation"]),
+    (
+        "machine.desk.home.release",
+        &["home", "ship", "digest", "reason"],
+    ),
+    (
+        "machine.desk.home.readmit",
+        &["home", "ship", "digest", "reason"],
+    ),
     (
         "machine.add",
         &["name", "target", "executable", "as", "fleet", "transport"],
@@ -3793,8 +3802,17 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
     ("machine.remove", &["name"]),
 ];
 
+/// Standalone read-only planning does not open or migrate a ship home.
+pub fn desk_home_plan(args: &Value) -> Result<Value> {
+    crate::check_args("machine.desk.home.plan", args)?;
+    desk_intake::release::dispatch(&Caller::Operator, "machine.desk.home.plan", args)
+}
+
 /// The `machine.*` JSON commands, for the operator.
 pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
+    if command.starts_with("machine.desk.home.") {
+        return desk_intake::release::dispatch(store.caller(), command, &args);
+    }
     store.caller().require_operator(command)?;
     match command {
         _ if command.starts_with("machine.desk.") => desk_placement::dispatch(command, &args),

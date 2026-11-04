@@ -23,6 +23,7 @@ pub(super) mod completion;
 pub(crate) mod home;
 pub(super) mod proof;
 mod reconcile;
+pub(crate) mod release;
 mod retention;
 pub(crate) mod subscription;
 pub(super) mod transport;
@@ -80,6 +81,10 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         "desk_intake_loss",
         "desk_source_revision",
         "desk_source_proof_work",
+        "desk_intake_loss_epoch",
+        "desk_home_release",
+        "desk_home_loss_boundary",
+        "desk_home_missing",
     ];
     let has_original_columns = |c: &Connection| -> Result<bool> {
         Ok(c.query_row(
@@ -104,6 +109,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         && has_original_columns(conn)?
         && has_cleanup_upper(conn)?
         && retention::replay::ready(conn)?
+        && release::ready(conn)?
     {
         return Ok(());
     }
@@ -116,6 +122,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         && has_original_columns(&tx)?
         && has_cleanup_upper(&tx)?
         && retention::replay::ready(&tx)?
+        && release::ready(&tx)?
     {
         return Ok(());
     }
@@ -245,6 +252,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
     // projection history. The ID suffix also resolves ties without a sort.
     tx.execute_batch("CREATE INDEX IF NOT EXISTS desk_intake_fact_order ON desk_intake_fact(domain,core,mailbox,source_order,id)")?;
     retention::replay::init(&tx)?;
+    release::init(&tx)?;
     if legacy {
         tx.execute("INSERT OR IGNORE INTO desk_intake_loss
             SELECT domain,source,state FROM desk_intake_gap

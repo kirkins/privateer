@@ -86,7 +86,7 @@ pub(super) fn census_until(
         let state = if skipped.contains(&path) {
             "skipped"
         } else {
-            census_state(&path, deadline)?
+            release::state(conn, &path, deadline)?
         };
         homes.push(Home {
             path,
@@ -118,8 +118,11 @@ pub(super) fn census_state(
     {
         return Ok("unreadable");
     }
-    if !database.exists() {
-        return Ok("missing");
+    match std::fs::symlink_metadata(&database) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok("missing"),
+        Err(_) => return Ok("unreadable"),
+        Ok(meta) if !meta.is_file() => return Ok("unreadable"),
+        Ok(_) => (),
     }
     let Ok(c) = Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     else {

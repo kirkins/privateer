@@ -154,7 +154,7 @@ fn next_work(
         )
         .optional()?
         .flatten();
-    let mut stmt = registry.prepare("SELECT home FROM (SELECT home FROM ships UNION SELECT home FROM desk_home_inventory) ORDER BY home<=COALESCE(?1,''),home LIMIT 10001")?;
+    let mut stmt = registry.prepare("SELECT home FROM (SELECT home FROM ships UNION SELECT home FROM desk_home_inventory) WHERE home NOT IN (SELECT home FROM desk_home_release) ORDER BY home<=COALESCE(?1,''),home LIMIT 10001")?;
     let paths = stmt.query_map([previous], |r| r.get::<_, String>(0))?;
     for path in paths {
         ensure!(
@@ -335,3 +335,48 @@ fn published_home(registry: &Connection, m: &Manifest, source: &str, path: &Path
 #[cfg(test)]
 #[path = "baseline_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    #[test]
+    fn baseline_rotation_skips_released_and_reappeared_homes_even_with_pending_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = Connection::open_in_memory().unwrap();
+        super::super::init(&r).unwrap();
+        r.execute_batch("CREATE TABLE ships(home TEXT)").unwrap();
+        let path = dir.path().join("alpha");
+        let path = path.to_str().unwrap();
+        r.execute("INSERT INTO ships VALUES(?1)", [path]).unwrap();
+        r.execute("INSERT INTO desk_home_release VALUES(?1,'alpha','captain',123,123,NULL,NULL,'Absent retired test home')", [path]).unwrap();
+        r.execute(
+            "INSERT INTO desk_baseline_home VALUES('alpha','beta',?1,'pending',123)",
+            [path],
+        )
+        .unwrap();
+        assert!(
+            next_work(
+                &r,
+                "alpha",
+                "beta",
+                Instant::now() + Duration::from_secs(10)
+            )
+            .unwrap()
+            .is_none()
+        );
+        let home = crate::store::Store::open(Path::new(path)).unwrap();
+        let before = home.connection().total_changes();
+        assert!(
+            next_work(
+                &r,
+                "alpha",
+                "beta",
+                Instant::now() + Duration::from_secs(10)
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(home.connection().total_changes(), before);
+    }
+}

@@ -70,6 +70,7 @@ pub(super) fn registry_stamp(
     for sql in [
         "SELECT json_array(home,retired_ms IS NULL,name) FROM ships ORDER BY home,name LIMIT 51",
         "SELECT json_array(home) FROM desk_home_inventory ORDER BY home LIMIT 51",
+        "SELECT json_array(home,ship,actor,released_ms,first_seen_missing_ms,unread,open,reason) FROM desk_home_release ORDER BY home LIMIT 51",
         "SELECT json_array(m.name,p.core) FROM machines m LEFT JOIN desk_placement_peer p ON p.machine=m.name ORDER BY m.name LIMIT 51",
         "SELECT json_array(machine,name) FROM machine_ships ORDER BY machine,name LIMIT 51",
     ] {
@@ -87,6 +88,7 @@ pub(super) fn registry_stamp(
         (SELECT revision FROM desk_source_revision WHERE domain=?1 AND source=?2),
         (SELECT state FROM desk_intake_gap WHERE domain=?1 AND source=?2),
         (SELECT state FROM desk_intake_loss WHERE domain=?1 AND source=?2),
+        (SELECT epoch FROM desk_intake_loss_epoch WHERE domain=?1 AND source=?2),
         EXISTS(SELECT 1 FROM desk_home_inventory_gap))",
         params![m.domain, source],
         |r| r.get(0),

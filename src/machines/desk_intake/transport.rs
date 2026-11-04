@@ -353,6 +353,7 @@ fn capture_one(conn: &Connection, c: &Contact, deadline: Instant) -> Result<()> 
     let next: Option<String> = conn
         .query_row(
             "SELECT home FROM (SELECT home FROM ships UNION SELECT home FROM desk_home_inventory)
+         WHERE home NOT IN (SELECT home FROM desk_home_release)
          ORDER BY home<=COALESCE(?1,''),home LIMIT 1",
             [previous.as_deref()],
             |r| r.get(0),

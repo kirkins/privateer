@@ -4,6 +4,7 @@ include!("fixtures/desk_placement_regressions.rs");
 include!("fixtures/desk_intake_transport.rs");
 include!("fixtures/desk_intake_reconciliation.rs");
 include!("fixtures/desk_intake_census.rs");
+include!("fixtures/desk_home_release.rs");
 include!("fixtures/desk_intake_proofs.rs");
 include!("fixtures/desk_intake_completion.rs");
 include!("fixtures/desk_intake_boot_clock.rs");
