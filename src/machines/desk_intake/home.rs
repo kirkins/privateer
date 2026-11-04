@@ -83,33 +83,10 @@ pub(super) fn census_until(
             "backpressure: census budget"
         );
         let path = PathBuf::from(path);
-        let database = path.join("privateer.sqlite");
         let state = if skipped.contains(&path) {
             "skipped"
-        } else if !database.exists() {
-            "missing"
-        } else if crate::store::reject_symlinks(&path).is_err()
-            || crate::store::reject_symlinks(&database).is_err()
-        {
-            "unreadable"
         } else {
-            match Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            {
-                Ok(c) => {
-                    c.busy_timeout(std::time::Duration::ZERO)?;
-                    let _budget = deadline
-                        .map(|d| super::transport::Budget::new(&c, d))
-                        .transpose()?;
-                    if c.query_row("SELECT COUNT(*) FROM mail", [], |r| r.get::<_, i64>(0))
-                        .is_ok()
-                    {
-                        "retained"
-                    } else {
-                        "unreadable"
-                    }
-                }
-                Err(_) => "unreadable",
-            }
+            census_state(&path, deadline)?
         };
         homes.push(Home {
             path,
@@ -127,6 +104,40 @@ pub(super) fn census_until(
         )?,
         complete: false,
     })
+}
+
+/// The contact rotation uses the same read-only classification as the census.
+/// Missing, symlinked or corrupt databases must never reach a writable open.
+pub(super) fn census_state(
+    path: &Path,
+    deadline: Option<std::time::Instant>,
+) -> Result<&'static str> {
+    let database = path.join("privateer.sqlite");
+    if crate::store::reject_symlinks(path).is_err()
+        || crate::store::reject_symlinks(&database).is_err()
+    {
+        return Ok("unreadable");
+    }
+    if !database.exists() {
+        return Ok("missing");
+    }
+    let Ok(c) = Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return Ok("unreadable");
+    };
+    c.busy_timeout(std::time::Duration::ZERO)?;
+    let _budget = deadline
+        .map(|d| super::transport::Budget::new(&c, d))
+        .transpose()?;
+    Ok(
+        if c.query_row("SELECT COUNT(*) FROM mail", [], |r| r.get::<_, i64>(0))
+            .is_ok()
+        {
+            "retained"
+        } else {
+            "unreadable"
+        },
+    )
 }
 
 /// Report census gaps durably, rather than dropping homes a directory omitted.
@@ -267,7 +278,7 @@ fn import_observed(
     } else if fact.is_none() {
         // Keep unresolved raw evidence in the receipt, not as an invented
         // origin. An equal ID/seq/body in another home proves nothing.
-        gap(&tx, m, source, "history_gap")?;
+        obstacle(&tx, m, source, "history_gap")?;
     }
     let receipt = crate::core::hash(&json!({"binding":bound,"intent":intent,"event":event}));
     tx.execute("INSERT INTO desk_home_receipt(domain,source,intent,binding,event,receipt) VALUES(?1,?2,?3,?4,?5,?6)", params![m.domain,source,intent,bound,event,receipt])?;
@@ -360,10 +371,22 @@ pub(super) fn capture_ready_until(
         // Frozen history never gains later observations. Cleanup is useful
         // while receipts advance, but rescanning its pinned live prefix on
         // every quiet contact would just rewrite cursors forever. Remaining
-        // bounded baseline proofs are retained conservatively.
-        if imported > 0 {
-            reclaim_imports(
+        // bounded baseline proofs are retained conservatively. Only this
+        // sidecar's unresolved receipts require another live-state check.
+        // The null-core lookup uses mail_source_import_local_seq instead of
+        // rescanning every pinned origin in an otherwise quiet baseline.
+        let unresolved: bool = baseline.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_source_import WHERE receipt IS NOT NULL
+             AND COALESCE(json_extract(event,'$.provenance.Origin.core'),
+                          json_extract(event,'$.provenance.Copy.core')) IS NULL
+             AND json_extract(event,'$.provenance') IN ('Unresolved','Local'))",
+            [],
+            |r| r.get(0),
+        )?;
+        if imported > 0 || unresolved {
+            reclaim_imports_from(
                 &baseline,
+                home,
                 registry,
                 m,
                 source,
@@ -443,7 +466,7 @@ fn capture_inner(
         let (imported, cleanup_upper) = import_pending(path, home, registry, m, source, deadline)?;
         // Pending imports get priority over optional cleanup. Two batched
         // commits replace up to 100 per-row fsyncs; expiration is a quiet stop.
-        reclaim_imports(home, registry, m, source, cleanup_upper, deadline)?;
+        reclaim_imports_from(home, home, registry, m, source, cleanup_upper, deadline)?;
         let membership_history_gap: bool = registry.query_row(
             "SELECT EXISTS(SELECT 1 FROM desk_home_inventory_gap)",
             [],
@@ -535,10 +558,24 @@ pub(super) fn import_pending(
 /// exact registry receipt. Delete the registry proof FIRST: a crash leaves a
 /// receipted home row, which is never re-imported, and cleanup safely retries.
 /// Delete home outbox+intent and adjust admission counters in one transaction.
-/// Unresolved/remote copies and the newest unread/open/pending fact stay
-/// pinned. Older observations may be discharged by a later receipted import.
+/// Unresolved observations stay pinned while their live mail lacks provenance;
+/// remote copies and the newest unread/open/pending fact also stay pinned.
+/// Older resolved observations may be discharged by a later receipted import.
+#[cfg(test)]
 fn reclaim_imports(
     home: &Connection,
+    registry: &Connection,
+    m: &Manifest,
+    source: &str,
+    cleanup_upper: i64,
+    deadline: Option<std::time::Instant>,
+) -> Result<()> {
+    reclaim_imports_from(home, home, registry, m, source, cleanup_upper, deadline)
+}
+
+fn reclaim_imports_from(
+    home: &Connection,
+    live: &Connection,
     registry: &Connection,
     m: &Manifest,
     source: &str,
@@ -548,7 +585,7 @@ fn reclaim_imports(
     if deadline.is_some_and(|d| source::work_now() >= d) {
         return Ok(());
     }
-    let result = reclaim_import_batch(home, registry, m, source, cleanup_upper, deadline);
+    let result = reclaim_import_batch(home, live, registry, m, source, cleanup_upper, deadline);
     match result {
         Err(e) if super::retention::interrupted_or_busy(&e) => Ok(()),
         other => other,
@@ -557,6 +594,7 @@ fn reclaim_imports(
 
 fn reclaim_import_batch(
     home: &Connection,
+    live: &Connection,
     registry: &Connection,
     m: &Manifest,
     source: &str,
@@ -580,13 +618,11 @@ fn reclaim_import_batch(
     // keyset cursor bounds work even with thousands of newest live facts.
     let mut stmt = home.prepare(
         "SELECT seq,intent,event,receipt FROM mail_source_import
-        WHERE receipt IS NOT NULL AND seq<=?2 AND seq>?3
-        AND COALESCE(json_extract(event,'$.provenance.Origin.core'),
-                     json_extract(event,'$.provenance.Copy.core'))=?1
+        WHERE receipt IS NOT NULL AND seq<=?1 AND seq>?2
         ORDER BY seq LIMIT 50",
     )?;
     let rows = stmt
-        .query_map(params![source, upper, cursor], |r| {
+        .query_map(params![upper, cursor], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -613,6 +649,27 @@ fn reclaim_import_batch(
             break;
         }
         let f: HomeFact = serde_json::from_str(&event)?;
+        scanned = seq;
+        let unresolved = matches!(f.provenance, Provenance::Unresolved | Provenance::Local);
+        if unresolved {
+            // A frozen observation cannot say whether its mail was later
+            // deleted or its pin resolved. Consult the native home, including
+            // when reclaiming receipts stored in the baseline sidecar. Keep
+            // extant mail without a pin conservatively unresolved as well.
+            let pinned: bool = live.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mail WHERE id=?1 AND NOT EXISTS(
+                 SELECT 1 FROM mail_source_origin WHERE id=?1
+                 AND provenance NOT IN ('\"Unresolved\"','\"Local\"')))",
+                [&f.id],
+                |r| r.get(0),
+            )?;
+            if pinned {
+                continue;
+            }
+        } else if !matches!(&f.provenance, Provenance::Origin(o) | Provenance::Copy(o) if o.core == source)
+        {
+            continue; // Remote copy evidence still requires origin comparison.
+        }
         let superseded: bool = home.query_row(
             "SELECT EXISTS(SELECT 1 FROM mail_source_import WHERE receipt IS NOT NULL
              AND json_extract(event,'$.mailbox')=?1 AND json_extract(event,'$.id')=?2
@@ -620,8 +677,10 @@ fn reclaim_import_batch(
             params![f.mailbox, f.id, serde_json::to_string(&f.provenance)?, seq],
             |r| r.get(0),
         )?;
-        scanned = seq;
-        if !superseded && (f.unread || f.pending || f.state.as_deref() == Some("open")) {
+        if !unresolved
+            && !superseded
+            && (f.unread || f.pending || f.state.as_deref() == Some("open"))
+        {
             continue;
         }
         let earlier: bool = home.query_row(

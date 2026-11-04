@@ -394,7 +394,7 @@ fn legacy_history_gap_stays_recoverable_in_real_reclamation_states() {
 }
 
 #[test]
-fn migrated_reclaimed_unresolved_receipt_blocks_proof_until_home_pin_resolves_or_mail_is_deleted() {
+fn unresolved_receipt_is_recoverable_but_blocks_proof_until_pin_resolves_or_mail_is_deleted() {
     fn notice(h: &Store) -> Value {
         h.connection()
             .query_row(
@@ -443,32 +443,30 @@ fn migrated_reclaimed_unresolved_receipt_blocks_proof_until_home_pin_resolves_or
         let fact: source::HomeFact = serde_json::from_str(&event).unwrap();
         assert_eq!(fact.provenance, source::Provenance::Unresolved);
         assert!(!fact.unread && !fact.pending && fact.state.as_deref() != Some("open"));
-        // Model the old cleanup's exact cross-database discharge order for a
-        // read/non-open/non-pending observation: registry receipt first, then
-        // the home's receipted import/outbox. No origin pin is reclaimed.
-        r.execute(
-            "DELETE FROM desk_home_receipt WHERE intent=?1 AND receipt=?2",
-            params![intent, receipt],
-        )
-        .unwrap();
-        source::reclaim_imports(h.connection(), &[(intent, receipt)], 0, 0).unwrap();
+        // A read/closed observation still pins unresolved extant mail. Import
+        // creates a recoverable obstacle, never permanent custody-loss evidence.
+        capture(&h, &r, &m);
+        assert_eq!(
+            r.query_row(
+                "SELECT receipt FROM desk_home_receipt WHERE intent=?1",
+                [&intent],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            receipt
+        );
         assert_eq!(
             h.connection()
                 .query_row("SELECT COUNT(*) FROM mail_source_import", [], |r| r
                     .get::<_, i64>(0))
                 .unwrap(),
-            0
+            1
         );
         assert_eq!(
             source::copy_provenance(h.connection(), "legacy-notice"),
             source::Provenance::Unresolved
         );
         assert!(!source::lost(h.connection()).unwrap());
-        // b2b-i had only the recoverable history_gap diagnostic, not today's
-        // sticky loss table. Upgrade with no retained unresolved receipt.
-        r.execute_batch("DROP TABLE desk_intake_loss; DROP TABLE desk_source_proof_work")
-            .unwrap();
-        super::super::init(&r).unwrap();
         assert_eq!(
             r.query_row("SELECT state FROM desk_intake_gap", [], |r| r
                 .get::<_, String>(0))
@@ -490,7 +488,7 @@ fn migrated_reclaimed_unresolved_receipt_blocks_proof_until_home_pin_resolves_or
         assert_eq!(vector["homes"][0]["state"], "unresolved");
         assert!(
             issued(&r, &m).1.is_none(),
-            "reclaimed receipt cannot hide unresolved home provenance"
+            "recoverable obstacle cannot hide unresolved home provenance"
         );
         if delete_mail {
             assert_eq!(crate::mail::prune(&h, i64::MAX, false).unwrap(), 1);
@@ -529,8 +527,27 @@ fn migrated_reclaimed_unresolved_receipt_blocks_proof_until_home_pin_resolves_or
         }
         capture(&h, &r, &m);
         let (cp, evidence) = issued(&r, &m);
-        let evidence =
-            evidence.expect("resolved/deleted home pin permits proof through the legacy obstacle");
+        assert_eq!(
+            r.query_row(
+                "SELECT COUNT(*) FROM desk_home_receipt WHERE intent=?1",
+                [&intent],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            h.connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM mail_source_import WHERE intent=?1",
+                    [&intent],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        let evidence = evidence
+            .expect("resolved/deleted home pin permits proof through the recoverable obstacle");
         assert!(evidence.valid && evidence.vector.candidate);
         accept_all(&r, &m, &cp);
         receive(&r, &m, ALPHA, Some(evidence.clone())).unwrap();

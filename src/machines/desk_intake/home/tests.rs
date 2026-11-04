@@ -8,6 +8,8 @@ mod cleanup_tests;
 mod retention_tests;
 #[path = "slow_tests.rs"]
 mod slow_tests;
+#[path = "unresolved_tests.rs"]
+mod unresolved_tests;
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 const BETA: &str = "00000000-0000-4000-8000-00000000000b";
 fn manifest() -> Manifest {
