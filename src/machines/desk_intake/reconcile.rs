@@ -210,6 +210,14 @@ pub(super) fn inspect(
             open: None,
             facts_cached: false,
         };
+        if home.state == "released" {
+            (proof.unread, proof.open) = conn.query_row(
+                "SELECT unread,open FROM desk_home_release WHERE home=?1",
+                [home.path.to_string_lossy().as_ref()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            proof.facts_cached = proof.unread.is_some() || proof.open.is_some();
+        }
         if home.state == "retained" {
             if let Err(error) = home_proof(&home.path, &bound, &mut proof, deadline, true) {
                 proof.state = if error.to_string().starts_with("integrity_gap") {
@@ -267,7 +275,7 @@ pub(super) fn inspect(
             && !loss
             && !unresolved_origin
             && copies_complete
-            && homes.iter().all(|h| h.state == "imported"),
+            && homes.iter().all(accepted_home),
         registry_stamp,
         copies,
         binding: binding(m)?,
@@ -280,7 +288,7 @@ pub(super) fn inspect(
             && !loss
             && !registry_gap
             && !unresolved
-            && homes.iter().all(|h| h.state == "imported"),
+            && homes.iter().all(accepted_home),
         homes,
     })
 }
@@ -297,6 +305,10 @@ pub(super) fn load(conn: &Connection, m: &Manifest, source: &str) -> Result<Opti
     raw.map(|raw| Ok(serde_json::from_str(&raw)?)).transpose()
 }
 
+fn accepted_home(h: &HomeProof) -> bool {
+    (h.state == "imported" && !h.facts_cached) || (h.state == "released" && h.retired)
+}
+
 pub(super) fn bound(p: &Proof, m: &Manifest, source: &str, upper: i64) -> Result<bool> {
     Ok(p.binding == binding(m)?
         && p.source == source
@@ -304,9 +316,7 @@ pub(super) fn bound(p: &Proof, m: &Manifest, source: &str, upper: i64) -> Result
         && p.homes.len() <= 50
         && p.membership_proved
         && !p.membership_history_gap
-        && p.homes
-            .iter()
-            .all(|h| h.state == "imported" && !h.facts_cached))
+        && p.homes.iter().all(accepted_home))
 }
 
 /// No mail-row or lifecycle-count scan on a contact. Recheck only the saved
@@ -360,10 +370,15 @@ pub(super) fn revalidate_step(
         }
         if old.home != crate::core::hash(&json!(path))
             || old.retired == active
-            || old.state != "imported"
-            || old.facts_cached
+            || !accepted_home(old)
         {
             return Ok((false, 0));
+        }
+        if old.state == "released" {
+            if release::state(conn, Path::new(&path), Some(deadline))? != "released" {
+                return Ok((false, 0));
+            }
+            continue;
         }
         let mut new = old.clone();
         if home_proof(Path::new(&path), &bound, &mut new, deadline, false).is_err() {
@@ -385,6 +400,18 @@ pub(super) fn revalidate_step(
 
 pub(super) fn save(conn: &Connection, m: &Manifest, source: &str, deadline: Instant) -> Result<()> {
     let mut proof = inspect(conn, m, source, &[], deadline)?;
+    // Only writable idle reconciliation records missing sightings. Plans and
+    // inspection remain read-only. Never overwrite the first observed date.
+    let census = home::census_until(conn, &[], Some(deadline))?;
+    for home in census.homes.iter().filter(|h| h.state == "missing") {
+        conn.execute(
+            "INSERT OR IGNORE INTO desk_home_missing(home,first_seen_ms) VALUES(?1,?2)",
+            params![
+                home.path.to_string_lossy().as_ref(),
+                crate::store::Store::now_ms()
+            ],
+        )?;
+    }
     // Quiet reconciliation is read-only, even with a different writer active.
     let old: Option<String> = conn
         .query_row(

@@ -142,6 +142,8 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "ship.profile",
     "wake.transcript",
     "fleet.snapshot",
+    "machine.desk.home.release",
+    "machine.desk.home.readmit",
     "report.get",
     "file.put",
     "usage.summary",

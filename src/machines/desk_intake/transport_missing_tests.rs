@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn capture_rotation_skips_released_and_reappeared_homes() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = db();
+    let path = dir.path().join("alpha");
+    r.execute("INSERT INTO ships VALUES(?1)", [path.to_str().unwrap()])
+        .unwrap();
+    r.execute("INSERT INTO desk_home_release VALUES(?1,'alpha','captain',123,123,NULL,NULL,'Absent retired test home')", [path.to_str().unwrap()]).unwrap();
+    let c = contact_for_test(false);
+    state(&r, &c).unwrap();
+    obstacle(&r, &c.manifest, &c.source, "history_gap").unwrap();
+    let before = r.total_changes();
+    capture_one(&r, &c, Instant::now() + Duration::from_secs(10)).unwrap();
+    assert_eq!(before, r.total_changes());
+    assert!(!path.exists());
+    let home = crate::store::Store::open(&path).unwrap();
+    capture_one(&r, &c, Instant::now() + Duration::from_secs(10)).unwrap();
+    assert_eq!(before, r.total_changes());
+    assert!(!crate::mail::source::intake_ready(home.connection()).unwrap());
+}
+
+#[test]
 fn unavailable_retired_home_never_aborts_paging_or_creates_a_database() {
     for unavailable in ["missing", "corrupt", "symlink"] {
         let dir = tempfile::tempdir().unwrap();

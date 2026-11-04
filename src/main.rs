@@ -265,6 +265,10 @@ fn run() -> Result<()> {
     if privateer::operator_only(&caller, &command) || command == "serve" {
         caller.require_operator(&command)?;
     }
+    if command == "machine.desk.home.plan" {
+        println!("{}", privateer::machines::desk_home_plan(&args)?);
+        return Ok(());
+    }
     let home = home.context(
         "not inside a ship folder (no .privateer here or above); run `privateer init`, or pass --home",
     )?;
