@@ -54,9 +54,13 @@ save only on main. Privateer's own binaries are rebuilt from the checkout.
 
 The [shard runner](../scripts/test-shard.py) assigns every integration target
 exactly once. Newly added integration suites go to `rest`; a missing or duplicate
-named suite, or an unsupported target kind, is an error. Library tests run in
-`slow-1` with no integration suite beside them, binary tests and doc tests in
-`rest`. Both platforms retain all-feature
+named suite, or an unsupported target kind, is an error. The library is split
+in two complementary halves by module-path filter (`door::` and its skip
+complement), so no single shard carries the whole library; binary tests and doc
+tests run in `rest`. A shard pair that stops partitioning the library is an
+error, and [the shard tests](../scripts/test_ci_shards.py), which the docs job
+runs on every PR, also check that the workflow matrix lists every shard. Both
+platforms retain all-feature
 tests, Linux's crew environment and the existing MCP, dashboard, pilot, lint
 and minimal-build checks.
 
@@ -89,3 +93,81 @@ the result. Each shard now appends Cargo invocation times and exit status to
 the Actions job summary. Use those summaries alongside per-suite timings in
 the logs to assess later balance; include the extra checks attached to each
 shard when comparing whole-job times.
+
+**Rebalance, 2026-11-04.** After the 11-02 rebalance `slow-1` kept growing:
+on [run 41827570345](https://github.com/kirkins/privateer/actions/runs/41827570345)
+(da6c78f4) macOS whole-job times were slow-1 22m35s, slow-2 18m28s, slow-3
+20m09s and rest 17m15s — four jobs sharing about 78 minutes of work against a
+25-minute limit each, with slow-1 cancelled at the limit on 11-03 (PRs 677 and
+680). Moving suites between four shards cannot fit that total under about
+70% of the limit, so the workflow gained a fifth shard, `slow-4`. Every
+integration suite was timed locally on the 11-04 checkout (one `cargo test
+--test <suite>` per suite, and `--lib` per top-level module), and the suites
+were dealt out so all five shards carry roughly equal measured work:
+
+| Shard | Measured work (local, s) | Content |
+| --- | ---: | --- |
+| slow-1 | ~550 | MCP door checks, dashboard smoke, pilot, minimal-build check, plus activation, attended, files, cli, input, watch |
+| slow-2 | ~560 | fmt and clippy, plus door, hosted, permissions, workspaces, plugins, tool_bundles, crew_routes, mail, fleet, jobs |
+| slow-3 | ~560 | library half `door::` (321 of 1430 tests, 339s locally), plus crew_park, upgrade_fetch, mcp_broker, review_gate, scheduling, cross_ship_waits, recovery_pilot |
+| slow-4 | ~555 | python_suites, upgrade_linked, machines, dashboard_fleet, dashboard, dashboard_yaml, cursor_attended, cross_machine_waits, pi_attention, pi_calm, pi_follow, pi_quiet |
+| rest | ~575 | library complement (`--skip door::`), bins, doc tests and the remaining suites, including desk_placement and placement |
+
+The two library halves are complements by construction (CI listed 321 + 1109
+= 1430 tests), and each runs as its own cargo invocation so a filter can never
+hide a suite's tests. A fifth runner costs one more job of setup, cache restore
+and compile (about 5–10 minutes by the fits below), so the expected macOS
+whole-job times are roughly 15–18 minutes each against the 25-minute limit —
+typical runs under 70% of the limit, with the previous worst case (slow-1 at
+90–100%) gone. This is a projection from local timings plus whole-job macOS
+anchors, not a measurement of the changed workflow; the per-invocation times
+the shard runner appends to the Actions job summary will show the real split.
+If shards still run close to the limit, the next levers are a sixth shard or
+cutting per-job overhead, not moving suites again.
+
+**Rebalance, 2026-11-04, second pass.** PR 717's first run with `slow-4`
+([run 41848822540](https://github.com/kirkins/privateer/actions/runs/41848822540)
+at `da76f98c`) timed the new macOS `slow-4` out at 25m49s. The Linux sums of
+each shard's Cargo invocations were slow-1 7m32s, slow-2 8m52s, slow-3 12m10s,
+slow-4 12m22s and rest 7m44s; macOS `slow-1` ran its whole job in 11m01s.
+Inside slow-4 the Linux times were upgrade_linked 310s, python_suites 220s,
+machines 83s, dashboard_fleet 47s and every other suite under 10s. macOS runs
+those two heavy suites at roughly 2.2 times their Linux time (crew_park's
+measured 4m12s from 11-02 matches 2.2 x ~115s), so upgrade_linked and
+python_suites together were about 18-20 minutes of suite time before setup:
+they must never share a shard again. The shard runner and the shard tests now
+refuse a map that puts them together or leaves either of them out of the named
+shards (into `rest`), the same way they refuse a duplicate.
+
+With the pair split apart, five shards cannot hold the measured work with
+every projected macOS job under about 17 minutes (~70% of the 25-minute
+limit), so the workflow gained a sixth shard, `slow-5`, on both platforms —
+the cost is one more Linux and one more macOS runner per runtime run.
+
+| Shard | Linux work in | Projected macOS | Content |
+| --- | ---: | ---: | --- |
+| slow-1 | 7m32s + 2m17s moved in | ~15m50s | MCP door checks, dashboard smoke, pilot and minimal-build check, plus activation, attended, files, cli, input, watch, machines, dashboard_fleet |
+| slow-2 | 8m52s (unchanged) | ~14-16m | fmt and clippy, plus door, hosted, permissions, workspaces, plugins, tool_bundles, crew_routes, mail, fleet, jobs |
+| slow-3 | 12m10s less crew_park | ~13-16m | library half `door::`, plus upgrade_fetch, mcp_broker, review_gate, scheduling, cross_ship_waits, recovery_pilot |
+| slow-4 | 310s + <40s of pi suites | ~16m50s | upgrade_linked, plus pi_attention, pi_calm, pi_follow, pi_quiet |
+| slow-5 | 220s + ~115s | ~16m20s | python_suites, plus crew_park |
+| rest | 7m44s + <40s moved in | ~14-16m | library complement, bins, doc tests, the remaining suites plus dashboard, dashboard_yaml, cursor_attended, cross_machine_waits |
+
+Projections use macOS ≈ 2.2 x Linux suite time + about 4 minutes of setup;
+slow-1 anchors on its measured 11m01s plus 2.2 x 130s of moved suites, and
+slow-3's row is bounded by the same map running green on macOS at `da76f98c`
+with crew_park still aboard — a shard's invocation sum also carries compile
+time that does not scale 2.2x, which is why the raw sums overstate slow-3.
+This is a projection, not a measurement of the changed workflow; the
+per-invocation times in the Actions job summaries will show the real split,
+with slow-4 and slow-5 the shards to watch first. If shards still run close
+to the limit after this, the next levers are a seventh shard or cutting
+per-job overhead, not moving suites again.
+
+**Rebalance, 2026-11-04, third pass (measured).** The first macOS jobs on
+the six-shard map that got runners (run 41859340431, attempt 2) measured
+slow-2 at 19m28s whole-job (78% of the limit; suites: door 414s, hosted
+180s, workspaces 149s, plugins 61s, the rest under 50s each) and slow-4 at
+5m53s (upgrade_linked 288s on macOS, close to its Linux time, not 2.2x).
+`hosted` and `workspaces` moved from slow-2 to slow-4, projecting macOS
+slow-2 at about 14 minutes and slow-4 at about 11-12 minutes.
