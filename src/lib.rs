@@ -151,6 +151,8 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "usage.summary",
     "activity.list",
     "privileged.run",
+    "attended.codex.grant",
+    "attended.codex.revoke",
 ];
 
 /// Whether a command is the operator's alone for this caller. The ship the
@@ -175,6 +177,7 @@ pub type Accepted = &'static [(&'static str, &'static [&'static str])];
 const ACCEPTED: &[Accepted] = &[
     ACCEPTED_HERE,
     activation::ACCEPTED,
+    host::codex_delivery::ACCEPTED,
     activity::ACCEPTED,
     attention::ACCEPTED,
     capabilities::ACCEPTED,
@@ -375,6 +378,7 @@ fn dispatch_once(store: &mut Store, command: &str, args: Value) -> Result<Value>
         }
         "bundle" if command == "bundle.configure" => tool_bundles::configure(store, args),
         "permissions" => permissions::dispatch(store, command, args),
+        "attended" => host::codex_delivery::dispatch(store, command, args),
         "routes" => crew_routes::dispatch(store, command, args),
         "work" => scheduling::dispatch(store, command, args),
         "task" if matches!(command, "task.enqueue" | "task.defer") => {

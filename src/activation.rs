@@ -380,6 +380,20 @@ pub fn profile(store: &Store, ship: &str, profile: &Value) -> Result<Value> {
     if let Some(host) = object.get("host").filter(|v| !v.is_null()) {
         out.insert("host".into(), crate::host::validate(host)?);
     }
+    if let Some(session) = object.get("codex_session").filter(|v| !v.is_null()) {
+        // The exact native session a hosted Codex pane resumes; never chosen
+        // by cwd or recency. Its history mode is checked at bind and spawn.
+        let raw = session.as_str().unwrap_or_default();
+        ensure!(
+            uuid::Uuid::parse_str(raw).is_ok_and(|u| u.to_string() == raw),
+            "first_mate.codex_session must be a canonical lowercase UUID"
+        );
+        ensure!(
+            out["manifest"].as_str().and_then(crate::bundled::harness).as_deref() == Some("codex"),
+            "first_mate.codex_session requires bundled:codex"
+        );
+        out.insert("codex_session".into(), json!(raw));
+    }
     for (name, default, min, max) in SETTINGS {
         let value = match object.get(*name).filter(|v| !v.is_null()) {
             Some(v) => v

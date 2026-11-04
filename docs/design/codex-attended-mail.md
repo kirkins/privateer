@@ -12,10 +12,13 @@ Privateer-owned attended-pane proof for review, **design only**.
 B5a fixes the B4 review findings below. The first mate approved separate B5b
 custody and B5c dormant-runner slices. B5b now implements the Rust custody
 prerequisite and PR700 receipt carry-ins below. B5c adds a dormant, unconnected
-queue consumer and conservative local accounting, described below. No launcher
-imports it; no B3c dispatched control/report integration or enable path is
-implemented; delivery stays disabled. The fresh
-reservation decision below is design only, not implementation approval.
+queue consumer and conservative local accounting, described below. **ACT1**
+(activation, Linux only, below) wires that runner into the hosted supervisor
+behind a captain-only grant with an explicit possibly-unattended turn budget.
+No code grants delivery by itself. Receipt-filter rollover, operator
+reconcile/resolve controls and runtime-created sessions are ACT2; real-PTY
+draft/race/second-client qualification is ACT3; live qualification is PR C.
+The fresh reservation decision below is design only, not implementation approval.
 Goal: an explicitly launched Codex first-mate pane handles idle mail without
 terminal injection. This qualifies attended mail, not full native autonomy.
 
@@ -1061,6 +1064,121 @@ runtime pause/reconcile/operator controls and budget/report integration; plus
 captain-authorized PR C live qualification. No real login/model/provider use,
 production deployment, hosted-eligibility change or Codex-owned Rust edit is
 part of B5c. **Paginated installs get no idle mail.** No history mode is changed.
+
+### ACT1: hosted activation behind a captain grant (Linux)
+
+The first mate approved the activation split on 2026-11-04 (ACT1 here, then
+ACT2, ACT3 and PR C) and budget option (B). Hosted-pane custody is the
+attendance boundary (captain decision 1fc59021), never ATTACHED: every queue
+turn is charged as **possibly unattended**.
+
+**Session source.** The captain sets `first_mate.codex_session` to an exact,
+existing native session UUID (canonical lowercase; only with `bundled:codex`).
+It must be a durable **legacy-history** session: `thread/read` reports
+`historyMode:"legacy"`, not ephemeral, cwd equal to the ship folder, and a
+materialized rollout whose `session_meta` names that UUID and cwd. Paginated or
+unknown history binds metadata only and **gets no idle mail** (C4); no history
+setting is changed. Fresh, fork and clear stay refused. Hosted Codex is
+refused without this setting, and on non-Linux hosts (Custody::new refuses).
+Runtime-created exact sessions (Operator-only `thread/start` on the verified
+daemon, zero-turn, recorded durably) are ACT2.
+
+**Flow.** `start --hosted` for harness `codex` places `resume <UUID>` first in
+argv (the binding grammar requires it) and sets `PRIVATEER_CODEX_ATTENDED=1` in
+the child environment; `codex_binding.prepare` is unchanged (exact UUID, shared
+daemon, no daemon-excluding `-c`, bearings prompt), and exec keeps the PID.
+Sleep, relaunch, refresh and upgrade rerun `replan`, which rereads the setting,
+so the same UUID resumes under a new launch generation and recovers that UUID's
+ledger; the launch is recorded as continued. After the trusted resume callback
+binds, the supervisor publishes custody (B5b) and, while each 250 ms pass
+validates it, starts at most one **runner tick** every 5 s:
+`/usr/bin/python3 -I -B codex_runner.py tick <launch.json>` as its own child
+(so the runner can pidfd the supervisor), with an empty environment except
+fixed PATH/LANG, output to `/dev/null`, its own process group and a 45 s cap.
+Retire (sleep, relaunch, supersede, exit) poisons first, then lets an
+in-flight pass finish within its cap before killing and reaping it; a killed
+pass's queue child is outside its process group, so that cleanup is the
+runner's own bounded drain, not a claim that every payload stopped.
+
+**One tick**, all RPC before the project flock: `ship.presence` (current hosted
+lease); `mail.pending` after max(accepted, acknowledged, suppressed), validated
+as `attended/mail.mjs` validates it; `observe` with the runtime ack cursor;
+`publish`; then at most one offer. `publish` sends `wake.hosted` only when the
+report is eligible: `trigger:mail` with the exact range once per promoted native
+receipt (recorded in the intent before the next offer may be prepared), and a
+`delivery` report with receipt/ack-backed `accepted_through`, pause/reason,
+declines and busy. It is withheld when no truthful busy start exists. An
+uncertain offer is reported `paused`, reason `other`, on the first pass (C3);
+there is no resend. A new offer needs an idle, unpaused, eligible report, actionable
+(not low-only) mail, and a current grant naming this UUID with turns left. Its
+body is the `mail.mjs` text with at most six headers as compact JSON, no message
+bodies, and the v1 receipt marker as its first line. `Ledger.prepare`, then
+`reserve`, then the existing fenced `dispatch`. A prepared offer waits, without
+spending, while busy or paused.
+
+**Grant and budget (Rust, `src/host/codex_delivery.rs`).**
+`attended.codex.grant {ship, session, budget}` and `attended.codex.revoke
+{ship}` are operator-only commands (OPERATOR_COMMANDS; the runtime Caller, never
+a role in the JSON). A grant must name the ship's `codex_session`; its budget
+is 1..1000, default 200. `attended.codex.status {ship}` is readable by the
+operator or that ship's own agent. `attended.codex.reserve {ship, holder,
+session, grant_id, nonce}` belongs to the ship's agent with the current
+unslept hosted lease. It spends one turn per nonce, idempotently, so a lost
+response retried with the same nonce never spends twice. The count is
+persisted per grant in SQLite and is never refunded by ack, rebind, restart,
+relaunch or a new lease. Only a new captain grant refills it, with a new grant
+id; the old id stops reserving. At or below 10% remaining (at least 1), one
+captain notice per grant says a refill is near. Exhaustion pauses with
+diagnostic `codex-turn-budget-exhausted` until a new grant id appears, never on
+time or mail. The runner pins the reservation in the intent and requires it
+under the lock (replacing the launch record's `delivery_enabled`, which binding
+still writes `false`). `receipts.json` keeps a second, never-decremented
+per-grant floor, so a reset or replayed runtime answer cannot widen a grant.
+The local `possibly_unattended_spent` total is reported. K=3 declines are unchanged.
+
+**Revoke ordering.** Revoke, or a grant for a different session, deletes the
+grant and publishes custody poison (`delivery_disabled`) inside the SQLite
+writer transaction, in the fixed order SQLite writer, then poison, then flock. A
+poison failure aborts the revoke, so an unfenced disable is never reported. The
+runner reads that poison as its last step before `Popen`, so a revoke committed
+first prevents the spawn. A spawn ordered first may still be admitted by Codex,
+as the admission-fence section says. Poison is sticky for the launch: delivery
+resumes after revoke plus re-grant only at the next pane launch.
+
+**PR 710 carry-ins.** Both fences are read after the final pidfd check, as the
+last step before Popen. The ack-only synthetic empty queue is used only when the
+ack covers the whole range. `progress` is zero on an empty ledger. Sticky
+diagnostics (`codex-custody-lost-after-invocation`,
+`codex-queue-cleanup-unproven`) are kept together in a list and are not hidden
+by the transient native-evidence diagnostic; older single-diagnostic ledgers
+migrate. Exec-failure rejections assert no refund. Native status `active` with
+an open rollout turn now counts as consistent busy evidence (previously every
+busy turn was "unavailable", so no busy report could be truthful). This
+`active` shape comes from the 0.166 app-server schema but has not been observed
+in the fixture, which is an ACT3/PR C qualification item.
+
+**Tests (deterministic, no provider).** The Rust unit tests cover
+operator-only grant and revoke, the agent's own status, session and budget
+bounds, per-nonce idempotent spend, no refund across a new lease, refill only
+by a new grant id, holder/grant refusal, revoke poisoning before commit with
+rollback on a poison failure, one low-budget notice, and a tick child with a
+clean environment and a single pass in flight. The Python runner tests cover a
+tick end to end, through the real fenced `Popen` of a stand-in queue binary:
+exact marker and body, immediate paused/other uncertainty, then a native
+promoted receipt giving exactly one mail wake and `accepted_through` 3. They
+also cover low-only and ungranted mail making no offer, busy holding a
+prepared offer without spending, exhaustion until a new grant, the local floor
+against a reset runtime, unbound/unhosted no-ops, withheld busy-less delivery
+reports, mail snapshot validation, and all the carry-ins. The native C2
+fixtures are unchanged. **Limitations:** no real Codex PTY yet (ACT3: draft
+preservation, idle-to-busy race, same-UUID second client, idle navigation); no
+live login or model use (PR C); no filter rollover (ACT2; the filter refuses
+at 25% fill, about 4,700 retirements per session); macOS needs kqueue
+`EVFILT_PROC`/`NOTE_EXIT`, `proc_pidinfo` start time plus `kern.boottime`,
+`proc_pidpath` with device/inode, `LOCAL_PEERPID` and the Mac daemon directory
+layout, and stays refused. A restarted pane with an old uncertain offer from a
+previous generation withholds reports (the watchdog bounds it) until evidence,
+ack or operator resolution settles that offer.
 
 ### B4: Privateer-owned attended-pane proof (reviewed design; implementation split above)
 
