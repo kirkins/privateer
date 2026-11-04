@@ -950,7 +950,57 @@ The six fake scenarios remain success, failure, hard-deadline hang, oversized
 output, pre-authority identity mismatch and immediate reparent/double-fork.
 Positive containment requires real qualification, never fake cgroup files.
 
-### b2c-b2b child-gate contract (bounded IO supervisor not implemented here)
+### b2c-b2b-iii-b3b: bounded protocol IO (dormant, capacity retained)
+
+B3b replaces the sole consuming spawn's null streams with private nonblocking
+streams. No registration, activation, terminal ledger transition or capacity
+release is added. B3c still owns terminal reconciliation and the six qualified
+containment scenarios. Ordinary subprocess protocol fixtures are not containment
+qualification and must not be described as such.
+
+Protocol v1 stdin is a four-byte big-endian metadata length, at most 16 KiB of
+UTF-8 JSON, then exactly `artifact.size_bytes` bytes and EOF. Metadata contains
+only schema version, deployment/claim/use binding, grant id/revision, environment,
+task, commit and artifact SHA-256/size (no local pathname, evidence, config or
+credentials). Bytes come from the fresh claim's retained open artifact inode via
+positional reads, not a reopened path. Artifact size is capped at 512 MiB. Hash
+only artifact bytes actually accepted by the stream; require the delivered size
+and digest to match the immutable use, and probe for extra source bytes. A
+post-verification rewrite therefore cannot yield local protocol success. Stdin
+uses a socket pair with `MSG_NOSIGNAL` writes to refuse closed-input delivery
+without exposing the supervisor to SIGPIPE; the child sees an ordinary fd 0.
+
+Stdout is exactly one four-byte big-endian length plus a JSON object of at most
+4096 bytes, with only `schema_version:1` and `status:"success"|"failure"`.
+Reject missing, truncated, extra or malformed results. Stderr is opaque. Hash
+both observed output streams incrementally, cap combined output at 1 MiB, and
+retain no raw diagnostics outside the transient bounded result buffer. Reports
+contain only fixed reason codes, byte counts and hashes, never adapter-controlled
+text. Local protocol success additionally requires full verified input delivery,
+zero leader exit status and successful bounded cleanup; it is not proof of remote
+success. Failure/unknown and successful reports all retain capacity and the
+existing started custody. B3c will persist terminal facts; these reports alone
+are not durable reconciliation or permission to replay.
+
+Each IO round attempts at most one 64 KiB operation per stream, checks the
+existing CLOCK_BOOTTIME runtime deadline, and polls at most 5 ms. Nonblocking
+EAGAIN/EINTR never resets a deadline. Exec acknowledgement retains its separate
+short bound. On protocol/IO/output/deadline refusal, kill and reap through the
+existing held cgroup/pidfd cleanup path with its separate cleanup bound. An
+inconclusive cleanup is reported as unproven, never capacity release. Regular
+artifact reads are bounded positional operations, not a claim that filesystem
+IO itself has a kernel-enforced latency bound.
+
+PR 718 follow-ups: after custody commits, the final release decision re-reads the
+grant row (same revision, unpaused, unrevoked) and then the emergency pause file,
+with no intervening observation before the release write. Database unreadability
+also refuses. This must remain the production phone pause/revoke contract:
+either that path commits this grant lifecycle row or writes this emergency file.
+The check narrows the decision window; a change after the last observation
+cannot recall the release byte. A failed abort-ledger write keeps the original
+release refusal as error context, rather than replacing it.
+
+### b2c-b2b child-gate contract (terminal supervisor reconciliation not implemented here)
 
 Prepare and verify the private pinned adapter before giving it deployment
 metadata or artifact bytes. The adapter inherits the verifier's launch contract:
