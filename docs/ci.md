@@ -163,3 +163,11 @@ per-invocation times in the Actions job summaries will show the real split,
 with slow-4 and slow-5 the shards to watch first. If shards still run close
 to the limit after this, the next levers are a seventh shard or cutting
 per-job overhead, not moving suites again.
+
+**Rebalance, 2026-11-04, third pass (measured).** The first macOS jobs on
+the six-shard map that got runners (run 41859340431, attempt 2) measured
+slow-2 at 19m28s whole-job (78% of the limit; suites: door 414s, hosted
+180s, workspaces 149s, plugins 61s, the rest under 50s each) and slow-4 at
+5m53s (upgrade_linked 288s on macOS, close to its Linux time, not 2.2x).
+`hosted` and `workspaces` moved from slow-2 to slow-4, projecting macOS
+slow-2 at about 14 minutes and slow-4 at about 11-12 minutes.

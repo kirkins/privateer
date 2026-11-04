@@ -22,7 +22,10 @@ SHARDS = {
     # on 2026-11-04: macOS slow-1 measured 11m01s, room for ~2.2x130s more.
     "slow-1": ("activation", "attended", "files", "cli", "input", "watch",
                "machines", "dashboard_fleet"),
-    "slow-2": ("door", "hosted", "permissions", "workspaces", "plugins",
+    # hosted (180s on macOS) and workspaces (149s) moved to slow-4 on
+    # 2026-11-04: macOS slow-2 measured 19m28s (78% of the limit) in run
+    # 41859340431, while macOS slow-4 measured 5m53s.
+    "slow-2": ("door", "permissions", "plugins",
                "tool_bundles", "crew_routes", "mail", "fleet", "jobs"),
     # The library half `door::` (LIB_SHARD below) also runs here. crew_park
     # (~115s on Linux, 4m12s measured on macOS) moved to slow-5 on 2026-11-04.
@@ -32,7 +35,7 @@ SHARDS = {
     # roughly 2.2x Linux time, so it keeps only suites measured under 10s each
     # and the four dashboard-flavoured light ones moved to rest.
     "slow-4": ("upgrade_linked", "pi_attention", "pi_calm", "pi_follow",
-               "pi_quiet"),
+               "pi_quiet", "hosted", "workspaces"),
     # python_suites (220s on Linux) is the other ~2.2x suite; it shares slow-5
     # only with crew_park, keeping the projected macOS job under ~17 minutes.
     "slow-5": ("python_suites", "crew_park"),
