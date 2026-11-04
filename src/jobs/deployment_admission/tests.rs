@@ -2,7 +2,7 @@ use super::*;
 use crate::store::FrozenWallClock;
 
 const GIB: u64 = 1024 * 1024 * 1024;
-fn fixture() -> (tempfile::TempDir, Store) {
+pub(super) fn fixture() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(dir.path()).unwrap();
     let mut store = Store::open(&root.join("alpha")).unwrap();
@@ -54,7 +54,7 @@ fn reading(path: &Path) -> Result<CapacityReading> {
         total: 512 * GIB,
     })
 }
-fn admit_fake(store: &Store) -> Result<Admitted> {
+pub(super) fn admit_fake(store: &Store) -> Result<Admitted> {
     admit_with(store, "alpha", estimate(), 60, reading)
 }
 fn holds(store: &Store) -> Vec<Reservation> {

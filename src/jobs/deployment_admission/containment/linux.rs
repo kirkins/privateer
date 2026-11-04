@@ -15,6 +15,7 @@ use std::{
 };
 
 mod gate;
+pub(crate) use gate::sealed::{SealedExecutable, SealedInput};
 mod signals;
 #[cfg(test)]
 mod tests;
@@ -26,8 +27,9 @@ const CLEANUP_MS: u64 = 2000;
 // overflows c_int; casting it would silently erase the containment flag.
 const CLONE_INTO_CGROUP: u64 = 0x200000000;
 
-// A held, empty, probed boundary. No public constructor or adapter spawn path.
-// Dropping this token does NOT delete the cgroup or imply custody discharge.
+// A held, empty, probed boundary. Only the dormant consuming Handoff spawn
+// can release an adapter gate. Dropping this token does NOT delete the cgroup
+// or imply custody discharge.
 #[derive(Debug)]
 pub(crate) struct Qualified {
     directory: File,
@@ -43,7 +45,7 @@ impl Qualified {
     }
 
     #[cfg(test)]
-    pub(super) fn dispose_test_boundary(self) {
+    pub(crate) fn dispose_test_boundary(self) {
         assert_eq!(self.identity()["containment_scope"], "attempt_cgroup_only");
         assert_eq!(
             self.identity()["limitation"],
@@ -311,7 +313,7 @@ struct CloneArgs {
 }
 
 fn duplicate(fd: RawFd) -> Result<File> {
-    let new = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
+    let new = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 64) };
     ensure!(new >= 0, "cannot prepare probe descriptors");
     Ok(unsafe { File::from_raw_fd(new) })
 }
