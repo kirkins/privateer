@@ -438,9 +438,10 @@ class Fleet:
         self.binary, self.root = binary, root
         bin_dir = root / "bin"
         bin_dir.mkdir()
-        codex = bin_dir / "codex"
-        codex.write_text("#!/bin/sh\nexit 0\n")
-        codex.chmod(0o755)
+        for harness in ("codex", "claude"):
+            fake = bin_dir / harness
+            fake.write_text("#!/bin/sh\nexit 0\n")
+            fake.chmod(0o755)
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("PRIVATEER_")}
         self.env.update({
             "HOME": str(root), "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
@@ -1296,6 +1297,12 @@ def main() -> int:
 
             # A tool denial is one card with its buttons. Mail the runtime adds
             # to that ask edits the card, buttons kept, and sends no new message.
+            # Only Claude's approvals take an Allow, so these first mates run it.
+            for ship in ("ops", "liaison"):
+                profile = fleet.call(ship, "ship.show", {"name": ship})
+                profile["first_mate"]["manifest"] = "bundled:claude"
+                profile["first_mate"]["options"] = {"permission_mode": "acceptEdits"}
+                fleet.call(ship, "ship.put", profile)
             blocked = fleet.call("ops", "permissions.blocked", {
                 "task_id": "ops-duty", "tool": "Bash", "input": {"command": "apify run actor/x"}})
             ask = blocked["request_id"]

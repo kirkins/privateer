@@ -134,7 +134,7 @@ A rule is refused (null) if it would fail the policy's own validation or allow e
 
 **Hosted and attended ships.** Their harness result is not visible, so they get a structured way to report instead of free text:
 
-- `permissions.blocked` accepts `{"task_id", "tool", "input"}` from the task owner when there is no `job_id`. It builds the same denial record and ask (`scope: wake`).
+- `permissions.blocked` accepts `{"task_id", "tool", "input"}` from the task owner when there is no `job_id`. It builds the same denial record and ask (`scope: wake`) when the ship's first-mate manifest is Claude's. An optional `"cause":"sandbox"` says the command ran but its sandbox blocked it. A sandbox restriction, or a report from any other harness, is a `harness_restriction` notice instead, one per cause (see `src/restriction.rs` and docs/tool-permissions.md).
 - The first-mate brief says: "If a tool is denied, call permissions.blocked, then stop; do not mail the captain about it."
 
 ### (b) Attach: one card per topic

@@ -1352,8 +1352,14 @@ pub(crate) fn raise(
     let title = task["title"].as_str().unwrap_or(task_id);
     let rules: Vec<&str> = records.iter().filter_map(|d| d["rule"].as_str()).collect();
     let all_derived = rules.len() == records.len();
-    let harness = "Claude";
-    let question = clip(&format!("{ship}: {harness} was denied {block_text}"), 200);
+    // Only Claude's refusals reach a decision: a pane's auto mode, its turn's
+    // denial line, or a Claude first mate's own report. Any other harness's,
+    // and a sandbox's restriction, is a notice (see `restriction`).
+    let harness = crate::restriction::Harness::claude();
+    let question = clip(
+        &format!("{ship}: {} was denied {block_text}", harness.name()),
+        200,
+    );
     let who = match scope {
         "crew" => "Its crew",
         "errand" => "Its errand",
@@ -1440,7 +1446,7 @@ pub(crate) fn raise(
         })
         .collect();
     let mut block = json!({"key": key, "fleet_key": fleet_key, "ship": ship, "task_id": task_id,
-        "job_id": job_id, "scope": scope, "harness": "claude", "denials": records, "more": more});
+        "job_id": job_id, "scope": scope, "harness": harness.id(), "denials": records, "more": more});
     if let Some(text) = &authorize {
         block["authorize"] = json!(text);
         block["authorized"] = json!(authorizations_hash(&policy, ship));

@@ -633,7 +633,14 @@ fn blocked(store: &mut Store, args: Value) -> Result<Value> {
             "only the task owner may report a permission block"
         );
     }
-    let denials = match &job_id {
+    let cause = crate::restriction::Cause::parse(&args)?;
+    // Who was refused is read from the runtime's own records, never from the
+    // report. A job's denials are the line `claude_turn.py` printed in its
+    // log, so they are Claude's; a ship's own report is its first mate's
+    // harness, as its record names it, with the sandbox its options set.
+    let first_mate =
+        crate::mail::ship(store, &owner)?.unwrap_or(Value::Null)["first_mate"]["options"].clone();
+    let (harness, options, denials) = match &job_id {
         Some(job_id) => {
             let job = crate::jobs::record(store, job_id)?;
             let log = store
@@ -642,7 +649,14 @@ fn blocked(store: &mut Store, args: Value) -> Result<Value> {
                 .join(job_id)
                 .join(job["incarnation"].as_str().unwrap_or_default())
                 .join("stdout.log");
-            crate::block_ask::logged_denials(&log)
+            let options = Some(job["launch"]["options"].clone())
+                .filter(Value::is_object)
+                .unwrap_or(first_mate);
+            (
+                crate::restriction::Harness::claude(),
+                options,
+                crate::block_ask::logged_denials(&log),
+            )
         }
         None => {
             let tool = required(&args, "tool")?;
@@ -651,7 +665,11 @@ fn blocked(store: &mut Store, args: Value) -> Result<Value> {
                 tool.len() <= 128 && input.to_string().len() <= 16_384,
                 "tool is limited to 128 bytes and input to 16 KiB"
             );
-            vec![json!({"tool_name": tool, "tool_input": input})]
+            (
+                crate::restriction::Harness::of_first_mate(store, &owner)?,
+                first_mate,
+                vec![json!({"tool_name": tool, "tool_input": input})],
+            )
         }
     };
     let denials = if denials.is_empty() {
@@ -667,6 +685,23 @@ fn blocked(store: &mut Store, args: Value) -> Result<Value> {
         None => "wake",
     };
     let tx = store.write_transaction()?;
+    if !crate::restriction::decidable(&harness, cause) {
+        // No allow rule or authorization reaches it: one notice per cause.
+        let reported = crate::restriction::report(
+            store,
+            &owner,
+            &task_id,
+            &task,
+            job_id.as_deref(),
+            &harness,
+            cause,
+            &options,
+            records,
+            more,
+        )?;
+        tx.commit()?;
+        return Ok(reported);
+    }
     let raised = crate::block_ask::raise(
         store,
         &owner,
@@ -797,7 +832,7 @@ pub(crate) fn paused(store: &Store, owner: &str) -> Result<bool> {
 pub(crate) const ACCEPTED: crate::Accepted = &[
     (
         "permissions.blocked",
-        &["job_id", "task_id", "tool", "input"],
+        &["job_id", "task_id", "tool", "input", "cause"],
     ),
     (
         "permissions.set",

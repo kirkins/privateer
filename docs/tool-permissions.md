@@ -496,7 +496,21 @@ runtime turns them into one captain **decision** from the task's owner (see
   a policy change ends it, another ship's decision the change does not cover is
   detached and shown on its own instead.
 - A hosted or attended first mate, whose harness result the runtime cannot read,
-  reports a denial with `permissions.blocked {"task_id","tool","input"}`.
+  reports a denial with `permissions.blocked {"task_id","tool","input"}`. A
+  command that ran but whose sandbox blocked network or filesystem access adds
+  `"cause":"sandbox"`.
+- Allow rules and standing authorizations reach only Claude's approvals. The
+  harness is read from the reporting ship's first-mate manifest (a job's
+  denial line is Claude's own), never from the report. A report from any other
+  harness, one the record cannot name ("The agent", `unknown`), or one whose
+  cause is `sandbox` (always so for Codex, which runs headless with no approval
+  prompt) is no decision: it is one `harness_restriction` notice to the
+  captain that names the harness, its sandbox mode and network setting, and the
+  supported fix (for Codex `workspace-write`, first_mate options
+  `network:true`). The ship's answer says plainly that no policy denied it.
+  The notice's id is its cause (ship, harness, sandbox, network, kind), so the
+  same restriction reported again, from any task or after any policy change,
+  adds no mail; a changed cause is a new notice.
 
 ## YOLO translations
 
