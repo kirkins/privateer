@@ -68,17 +68,14 @@ fn poison(dir: &Path, reason: &str) -> Result<()> {
         Ok(_) => fs::remove_file(path)?,
         Err(e)
             if e.downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            ()
-        }
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {}
         Err(e) => return Err(e),
     }
     sync(dir)?;
     atomic(
         dir,
         "custody-poison.json",
-        &json!({"token": uuid::Uuid::new_v4(), "reason": reason}),
+        &json!({"token": uuid::Uuid::new_v4().to_string(), "reason": reason}),
     )
 }
 
@@ -296,7 +293,7 @@ impl Custody {
             "invalid custody token"
         );
         let held = json!({"version": 1, "state": "owned", "token": token,
-            "epoch": uuid::Uuid::new_v4(), "generation": record["generation"], "session": record["session"],
+            "epoch": uuid::Uuid::new_v4().to_string(), "generation": record["generation"], "session": record["session"],
             "home": record["home"], "cwd": record["cwd"], "codex_home": record["codex_home"],
             "holder": holder, "ship": ship, "pid": self.pid, "process_identity": self.process,
             "executable": exe, "daemon": native, "supervisor_pid": std::process::id(),

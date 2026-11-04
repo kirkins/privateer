@@ -31,7 +31,7 @@ PATH_ENV = ("HOME", "CODEX_HOME", "PRIVATEER_FLEET", "PRIVATEER_RESOURCE_HOME", 
 
 # Deliberately version-independent. The trusted command names a project-local
 # dispatcher; the private launch record selects this launch's release handler.
-DISPATCHER = '''import fcntl, json, os, pathlib, runpy, stat, sys, tempfile, time, uuid
+DISPATCHER = '''import fcntl, io, json, os, pathlib, runpy, stat, sys, tempfile, time, uuid
 sys.dont_write_bytecode = True
 registry = pathlib.Path(__file__).with_name("launch.json")
 for path in (registry.parent, registry):
@@ -75,9 +75,14 @@ finally:
 # Wrong-UUID callbacks revoke custody BEFORE flock, including lock timeout.
 # Keep the original input for the release handler; never read stdin twice.
 event_data = sys.stdin.buffer.read((1 << 20) + 1)
-if len(event_data) > 1 << 20:
-    raise ValueError("Codex callback exceeds limit")
-event = json.loads(event_data)
+try:
+    event = json.loads(event_data) if len(event_data) <= 1 << 20 else {}
+except (ValueError, UnicodeError):
+    event = {}
+if not isinstance(event, dict):
+    event = {}
+# Even malformed/oversized callbacks still commit unbound state below.
+sys.stdin = io.TextIOWrapper(io.BytesIO(event_data), encoding="utf-8")
 with registry.open("rb") as stream:
     preview_data = stream.read((1 << 20) + 1)
 if len(preview_data) > 1 << 20:
@@ -308,9 +313,12 @@ def invalidate(registry, event=None):
     request = publish_request(registry)
     if event is not None:
         if isinstance(event, bytes):
-            if len(event) > LIMIT:
-                raise ValueError("Codex startup callback exceeds limit")
-            event = json.loads(event)
+            try:
+                event = json.loads(event) if len(event) <= LIMIT else {}
+            except (ValueError, UnicodeError):
+                event = {}
+        if not isinstance(event, dict):
+            event = {}
         if event.get("session_id") != load(registry).get("session"):
             publish_request(registry, "custody-poison.json", reason="callback_uuid_changed")
     with locked(registry.parent):

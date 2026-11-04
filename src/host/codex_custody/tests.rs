@@ -16,7 +16,7 @@ impl Fixture {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let folder = tmp.path();
-        let store = Store::open(folder.join(".privateer")).unwrap();
+        let store = Store::open(&folder.join(".privateer")).unwrap();
         fs::write(store.home().join("config.json"), br#"{"ship":"alpha"}"#).unwrap();
         store
             .connection()
@@ -50,9 +50,9 @@ impl Fixture {
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).unwrap();
         let rendezvous = folder.join("r");
         symlink(&socket_path, &rendezvous).unwrap();
-        let generation = uuid::Uuid::new_v4();
-        let token = uuid::Uuid::new_v4();
-        let session = uuid::Uuid::new_v4();
+        let generation = uuid::Uuid::new_v4().to_string();
+        let token = uuid::Uuid::new_v4().to_string();
+        let session = uuid::Uuid::new_v4().to_string();
         let record = json!({"pid": child.id(), "process_identity": identity(child.id()).unwrap(),
             "generation": generation, "session": session, "holder": "host:alpha", "ship": "alpha",
             "home": store.home(), "cwd": folder, "codex_home": native_home,
@@ -66,7 +66,7 @@ impl Fixture {
         atomic(
             &custody.dir,
             "custody-poison.json",
-            &json!({"token": uuid::Uuid::new_v4(), "generation": generation}),
+            &json!({"token": uuid::Uuid::new_v4().to_string(), "generation": generation}),
         )
         .unwrap();
         Self {
