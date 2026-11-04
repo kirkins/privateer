@@ -73,7 +73,7 @@ def build(harness, request):
     if harness in ("rovo", "kimi", "devin", "grok"):
         allowed |= {"transport", "acp_permissions"}
     if harness == "codex":
-        allowed |= {"sandbox", "ephemeral", "yolo", "web_search"}
+        allowed |= {"sandbox", "ephemeral", "yolo", "web_search", "network"}
     if harness == "opencode-v2":
         allowed |= {"auto"}
     if harness in ("pi", "pi-signed", "omp"):
@@ -183,8 +183,14 @@ def build(harness, request):
             argv += ["--dangerously-bypass-approvals-and-sandbox"]
         sandbox = selector(options, "sandbox", ["read-only", "workspace-write", "danger-full-access"])
         web_search = selector(options, "web_search", ["disabled", "cached", "live"])
+        network = boolean(options, "network")
         if reviewer:
             sandbox = "read-only"
+        if network:
+            if sandbox != "workspace-write":
+                raise ValueError("Codex network requires sandbox workspace-write")
+            if boolean(options, "yolo"):
+                raise ValueError("Codex network cannot be combined with yolo")
         if sandbox:
             argv += ["--sandbox", sandbox]
             if sandbox == "workspace-write":
@@ -203,6 +209,8 @@ def build(harness, request):
         if web_search and not reviewer:
             # A reviewer keeps the pinned disabled setting from its block below.
             argv += ["-c", "web_search=" + json.dumps(web_search)]
+        if network:
+            argv += ["-c", "sandbox_workspace_write.network_access=true"]
         if reviewer:
             argv += [
                 "-c", 'web_search="disabled"',
