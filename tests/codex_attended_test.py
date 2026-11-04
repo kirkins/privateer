@@ -1118,6 +1118,10 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
 
 
 class ReceiptTests(unittest.TestCase):
+    # Captured from the real 0.166.0 B4 loopback probe, not invented fields.
+    native_events = [json.loads(line)["payload"] for line in
+                     (ROOT / "tests/fixtures/codex-queue-accepted.jsonl").read_text().splitlines()]
+    client_id = native_events[1]["client_id"]
     setUp = BindingTests.setUp
     bind_current = BindingTests.bind_current
 
@@ -1147,10 +1151,50 @@ class ReceiptTests(unittest.TestCase):
         return self.ledger.reconcile(self.session, self.nonce,
             queue if queue is not None else {"data": [], "nextCursor": None}, ack, failure)
 
+    def native_input(self, body=None):
+        return {**copy.deepcopy(self.native_events[1]), "message": self.body if body is None else body}
+
     def promote(self):
         self.append({"type": "task_started", "turn_id": "alpha-turn", "started_at": 123},
-                    {"type": "user_message", "message": self.body, "client_id": "alpha-client"},
+                    self.native_input(),
                     {"type": "task_complete", "turn_id": "alpha-turn"})
+
+    def test_captured_native_queue_record_settles_anchored_receipt(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        events = copy.deepcopy(self.native_events)
+        events[1]["message"] = self.body  # only substitute the per-test mail body
+        self.append(*events)
+        result = self.reconcile()
+        self.assertEqual(result["state"], "presented")
+        self.assertEqual(result["evidence"]["receipt"], {"turn_id": events[0]["turn_id"],
+                                                        "client_id": events[1]["client_id"]})
+        self.assertNotIn("turn_id", events[1])
+        self.assertEqual(result["accepted_through"], 4)
+        self.assertEqual(result["acknowledged_through"], 0)
+
+    def test_unqualified_native_input_shape_pauses_with_clear_reason(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        original = self.transcript.read_bytes()
+        good = self.native_input()
+        missing = {key: value for key, value in good.items() if key != "images"}
+        alias = {key: value for key, value in good.items() if key != "client_id"}
+        alias["clientId"] = self.client_id
+        for event in (missing, alias, {**good, "client_id": None}, {**good, "client_id": "alpha"},
+                      {**good, "turn_id": "alpha"}, {**good, "audio": ["alpha"]},
+                      {**good, "text_elements": None}):
+            with self.subTest(event=event):
+                self.transcript.write_bytes(original)
+                self.append({"type": "task_started", "turn_id": "alpha-turn"}, event)
+                result = self.reconcile()
+                self.assertTrue(result["paused"])
+                self.assertEqual(result["state"], "uncertain")
+                self.assertIn("user_message schema unqualified", result["evidence"]["pause_reason"])
+                self.assertEqual(result["accepted_through"], 0)
+        self.transcript.write_bytes(original)
+        self.promote()
+        self.assertEqual(self.reconcile()["state"], "presented")
 
     def test_lost_response_recovers_from_anchored_promotion_without_cli_receipt(self):
         self.intent()
@@ -1160,7 +1204,7 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(result["state"], "presented")
         self.assertEqual(result["accepted_through"], 4)
         self.assertEqual(result["acknowledged_through"], 0)
-        self.assertEqual(result["evidence"]["receipt"], {"turn_id": "alpha-turn", "client_id": "alpha-client"})
+        self.assertEqual(result["evidence"]["receipt"], {"turn_id": "alpha-turn", "client_id": self.client_id})
         # New process and same UUID: durable receipt despite unacknowledged mail.
         self.ledger = receipts.Ledger(self.registry, self.record["home"], "alpha")
         self.assertEqual(self.reconcile()["accepted_through"], 4)
@@ -1170,7 +1214,7 @@ class ReceiptTests(unittest.TestCase):
     def test_queue_presence_is_admission_not_presentation_or_ack(self):
         self.intent()
         self.ledger.invoking(self.session, self.nonce)
-        queue = {"data": [{"id": "alpha-queue", "clientUserMessageId": "alpha-client", "input": [
+        queue = {"data": [{"id": "alpha-queue", "clientUserMessageId": self.client_id, "input": [
             {"type": "text", "text": self.body, "text_elements": []}]}], "nextCursor": "more"}
         result = self.reconcile(queue)
         self.assertEqual(result["state"], "queued")
@@ -1278,9 +1322,9 @@ class ReceiptTests(unittest.TestCase):
         self.intent()
         self.ledger.invoking(self.session, self.nonce)
         self.append({"type": "task_started", "turn_id": "alpha-turn"},
-                    {"type": "user_message", "message": self.body + "quoted", "client_id": "alpha"},
+                    self.native_input(self.body + "quoted"),
                     {"type": "task_complete", "turn_id": "alpha-turn"},
-                    {"type": "user_message", "message": self.body, "client_id": "alpha"})
+                    self.native_input())
         result = self.reconcile()
         self.assertTrue(result["paused"])
         self.assertEqual(result["accepted_through"], 0)
@@ -1300,7 +1344,7 @@ class ReceiptTests(unittest.TestCase):
         result = self.reconcile()
         self.assertEqual(result["evidence"]["open_turn"], "alpha-turn")
         offset = result["evidence"]["scan"]["offset"]
-        line = json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": self.body, "client_id": "alpha-client"}})
+        line = json.dumps({"type": "event_msg", "payload": self.native_input()})
         with self.transcript.open("a") as stream:
             stream.write(line[:30])
         self.assertEqual(self.reconcile()["evidence"]["scan"]["offset"], offset)
@@ -1539,9 +1583,10 @@ class ReceiptTests(unittest.TestCase):
         self.assertNotIn(hashes[0], saved["nonce_digests"])
         self.assertTrue(all(receipts.seen_nonce(saved, h) for h in hashes))
         body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, old_nonce, 4, 8))
-        with self.assertRaisesRegex(ValueError, "nonce reused"):
+        with self.assertRaises(receipts.NonceFilterClosed) as closed:
             receipts.Ledger(self.registry, self.record["home"], "alpha").prepare(
                 self.offer_record, body, 4, 8, old_nonce)
+        self.assertEqual(closed.exception.diagnostic["kind"], "nonce_filter_possible_reuse")
         # Saturation safely rejects; corrupt filters fail closed as well.
         for filter_value in ("f" * (receipts.NONCE_FILTER_BITS // 4), "bad"):
             value = self.ledger.read()
@@ -1551,6 +1596,48 @@ class ReceiptTests(unittest.TestCase):
             body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, nonce, 4, 8))
             with self.assertRaises(ValueError):
                 self.ledger.prepare(self.offer_record, body, 4, 8, nonce)
+
+    def test_filter_collision_and_capacity_have_distinct_closed_diagnostics(self):
+        self.intent()
+        self.reconcile(ack=4)
+        value = self.ledger.read()
+        nonce = str(uuid.uuid4())
+        body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, nonce, 4, 8))
+        bits = sum(1 << bit for bit in set(receipts.nonce_bits(receipts.digest(nonce.encode()))))
+        state = value["sessions"][self.session]
+        # Force a false positive for a never-used nonce, not exact reuse.
+        state["nonce_filter"] = format(bits, f"0{receipts.NONCE_FILTER_BITS // 4}x")
+        for saturated in (False, True):
+            if saturated:
+                threshold_bits = (1 << (receipts.NONCE_FILTER_BITS // 4)) - 1
+                state["nonce_filter"] = format(threshold_bits, f"0{receipts.NONCE_FILTER_BITS // 4}x")
+            binding.atomic(self.ledger.path, value)
+            before = self.ledger.path.read_bytes()
+            with self.assertRaises(receipts.NonceFilterClosed) as closed:
+                self.ledger.prepare(self.offer_record, body, 4, 8, nonce)
+            diag = closed.exception.diagnostic
+            self.assertEqual(diag["kind"], "nonce_filter_saturated" if saturated else "nonce_filter_possible_reuse")
+            self.assertEqual(diag["session"], self.session)
+            self.assertEqual(diag["fill_ratio"], 0.25 if saturated else len(set(receipts.nonce_bits(receipts.digest(nonce.encode())))) / receipts.NONCE_FILTER_BITS)
+            self.assertIn("do not resample", diag["next"])
+            self.assertEqual(self.ledger.path.read_bytes(), before)
+
+    def test_never_spawned_rejections_do_not_consume_admission_filter(self):
+        # Exceed both the exact window and the cumulative body cap. Reduce the
+        # window only, leaving real filter size/capacity intact.
+        with patch.object(receipts, "MAX_NONCE_DIGESTS", 8):
+            for _ in range(33):
+                self.intent(padding=300000)
+                self.ledger.invoking(self.session, self.nonce)
+                self.reconcile(failure=True)
+            self.intent()
+        state = self.ledger.read()["sessions"][self.session]
+        self.assertEqual(state["rejected_count"], 33)
+        self.assertEqual(len(state["rejected_nonce_digests"]), 8)
+        self.assertNotIn("nonce_filter", state)
+        self.assertNotIn("nonce_digests", state)
+        self.assertLess(self.ledger.path.stat().st_size, 20000)
+        self.assertEqual(state["accepted_through"], 0)
 
     def test_old_abandon_audit_migration_preserves_range_hash_and_unresolved(self):
         self.intent()

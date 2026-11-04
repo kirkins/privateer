@@ -57,15 +57,21 @@ class Fixture:
         fixture = self
         class Mock(BaseHTTPRequestHandler):
             def do_POST(self):
-                fixture.calls.append(self.path)
-                self.send_response(500)
-                self.end_headers()
+                fixture.mock_request(self)
             do_GET = do_POST
             def log_message(self, *args):
                 pass
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Mock)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
+
+    def mock_request(self, handler):
+        self.calls.append(handler.path)
+        handler.send_response(500)
+        handler.end_headers()
+
+    def check_calls(self):
+        assert self.calls == [], f"unexpected local mock-provider requests: {self.calls}"
 
     def run(self, argv, cwd=None):
         result = subprocess.run(argv, cwd=cwd or self.root, env=self.env,
@@ -337,7 +343,7 @@ enabled = false
             self.server.shutdown()
             self.server.server_close()
             self.thread.join()
-        assert self.calls == [], f"unexpected local mock-provider requests: {self.calls}"
+        self.check_calls()
         shutil.rmtree(self.root)
         self.closed = True
 

@@ -21,6 +21,7 @@ MAX_LEDGER = 8 * LIMIT
 MAX_SESSIONS = 128
 MAX_NONCE_DIGESTS = 256
 NONCE_FILTER_BITS = 65536
+NONCE_FILTER_MAX_FILL = 0.25
 FINAL = {"presented", "acked", "rejected", "abandoned", "operator_presented"}
 
 
@@ -57,10 +58,39 @@ def remember_nonces(state, additions):
     state["nonce_digests"] = hashes[-MAX_NONCE_DIGESTS:]
 
 
+class NonceFilterClosed(ValueError):
+    """Capacity/collision backpressure, not positive proof of nonce reuse."""
+    def __init__(self, kind, session, fill):
+        self.diagnostic = {"kind": kind, "session": session, "fill_ratio": fill,
+                           "filter_bits": NONCE_FILTER_BITS, "max_fill_ratio": NONCE_FILTER_MAX_FILL,
+                           "next": "Pause offers; do not resample nonces or retry on a timer. Operator capacity review required."}
+        super().__init__(encode(self.diagnostic))
+
+
 def seen_nonce(state, nonce_hash):
+    # Compatibility helper for offline inspection; a positive filter test is
+    # only possible reuse, NEVER the exact-reuse diagnostic used by prepare.
     return (nonce_hash in state.get("nonce_digests", [])
+            or nonce_hash in state.get("rejected_nonce_digests", [])
             or ("nonce_filter" in state and all(nonce_filter(state) & (1 << bit)
                                                for bit in nonce_bits(nonce_hash))))
+
+
+def check_nonce(sessions, nonce):
+    nonce_hash = digest(nonce.encode())
+    for state in sessions.values():
+        if (nonce_hash in state.get("nonce_digests", [])
+                or nonce_hash in state.get("rejected_nonce_digests", [])
+                or any(nonce == offer.get("nonce")
+                       for offer in [state.get("intent", {}), *state.get("history", [])])):
+            raise ValueError("receipt nonce reused")
+    for session, state in sessions.items():
+        bits = nonce_filter(state)
+        fill = bin(bits).count("1") / NONCE_FILTER_BITS
+        if fill >= NONCE_FILTER_MAX_FILL:
+            raise NonceFilterClosed("nonce_filter_saturated", session, fill)
+        if all(bits & (1 << bit) for bit in nonce_bits(nonce_hash)):
+            raise NonceFilterClosed("nonce_filter_possible_reuse", session, fill)
 
 
 def exact_uuid(value):
@@ -170,6 +200,28 @@ def anchor(binding, cwd):
                 "open_turn": open_turn_at(stream, offset)}
 
 
+class NativeInputUnqualified(ValueError):
+    def __init__(self):
+        super().__init__("native text-only user_message schema unqualified; idle mail paused")
+
+
+def native_client(event):
+    """Observed 0.166.0 text-only queue input, B4 loopback fixture.
+
+    No turn_id is persisted on this event: association comes ONLY from the
+    anchored lifecycle. Refuse aliases/multimedia/unknown shape, not guesses.
+    """
+    arrays = {"images", "local_images", "audio", "local_audio", "text_elements"}
+    if (set(event) != {"type", "client_id", "message", *arrays}
+            or event.get("type") != "user_message" or not isinstance(event.get("message"), str)
+            or any(event.get(key) != [] for key in arrays)):
+        raise NativeInputUnqualified()
+    try:
+        return exact_uuid(event.get("client_id"))
+    except ValueError:
+        raise NativeInputUnqualified() from None
+
+
 def scan(intent, session, cwd):
     """One <=1 MiB forward batch, complete-record checkpoints, no last-N tail.
 
@@ -215,9 +267,9 @@ def scan(intent, session, cwd):
                 intent["open_turn"] = None
             elif kind == "user_message" and event.get("message") == intent["body"]:
                 turn = intent.get("open_turn")
-                client = event.get("client_id")
-                if not turn or not isinstance(client, str) or not client:
-                    raise ValueError("native mail input lacks turn/client association")
+                client = native_client(event)
+                if not turn:
+                    raise ValueError("native mail input lacks open-turn association")
                 if intent.get("client_id") not in (None, client):
                     raise ValueError("native mail client ID mismatch")
                 receipt = {"turn_id": turn, "client_id": client}
@@ -257,8 +309,10 @@ class Ledger:
 
     Watermarks and nonce digests survive explicit same-UUID restart. Historical
     settled bodies are pruned; operator audits survive. Recent exact nonce
-    digests plus a bounded non-deleting filter refuse reuse, even after eviction
-    from the exact window. False positives and pinned facts apply backpressure.
+    digests plus a bounded non-deleting filter refuse possible admission-nonce
+    reuse, even after eviction from the exact window. Never-spawned rejections
+    use a separate counter/recent exact window. Filter capacity/collisions and
+    pinned facts apply explicit backpressure.
     The project directory and lock are shared with binding transactions.
     """
     def __init__(self, registry, home, ship):
@@ -291,7 +345,15 @@ class Ledger:
                            or (offer["state"] in FINAL
                                and offer["through_seq"] <= state["accepted_through"]))
                 if settled:
-                    hashes.append(digest(exact_uuid(offer["nonce"]).encode()))
+                    nonce_hash = digest(exact_uuid(offer["nonce"]).encode())
+                    if offer["state"] == "rejected":
+                        # Proven exec failure: no native request ever existed.
+                        # Do not consume the non-deleting admission filter.
+                        state["rejected_count"] = state.get("rejected_count", 0) + 1
+                        state["rejected_nonce_digests"] = [
+                            *state.get("rejected_nonce_digests", []), nonce_hash][-MAX_NONCE_DIGESTS:]
+                    else:
+                        hashes.append(nonce_hash)
                     # Retain the exact range and body commitment, also when
                     # migrating older audits that predate these audit fields.
                     if "operator_resolution" in offer:
@@ -338,10 +400,7 @@ class Ledger:
             state = sessions[session]
             if after_seq < max(state["accepted_through"], state.get("suppressed_through", 0)):
                 raise ValueError("receipt range would replay accepted mail or operator-abandoned offer")
-            if (any(seen_nonce(s, digest(nonce.encode())) for s in sessions.values())
-                    or any(nonce == offer.get("nonce") for s in sessions.values()
-                           for offer in [s.get("intent", {}), *s.get("history", [])])):
-                raise ValueError("receipt nonce reused")
+            check_nonce(sessions, nonce)
             if state.get("intent"):
                 state.setdefault("history", []).append(state["intent"])
             intent = {"state": "prepared", "nonce": nonce, "body": body, "body_hash": digest(body.encode()),
@@ -406,12 +465,13 @@ class Ledger:
                     candidate["scan_caught_up"] = caught_up
                     candidate.pop("pause_reason", None)
                     intent.update(candidate)
-                except (OSError, ValueError, KeyError, TypeError):
+                except (OSError, ValueError, KeyError, TypeError) as error:
                     # Commit only the last good checkpoint; never reset an
                     # anchor or turn missing evidence into rejection.
                     if intent["state"] != "prepared":
                         intent["state"] = "uncertain"
-                    intent["pause_reason"] = "native receipt evidence unavailable or discontinuous"
+                    intent["pause_reason"] = (str(error) if isinstance(error, NativeInputUnqualified)
+                                              else "native receipt evidence unavailable or discontinuous")
             if intent["state"] in ("presented", "acked", "operator_presented"):
                 intent.pop("pause_reason", None)
                 state["accepted_through"] = max(state["accepted_through"], intent["through_seq"])

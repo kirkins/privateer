@@ -2,7 +2,9 @@
 """Opt-in native queue/attachment/receipt probe, NOT live mail qualification.
 
 Fixture-owned daemon, throwaway homes, exact --remote/--thread, no --resume or
-turn/start. Fixture-only hooks stop every turn BEFORE any provider request.
+turn/start. All turns stop at trusted hooks except ONE explicitly selected queued
+turn, permitted to reach this fixture's loopback-only mock (captain B4 scope).
+No real provider, login or auth.json; this is not live model qualification.
 """
 import argparse
 import importlib.util
@@ -18,6 +20,8 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins/attended-codex"))
 from codex_socket import Daemon, load
+from codex_binding import atomic
+import codex_receipts as receipts
 
 spec = importlib.util.spec_from_file_location("binding_fixture", ROOT / "scripts/codex-binding-spike.py")
 binding_fixture = importlib.util.module_from_spec(spec)
@@ -53,14 +57,34 @@ class Fixture(binding_fixture.Fixture):
     def setup(self):
         super().setup()
         self.hook_log = self.root / "hook-events.jsonl"
-        # Both SessionStart and UserPromptSubmit stop. SessionStart alone only
-        # stops the first entry and would NOT protect later queued turns.
-        self.stopper.write_text("import json,sys\n"
+        # SessionStart stops; UserPromptSubmit permits only the exact selected
+        # nonce/body/session once. SessionStart alone would NOT protect later turns.
+        self.allow_body = None
+        self.permit = self.root / "permit.json"
+        self.allow_once = self.root / "allowed-once"
+        self.stopper.write_text("import json,sys,os\n"
             "event=json.load(sys.stdin)\n"
             f"with open({str(self.hook_log)!r},'a') as out: out.write(json.dumps(event)+'\\n')\n"
-            "print(json.dumps({'continue':False,'stopReason':'Fixture: no provider call'}))\n")
+            "allowed=False\n"
+            f"permit_path={str(self.permit)!r}\n"
+            "try:\n"
+            " permit=json.load(open(permit_path))\n"
+            "except (OSError,ValueError):\n"
+            " permit={}\n"
+            "if (event.get('hook_event_name') == 'UserPromptSubmit' and isinstance(permit,dict)\n"
+            "    and permit.get('session') and isinstance(permit.get('body'),str)\n"
+            "    and event.get('session_id') == permit.get('session') and event.get('prompt') == permit.get('body')):\n"
+            " try:\n"
+            f"  fd=os.open({str(self.allow_once)!r},os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)\n"
+            "  os.close(fd)\n"
+            " except OSError:\n"
+            "  pass\n"
+            " else:\n"
+            "  allowed=True\n"
+            "print(json.dumps({'continue':allowed,'stopReason':'Fixture: stop all but the one mock turn'}))\n")
         config = self.home / "config.toml"
-        text = config.read_text()
+        text = config.read_text().replace('requires_openai_auth = false',
+            'requires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0')
         for name in ("alpha", "beta"):
             hooks = self.root / name / ".codex/hooks.json"
             value = json.loads(hooks.read_text())
@@ -157,10 +181,12 @@ class Fixture(binding_fixture.Fixture):
             detached = self.snapshot(observer, session)
         # These are negative qualification results, NOT a guessed discriminator.
         # The recorded origin/source describe creation, not current attachment.
-        assert attached["loaded"] and never_tui["loaded"]
-        assert attached["status"] == never_tui["status"] == {"type": "idle"}
+        assert attached["loaded"] and never_tui["loaded"] and detached["loaded"]
+        assert attached["status"] == never_tui["status"] == detached["status"] == {"type": "idle"}
         assert attached["thread_fields"] == never_tui["thread_fields"]
         assert not self.calls
+        receipt = self.qualify_receipt(alpha)
+        self.check_calls()
         return {"binding_only": False, "delivery_enabled": False,
                 "cli_version": self.daemon["cliVersion"], "daemon_version": self.daemon["appServerVersion"],
                 "attached_queue_reached_prompt_hook": True,
@@ -172,10 +198,95 @@ class Fixture(binding_fixture.Fixture):
                                             "after_owned_tui_exit": detached},
                 "attached_discriminator_qualified": False,
                 "attachment_blocker": "0.166 thread/read status and loaded/list do not prove a TUI subscriber; no qualified public exact-pane attachment evidence",
-                "native_user_message_qualified": False,
-                "receipt_blocker": "Trusted stop hooks run before accepted user_message; no native client_id record produced. Removing the stop has no qualified zero-provider-request barrier",
+                "native_user_message_qualified": True,
+                "native_receipt_observation": receipt,
+                "mock_provider_requests": self.calls,
+                "scope_change": "B4 captain allowed exactly one loopback mock request; B3b assignment forbade even mock requests",
                 "runner_implemented": False,
-                "model_calls": len(self.calls), "mail_delivery_qualified": False}
+                "model_calls": 0, "mock_calls": len(self.calls), "mail_delivery_qualified": False}
+
+    def mock_request(self, handler):
+        # The only permitted inference endpoint is our bound loopback server.
+        # Return a terminal canned response without tools or retries.
+        call = {"path": handler.path, "peer": handler.client_address[0],
+                "host": handler.headers["Host"], "method": handler.command, "allowed_body": False}
+        self.calls.append(call)  # count even malformed/unexpected requests
+        assert len(self.calls) == 1, "more than the one captain-approved mock request"
+        assert call["peer"] == "127.0.0.1" and call["host"] == f"127.0.0.1:{self.server.server_port}"
+        size = int(handler.headers.get("Content-Length", "0"))
+        assert 0 < size <= 1 << 20
+        request = json.loads(handler.rfile.read(size))
+        def contains_body(value):
+            if isinstance(value, str):
+                return self.allow_body is not None and self.allow_body in value
+            if isinstance(value, dict):
+                return any(contains_body(item) for item in value.values())
+            return isinstance(value, list) and any(contains_body(item) for item in value)
+        call["allowed_body"] = contains_body(request)
+        assert call["allowed_body"]
+        response = {"id": "resp_fixture", "object": "response", "status": "completed",
+                    "output": [], "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1}}
+        data = "event: response.completed\ndata: " + json.dumps({"type": "response.completed", "response": response}) + "\n\n"
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.send_header("Content-Length", str(len(data.encode())))
+        handler.end_headers()
+        handler.wfile.write(data.encode())
+
+    def check_calls(self):
+        assert len(self.calls) == 1, f"expected exactly one local mock request: {self.calls}"
+        assert self.calls[0]["peer"] == "127.0.0.1"
+        assert self.calls[0]["host"] == f"127.0.0.1:{self.server.server_port}"
+        assert self.calls[0]["path"] == "/v1/responses" and self.calls[0]["method"] == "POST"
+        assert self.calls[0]["allowed_body"] is True
+
+    def qualify_receipt(self, record):
+        session, nonce = record["session"], str(uuid.uuid4())
+        registry = self.root / "alpha/.codex/privateer-attended/launch.json"
+        self.allow_body = receipts.encode(receipts.marker(record["home"], record["ship"], session, nonce, 0, 1)) + "\nFixture notification, not an acknowledgement."
+        ledger = receipts.Ledger(registry, record["home"], record["ship"])
+        # Dormant reducer exercised by the fixture, NOT production authorization.
+        # Delivery remains false. Snapshot anchor before the one permitted turn.
+        ledger.prepare(record, self.allow_body, 0, 1, nonce)
+        ledger.invoking(session, nonce)
+        atomic(self.permit, {"session": session, "body": self.allow_body})
+        with Observer(self) as observer:
+            thread = observer.call("thread/read", {"threadId": session})["thread"]
+            before = len(self.rollout_events(thread["path"]))
+            self.queue(session, self.allow_body)
+            self.wait_hook(session, self.allow_body)
+            self.wait_terminal(Path(thread["path"]))
+            events = self.rollout_events(thread["path"])[before:]
+            # Print the ACTUAL record before asserting any contract. A failure
+            # reports evidence instead of quietly guessing a client-ID alias.
+            print(json.dumps({"accepted_turn_native_events": events}), file=sys.stderr)
+            inputs = [event for event in events if event.get("type") == "user_message"]
+            assert len(inputs) == 1
+            user = inputs[0]
+            client = receipts.native_client(user)
+            assert user["message"] == self.allow_body
+            starts = [event for event in events if event.get("type") == "task_started"]
+            ends = [event for event in events if event.get("type") == "task_complete"]
+            assert len(starts) == len(ends) == 1
+            assert starts[0]["turn_attribution"]["turn_trigger"] == "queue"
+            assert starts[0]["turn_id"] == ends[0]["turn_id"]
+            assert events.index(starts[0]) < events.index(user) < events.index(ends[0])
+            queue = observer.call("thread/queue/list", {"threadId": session, "limit": 128})
+            # A new reducer instance proves durable anchored recovery without
+            # relying on CLI stdout or a transient notification subscription.
+            recovered = receipts.Ledger(registry, record["home"], record["ship"]).reconcile(session, nonce, queue)
+            assert recovered["state"] == "presented"
+            assert recovered["accepted_through"] == 1 and recovered["acknowledged_through"] == 0
+            assert recovered["evidence"]["receipt"] == {"turn_id": starts[0]["turn_id"], "client_id": client}
+            assert load(registry)["delivery_enabled"] is False
+            repeated = binding_fixture.subprocess.run([sys.executable, str(self.stopper)],
+                input=json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": session,
+                                  "prompt": self.allow_body}), env=self.env, text=True,
+                capture_output=True, timeout=5, check=True)
+            assert json.loads(repeated.stdout)["continue"] is False, "one-use allowance reopened"
+            return {"user_message": user, "events": events, "anchored_ledger_recovered": True,
+                    "one_use_allowance_rejects_repeat": True,
+                    "accepted_through": 1, "acknowledged_through": 0}
 
     @staticmethod
     def rollout_events(path):
