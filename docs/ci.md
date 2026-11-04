@@ -109,12 +109,12 @@ were dealt out so all five shards carry roughly equal measured work:
 | --- | ---: | --- |
 | slow-1 | ~550 | MCP door checks, dashboard smoke, pilot, minimal-build check, plus activation, attended, files, cli, input, watch |
 | slow-2 | ~560 | fmt and clippy, plus door, hosted, permissions, workspaces, plugins, tool_bundles, crew_routes, mail, fleet, jobs |
-| slow-3 | ~560 | library half `door::` (323 of 1469 tests, 339s locally), plus crew_park, upgrade_fetch, mcp_broker, review_gate, scheduling, cross_ship_waits, recovery_pilot |
+| slow-3 | ~560 | library half `door::` (321 of 1430 tests, 339s locally), plus crew_park, upgrade_fetch, mcp_broker, review_gate, scheduling, cross_ship_waits, recovery_pilot |
 | slow-4 | ~555 | python_suites, upgrade_linked, machines, dashboard_fleet, dashboard, dashboard_yaml, cursor_attended, cross_machine_waits, pi_attention, pi_calm, pi_follow, pi_quiet |
 | rest | ~575 | library complement (`--skip door::`), bins, doc tests and the remaining suites, including desk_placement and placement |
 
-The two library halves are complements by construction (323 + 1146 = 1469
-listed tests), and each runs as its own cargo invocation so a filter can never
+The two library halves are complements by construction (CI listed 321 + 1109
+= 1430 tests), and each runs as its own cargo invocation so a filter can never
 hide a suite's tests. A fifth runner costs one more job of setup, cache restore
 and compile (about 5–10 minutes by the fits below), so the expected macOS
 whole-job times are roughly 15–18 minutes each against the 25-minute limit —
@@ -136,7 +136,8 @@ those two heavy suites at roughly 2.2 times their Linux time (crew_park's
 measured 4m12s from 11-02 matches 2.2 x ~115s), so upgrade_linked and
 python_suites together were about 18-20 minutes of suite time before setup:
 they must never share a shard again. The shard runner and the shard tests now
-refuse a map that puts them together, the same way they refuse a duplicate.
+refuse a map that puts them together or leaves either of them out of the named
+shards (into `rest`), the same way they refuse a duplicate.
 
 With the pair split apart, five shards cannot hold the measured work with
 every projected macOS job under about 17 minutes (~70% of the 25-minute

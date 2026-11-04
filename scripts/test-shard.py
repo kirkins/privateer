@@ -39,14 +39,17 @@ SHARDS = {
 }
 # macOS runs python_suites and upgrade_linked at roughly 2.2 times their Linux
 # time; together they timed out a 25-minute macOS job at 25m49s (PR 717, run
-# 41848822540). docs/ci.md records the numbers; they must never share a shard.
+# 41848822540). docs/ci.md records the numbers; they must never share a
+# shard, and each must be listed in a named shard so neither falls to rest
+# with the other.
 HEAVY_PAIR = ("python_suites", "upgrade_linked")
 # The library is one `cargo test --lib` run's worth of time on its own, so it is
 # split in two by module-path filter: LIB_SHARD runs the tests whose full name
 # contains one of LIB_INCLUDE; LIB_SKIP_SHARD runs the complement (one --skip
-# per prefix). The filters are substrings of the full test path and a prefix
-# ending in `::` matches exactly that module's tests, so the two halves
-# partition the library: every test matches the include list or is skipped.
+# per prefix). A libtest filter matches any substring of the test name, not
+# just a module path, so `door::` also matches a test like `x::door::t`. The
+# two halves still partition the library only because `--skip` applies the
+# same substring rule, skipping exactly the tests the include filter selects.
 LIB_SHARD = "slow-3"
 LIB_INCLUDE = ("door::",)
 LIB_SKIP_SHARD = "rest"
@@ -89,6 +92,10 @@ def commands(shard):
     missing = sorted(set(named) - set(tests))
     if missing:
         raise SystemExit(f"test-shard: no such suite: {' '.join(missing)}")
+    unlisted = sorted(set(HEAVY_PAIR) - set(named))
+    if unlisted:
+        raise SystemExit(f"test-shard: heavy suites must be listed in a named "
+                         f"shard, never fall to rest: {' '.join(unlisted)}")
     sharing = sorted(name for name, suites in SHARDS.items()
                      if set(HEAVY_PAIR) <= set(suites))
     if sharing:

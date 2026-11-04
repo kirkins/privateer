@@ -42,8 +42,11 @@ class ShardCoverage(unittest.TestCase):
                 if "--bins" in selected:
                     assigned.update(("bin", t["name"]) for t in self.targets() if t["kind"] == ["bin"])
                 if "--lib" in selected:
+                    # Both halves are collected here; that they really partition
+                    # the library is what
+                    # test_library_halves_partition_by_complementary_filters
+                    # checks.
                     lib_runs.append((name, selected))
-                    assigned["lib"] += 0  # counted once below, as both halves
                 assigned.update(("test", selected[i + 1]) for i, arg in enumerate(selected) if arg == "--test")
         # The two filter halves partition the library, so it runs exactly once.
         self.assertEqual(len(lib_runs), 2)
@@ -116,6 +119,18 @@ class ShardCoverage(unittest.TestCase):
         with patch.object(shard, "SHARDS", regrouped), \
              patch.object(shard, "targets", return_value=found):
             with self.assertRaisesRegex(SystemExit, "share shard"):
+                shard.commands("rest")
+
+    def test_heavy_pair_cannot_fall_to_rest(self):
+        """Unnamed suites land in rest, so the heavy pair must both be named."""
+        named = {name for suites in shard.SHARDS.values() for name in suites}
+        self.assertLessEqual(set(shard.HEAVY_PAIR), named)
+        found = self.targets()
+        stripped = {name: tuple(s for s in suites if s not in shard.HEAVY_PAIR)
+                    for name, suites in shard.SHARDS.items()}
+        with patch.object(shard, "SHARDS", stripped), \
+             patch.object(shard, "targets", return_value=found):
+            with self.assertRaisesRegex(SystemExit, "fall to rest"):
                 shard.commands("rest")
 
     def test_workflow_matrix_lists_every_shard(self):
