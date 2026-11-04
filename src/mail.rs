@@ -3355,6 +3355,9 @@ fn deliver_inner(store: &Store, args: &Value, provenance: &source::Provenance) -
         .filter(|key| payload.get(**key).is_some())
         .count();
     if waits > 0 {
+        // Only the operator transport can assert the carrying machine. A
+        // local agent's `via` is an envelope claim, not runtime provenance.
+        store.caller().require_operator("wait notice delivery")?;
         ensure!(kind == "notice", "a wait notice rides a notice");
         ensure!(
             from != CAPTAIN && to != CAPTAIN && to != CREW,

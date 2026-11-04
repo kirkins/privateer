@@ -54,6 +54,9 @@ impl Drop for ReadOnly<'_> {
 }
 
 fn retained_facts(conn: &Connection, m: &Manifest, source: &str, out: &mut Value) -> Result<()> {
+    if let Some(cut) = proof::legacy_status(conn, m, source)? {
+        out["legacy_cut"] = cut;
+    }
     if let Some(mut homes) = proof::retained_homes(conn, m, source)? {
         for home in homes.as_array_mut().into_iter().flatten() {
             home["facts_cached"] = json!(true);
@@ -206,6 +209,9 @@ pub(super) fn snapshot(
     }
     if !fresh(conn, m, source, clock)? {
         return Ok(reject(out, "cached", "contact_not_fresh"));
+    }
+    if let Some(cut) = out.get_mut("legacy_cut") {
+        cut["proof_holds"] = json!(true);
     }
     out["complete"] = json!(true);
     out["state"] = json!("covered");

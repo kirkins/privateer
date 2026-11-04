@@ -59,6 +59,22 @@ class ArgumentDiagnosticsTests(unittest.TestCase):
 
 
 class DeskContractTests(unittest.TestCase):
+    def test_legacy_closed_flag_is_visible_without_operator_tools(self):
+        from door import desk_result
+        from tools import DESK_TOOLS, TOOLS
+        source = {"id": "opaque", "state": "covered", "through": "barrier",
+                  "history": "legacy_cut", "history_as_of": 1000}
+        coverage = {"schema": "coverage.v1", "scope": "desk-domain", "complete": False,
+                    "sources": [source], "other_machines": "not_queried"}
+        for name in DESK_TOOLS:
+            shown = desk_result(name, {"ok": True, "result": {
+                "schema": "desk.subscription.v1", "coverage": coverage}})
+            self.assertEqual(shown.structured_content["coverage"], coverage)
+            self.assertIn("legacy, closed", shown.structured_content["delivery_notice"])
+            self.assertIn("history_as_of", shown.model_dump_json())
+        for command, *_ in TOOLS.values():
+            self.assertFalse(command.startswith(("machine.desk.legacy.", "machine.desk.home.")))
+
     def test_closed_schemas_mirror_core_bounds(self):
         from tools import DESK_TOOLS, TOOLS
         sub = "00000000-0000-4000-8000-000000000001"

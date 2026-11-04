@@ -104,6 +104,10 @@ pub(super) struct Evidence {
     // Required even when null: v2 deny_unknown_fields decoders drop v3.
     #[serde(default)]
     cut_digest: Option<String>,
+    // Optional additive operator diagnostics. Omit entirely without a cut so
+    // older strict v3 peers continue decoding ordinary uncut proofs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy: Option<legacy::Summary>,
     pub(super) checkpoint: Checkpoint,
     vector: reconcile::Proof,
     // Rechecked at each source contact; not persisted in the immutable issue.
@@ -128,6 +132,7 @@ fn candidate(conn: &Connection, m: &Manifest, cp: &Checkpoint) -> Result<Option<
     let e = Evidence {
         version: VERSION,
         cut_digest: legacy::load(conn, m, &cp.source)?.map(|(digest, _)| digest),
+        legacy: legacy::summary(conn, m, &cp.source)?,
         checkpoint: cp.clone(),
         vector,
         valid: true,
@@ -374,6 +379,55 @@ pub(super) fn retained_homes(
     let raw: Option<String> = conn.query_row("SELECT body FROM desk_intake_proof WHERE domain=?1 AND source=?2 AND length(CAST(body AS BLOB))<=65536", params![m.domain,source], |r|r.get(0)).optional()?.flatten();
     raw.map(|raw| Ok(serde_json::from_str::<Value>(&raw)?["vector"]["homes"].clone()))
         .transpose()
+}
+
+pub(super) fn legacy_status(
+    conn: &Connection,
+    m: &Manifest,
+    source: &str,
+) -> Result<Option<Value>> {
+    let local = crate::door::reader_link::machine_id_in(conn)? == source;
+    let mut barrier = None;
+    let summary = if local {
+        legacy::summary(conn, m, source)?.map(|s| json!(s))
+    } else {
+        let raw: Option<String> = conn.query_row(
+            "SELECT body FROM desk_intake_proof WHERE domain=?1 AND source=?2 AND length(CAST(body AS BLOB))<=65536",
+            params![m.domain,source], |r| r.get(0)).optional()?.flatten();
+        match raw
+            .map(|raw| serde_json::from_str::<Evidence>(&raw))
+            .transpose()?
+        {
+            Some(e) if e.checkpoint.binding == binding(m)? && e.checkpoint.source == source => {
+                barrier = Some(e.checkpoint.id);
+                e.cut_digest.map(|digest| {
+                    e.legacy
+                        .filter(|s| s.digest == digest)
+                        .map(|s| json!(s))
+                        .unwrap_or_else(|| {
+                            json!({"digest":digest,"cut_at_ms":null,
+                            "homes":null,"released_homes":null})
+                        })
+                })
+            }
+            _ => None,
+        }
+    };
+    let Some(summary) = summary else {
+        return Ok(None);
+    };
+    let observed_at = if local {
+        Some(crate::store::Store::now_ms())
+    } else {
+        conn.query_row("SELECT received_at FROM desk_intake_checkpoint WHERE domain=?1 AND source=?2 AND binding=?3 AND barrier=?4 AND EXISTS(SELECT 1 FROM desk_intake_proof WHERE domain=?1 AND source=?2 AND valid=1)",
+            params![m.domain,source,binding(m)?,barrier], |r| r.get::<_,Option<i64>>(0)).optional()?.flatten()
+    };
+    let mut out = summary;
+    out["observed_at"] = json!(observed_at);
+    // Set true only after all completion predicates (including freshness and
+    // local revalidation) pass. Retained facts alone never assert proof.
+    out["proof_holds"] = json!(false);
+    Ok(Some(out))
 }
 
 pub(super) enum LocalCurrent {

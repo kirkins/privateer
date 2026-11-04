@@ -137,6 +137,7 @@ DESK_NOTE = (
     " Operator-enabled local generation-1 raw subscription; mail:read and current visibility checked every call. "
     "No client domain/owner/route/cursor. Reads reserve durable custody, never implicitly acknowledge. "
     "As of last source contacts: coverage shows barrier_mode, desk-measured received_at/age_ms and max_source_age_ms, not on-demand contact. "
+    "Source history:legacy_cut means history before an operator boundary is legacy, closed, as of desk-measured history_as_of; it is not provenance or acknowledgment. "
     "Empty partial coverage or pending replay proof is not an all-clear; inspect omissions and retry actions. "
     "coverage.complete is separate from continuation, replay selection and completed work, never whole-fleet clearance. "
     "Item state open/closed/unknown and delivery_class history/since_switch_on/unknown are not unread state. "
@@ -493,6 +494,7 @@ def render(name, value):
             value = {**value, "coverage": {"scope": "unreported", "complete": False, "note": COVERAGE_NOTE}}
         return {**value, "delivery_notice": (
             "As of last source contacts, not an on-demand fleet observation. "
+            "Source history:legacy_cut marks earlier history as legacy, closed, as of desk-measured history_as_of, not provenance or acknowledgment. "
             "Inspect coverage source ages/omissions and replay_selection independently. "
             "Empty partial results are incomplete, not an all-clear. "
             "Continuation finishes only this snapshot; follow pull_after_ack/thread_continue separately. "

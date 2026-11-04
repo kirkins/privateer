@@ -3,7 +3,7 @@ fn legacy_apply_and_revoke_refuse_agents_before_home_startup() {
     let dir = tempfile::tempdir().unwrap();
     let m = Machine::new(dir.path().join("alpha"), "survey");
     let absent = m.root.join("gamma");
-    for command in ["machine.desk.legacy.apply", "machine.desk.legacy.revoke"] {
+    for command in ["machine.desk.legacy.apply", "machine.desk.legacy.revoke", "machine.desk.status"] {
         let out = m.command().args(["--role","agent","--actor","survey","--home",absent.to_str().unwrap(),command,"--json","{}"] ).output().unwrap();
         assert!(!out.status.success());
         assert!(String::from_utf8_lossy(&out.stderr).contains("operator"),"{}",String::from_utf8_lossy(&out.stderr));
@@ -57,4 +57,14 @@ fn pushed_reply_records_authenticated_origin_not_envelope_claim() {
     assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
     let origin: Option<String> = c.query_row("SELECT origin_machine FROM mail WHERE id='agent-origin-claim'",[],|r|r.get(0)).unwrap();
     assert_eq!(origin,None);
+    // Runtime wait notices used to consume this same agent-controlled `via`
+    // before the later origin filter. Refuse them before schedule mutation.
+    for key in ["task_end", "wait_closed", "wait_subscribe", "wait_unsubscribe"] {
+        let mut notice = args.clone();
+        notice["id"] = json!(format!("agent-{key}"));
+        notice["payload"] = json!({key:{"task":"beta-work","status":"done"}});
+        let out = b.command().args(["--role","agent","--actor","survey","--home",b.root.join("relay/.privateer").to_str().unwrap(),"mail.deliver","--json",&notice.to_string()]).output().unwrap();
+        assert!(!out.status.success(), "{key}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("operator"), "{}", String::from_utf8_lossy(&out.stderr));
+    }
 }
