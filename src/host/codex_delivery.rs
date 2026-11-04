@@ -41,7 +41,9 @@ fn init(conn: &rusqlite::Connection) -> Result<()> {
 }
 
 fn canonical(args: &Value, key: &str) -> Result<String> {
-    let raw = args[key].as_str().with_context(|| format!("{key} is required"))?;
+    let raw = args[key]
+        .as_str()
+        .with_context(|| format!("{key} is required"))?;
     let parsed = uuid::Uuid::parse_str(raw)
         .ok()
         .map(|u| u.to_string())

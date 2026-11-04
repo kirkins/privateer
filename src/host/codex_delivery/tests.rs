@@ -69,11 +69,17 @@ fn codex_delivery_grant_and_revoke_are_the_captains_alone() {
     let mut f = Fixture::new();
     let args = json!({"ship": "alpha", "session": SESSION});
     let refused = f.agent("attended.codex.grant", args.clone()).unwrap_err();
-    assert!(refused.to_string().contains("operator command"), "{refused}");
+    assert!(
+        refused.to_string().contains("operator command"),
+        "{refused}"
+    );
     let refused = f
         .agent("attended.codex.revoke", json!({"ship": "alpha"}))
         .unwrap_err();
-    assert!(refused.to_string().contains("operator command"), "{refused}");
+    assert!(
+        refused.to_string().contains("operator command"),
+        "{refused}"
+    );
     let granted = f.operator("attended.codex.grant", args).unwrap();
     assert_eq!(granted["grant"]["budget"], DEFAULT_BUDGET);
     assert_eq!(granted["grant"]["remaining"], DEFAULT_BUDGET);
@@ -139,9 +145,15 @@ fn codex_delivery_reserve_spends_once_per_nonce_and_never_refunds() {
     // A lost response retried with the same nonce does not spend again.
     assert_eq!(f.reserve(&grant, &first).unwrap()["spent"], 1);
     let second = f.reserve(&grant, &nonce()).unwrap();
-    assert_eq!((second["spent"].clone(), second["remaining"].clone()), (json!(2), json!(0)));
+    assert_eq!(
+        (second["spent"].clone(), second["remaining"].clone()),
+        (json!(2), json!(0))
+    );
     let exhausted = f.reserve(&grant, &nonce()).unwrap_err();
-    assert!(exhausted.to_string().contains("budget exhausted"), "{exhausted}");
+    assert!(
+        exhausted.to_string().contains("budget exhausted"),
+        "{exhausted}"
+    );
     // Mailbox acks, relaunch and a new lease refund nothing.
     crate::presence::attend(&f.store, "alpha", "host:again", 90, None).unwrap();
     let again = f

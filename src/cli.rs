@@ -1403,7 +1403,11 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     // refuses hosted Codex without one).
     let codex_session = |launch: &Launch, profile: &Value| -> Option<String> {
         (hosted && launch.harness == "codex")
-            .then(|| profile["first_mate"]["codex_session"].as_str().map(str::to_owned))
+            .then(|| {
+                profile["first_mate"]["codex_session"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
             .flatten()
     };
     // The launch command, the captain approvals it carries for the first
@@ -1625,9 +1629,9 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             };
             let mut codex_custody = if codex_session(&launch, &profile).is_some() {
                 match crate::host::codex_custody::Custody::new(&child, folder) {
-                    Ok(custody) => Some(custody.with_runner(
-                        plugins.join("attended-codex/codex_runner.py"),
-                    )),
+                    Ok(custody) => {
+                        Some(custody.with_runner(plugins.join("attended-codex/codex_runner.py")))
+                    }
                     Err(error) => {
                         eprintln!(
                             "Codex custody unavailable; delivery remains disabled: {error:#}"

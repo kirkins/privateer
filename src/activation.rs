@@ -389,7 +389,11 @@ pub fn profile(store: &Store, ship: &str, profile: &Value) -> Result<Value> {
             "first_mate.codex_session must be a canonical lowercase UUID"
         );
         ensure!(
-            out["manifest"].as_str().and_then(crate::bundled::harness).as_deref() == Some("codex"),
+            out["manifest"]
+                .as_str()
+                .and_then(crate::bundled::harness)
+                .as_deref()
+                == Some("codex"),
             "first_mate.codex_session requires bundled:codex"
         );
         out.insert("codex_session".into(), json!(raw));
