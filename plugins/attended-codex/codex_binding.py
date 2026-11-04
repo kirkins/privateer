@@ -24,6 +24,7 @@ SYSTEM_PYTHON = "/usr/bin/python3"
 B0_DISPATCHER_SHA256 = "13ebd926418ea7ee13ec7503fdf5d02ea54e13619ace2bc9413eb6e6d48c4d1f"
 B1_DISPATCHER_SHA256 = "a523c4c8500b1c42425a1ba16188f10763db9227cdeb56efc0d822ceefaae5e4"
 B2_DISPATCHER_SHA256 = "6a9c023e7cc6a52fd508dd449005aa83ee681c9f935e0b4800341f7237cc5388"
+B5A_DISPATCHER_SHA256 = "28c74254b8d4e82abd8aaf6d7e4b18482bd4880673fd08f3ad13a6725bba26ab"
 
 PATH_ENV = ("HOME", "CODEX_HOME", "PRIVATEER_FLEET", "PRIVATEER_RESOURCE_HOME", "TMPDIR",
             "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "PRIVATEER_SERVICE")
@@ -71,6 +72,45 @@ try:
 finally:
     if os.path.exists(name):
         os.unlink(name)
+# Wrong-UUID callbacks revoke custody BEFORE flock, including lock timeout.
+# Keep the original input for the release handler; never read stdin twice.
+event_data = sys.stdin.buffer.read((1 << 20) + 1)
+if len(event_data) > 1 << 20:
+    raise ValueError("Codex callback exceeds limit")
+event = json.loads(event_data)
+with registry.open("rb") as stream:
+    preview_data = stream.read((1 << 20) + 1)
+if len(preview_data) > 1 << 20:
+    raise ValueError("Codex launch exceeds limit")
+if event.get("session_id") != json.loads(preview_data).get("session"):
+    custody_fence = registry.with_name("custody-poison.json")
+    try:
+        info = custody_fence.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError("unsafe Codex custody poison")
+        custody_fence.unlink()
+    except FileNotFoundError:
+        pass
+    parent = os.open(registry.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+    fd, name = tempfile.mkstemp(prefix=".poison-", dir=registry.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump({"token": str(uuid.uuid4()), "reason": "callback_uuid_changed"}, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, custody_fence)
+        parent = os.open(registry.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
 lock = os.open(registry.with_name("lock"), os.O_CREAT | os.O_NOFOLLOW | os.O_RDWR, 0o600)
 try:
     info = os.fstat(lock)
@@ -122,7 +162,7 @@ if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode 
 sys.path.insert(0, str(handler.parent))
 sys.argv = [str(handler), "--registry", str(registry)]
 runpy.run_path(str(handler), run_name="__main__",
-              init_globals={"_DISPATCH_CONTEXT": (previous, token, request)})
+              init_globals={"_DISPATCH_CONTEXT": (previous, token, request), "_DISPATCH_EVENT": event_data})
 '''
 
 
@@ -160,7 +200,7 @@ def install_dispatcher(directory):
         body = path.read_bytes()
         if body == DISPATCHER.encode():
             return
-        if hashlib.sha256(body).hexdigest() not in (B0_DISPATCHER_SHA256, B1_DISPATCHER_SHA256, B2_DISPATCHER_SHA256):
+        if hashlib.sha256(body).hexdigest() not in (B0_DISPATCHER_SHA256, B1_DISPATCHER_SHA256, B2_DISPATCHER_SHA256, B5A_DISPATCHER_SHA256):
             raise ValueError("Codex project dispatcher differs; inspect it before relaunch")
         # prepare holds the project lock and has refused any live owner. The
         # declaration/command stays unchanged; native trust is never rewritten.
@@ -226,10 +266,10 @@ def locked(directory):
         os.close(fd)
 
 
-def publish_request(registry):
+def publish_request(registry, filename="invalidate.json", **fields):
     """Sticky pre-lock poison, including when the callback cannot acquire lock."""
     safe(registry.parent, stat.S_ISDIR, private=True)
-    path = registry.with_name("invalidate.json")
+    path = registry.with_name(filename)
     try:
         safe(path, private=True)
         path.unlink()
@@ -237,7 +277,7 @@ def publish_request(registry):
         pass  # Another callback/publisher already removed it; still publish ours.
     sync_directory(path.parent)
     request = str(uuid.uuid4())
-    atomic(path, {"token": request}, prefix=".poison-")
+    atomic(path, {"token": request, **fields}, prefix=".poison-")
     return request
 
 
@@ -263,9 +303,16 @@ def require_fence(registry, record):
         raise ValueError("Codex binding invalidation fence missing or superseded")
 
 
-def invalidate(registry):
+def invalidate(registry, event=None):
     """Publish poison, then a short transaction; never lock across daemon calls."""
     request = publish_request(registry)
+    if event is not None:
+        if isinstance(event, bytes):
+            if len(event) > LIMIT:
+                raise ValueError("Codex startup callback exceeds limit")
+            event = json.loads(event)
+        if event.get("session_id") != load(registry).get("session"):
+            publish_request(registry, "custody-poison.json", reason="callback_uuid_changed")
     with locked(registry.parent):
         previous = load(registry)
         record = dict(previous)
@@ -453,6 +500,8 @@ def prepare(argv, env):
                   "experimental": True, "delivery_enabled": False}
         # Fence stale in-memory snapshots even if registry replacement fails.
         publish_request(registry)
+        # New launch only. Callbacks/supervisors may never refresh this capability.
+        publish_request(registry, "custody-poison.json", generation=record["generation"])
         atomic(registry, record)
     print("Codex attended binding: UNBOUND until trusted SessionStart; experimental queue API; delivery disabled", file=sys.stderr)
     return planned
@@ -564,14 +613,20 @@ def bind(registry, event, context=None):
     # The dispatcher has already invalidated before loading this handler. Direct
     # calls must do the same. last_binding retains compact continuity across
     # overlapping callbacks, but is never an active/delivery binding.
-    previous, token, request = invalidate(registry) if context is None else context
+    previous, token, request = invalidate(registry, event) if context is None else context
     record = dict(previous)
     if isinstance(event, bytes):
         if len(event) > LIMIT:
             raise ValueError("Codex startup callback exceeds limit")
         event = json.loads(event)
+    if event.get("session_id") != record["session"]:
+        publish_request(registry, "custody-poison.json", reason="callback_uuid_changed")
     with Daemon(record["codex_home"]) as daemon:
         binding = validate(previous, event, daemon)
+    old = previous.get("binding", previous.get("last_binding", {}))
+    if old and any(old.get(key) != binding.get(key) for key in
+                   ("daemon_pid", "daemon_identity", "socket", "rendezvous")):
+        publish_request(registry, "custody-poison.json", reason="daemon_changed")
     presence = control(record, "ship.presence", {"ship": record["ship"]})
     if presence.get("attended") is not True or presence.get("lease", {}).get("holder") != record["holder"]:
         raise ValueError("Codex binding does not own current presence")
@@ -597,7 +652,9 @@ def main():
     try:
         if len(sys.argv) != 3 or sys.argv[1] != "--registry":
             raise ValueError("invalid Codex binding hook invocation")
-        data = sys.stdin.buffer.read(LIMIT + 1)
+        data = globals().get("_DISPATCH_EVENT")
+        if data is None:
+            data = sys.stdin.buffer.read(LIMIT + 1)
         bind(sys.argv[2], data, globals().get("_DISPATCH_CONTEXT"))
         print("{}")
     except Exception as error:

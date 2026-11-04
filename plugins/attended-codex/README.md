@@ -35,8 +35,8 @@ hash: **review and re-trust the new declaration through `/hooks`** before bindin
 An older non-isolated dispatcher also requires explicit review/removal before
 reinstall; its command trust hash changes with `-I`. Unexpected dispatcher file
 contents are never silently overwritten, except for explicit migrations of the
-**exact known B0, B1 and B2 dispatcher bytes** (SHA-256 pinned in `codex_binding.py`,
-fixtures in `tests/fixtures/codex-dispatcher-b{0,1,2}.txt`). Prepare upgrades that body atomically
+**exact known B0, B1, B2 and B5a dispatcher bytes** (SHA-256 pinned in `codex_binding.py`,
+fixtures in `tests/fixtures/codex-dispatcher-b{0,1,2,5a}.txt`). Prepare upgrades that body atomically
 only after refusing a live owner and while holding the project lock. A changed
 B0 body is refused. The command/declaration and native trust remain untouched;
 the new launch is UNBOUND and delivery-disabled, never grandfathered in.
@@ -120,9 +120,17 @@ including recovery from older checkpoints. Unknown/aliased/multimedia shapes pau
 with a clear reason. Queue `clientUserMessageId` and promoted `client_id` are
 separate canonical facts: equality has not been observed before promotion and
 is not required. The exact saved body/nonce and queue-triggered lifecycle prove
-the receipt. Native attachment remains unqualified; future hosted-pane custody
-and possibly-unattended turn accounting need separate implementation and review.
-Activation remains blocked.
+the receipt. B5b also requires the attribution's turn_id to equal task_started's
+turn_id, including when recovering old checkpoints. Queue item ID changes, not
+only client-ID changes, pause. Native attachment remains unqualified. The dormant
+Rust hosted-supervisor custody prerequisite is implemented in B5b: only the owner
+of the unreaped child acquires a pidfd and records executable/start/boot identity.
+A separate sticky custody poison fences pane exit, wrong-UUID callbacks, holder
+changes and daemon/socket replacement; a new valid callback cannot repair it.
+See the design for lock order and the B5c consumer's mandatory fresh pidfd checks
+for both pane and supervisor. This does not make Codex hosted eligible or prove
+current UI subscription. No runner, enable path or possibly-unattended K=3/budget
+accounting is implemented yet. Activation remains blocked.
 
 The fixed non-deleting admission-nonce filter has separate possible-reuse and
 saturation errors with fill-ratio diagnostics (25% fill limit, about 4,700 unique
@@ -130,7 +138,11 @@ retirements per session). Saturation blocks inserts only into that session;
 other sessions still check its filter for possible reuse. No rollover or
 automatic UUID switching is provided. These are not exact-reuse claims. Future runners must
 pause/surface the error, never resample or retry on a timer; operator capacity
-review is required. Positively never-spawned rejected nonces use a separate
+review is required. False-positive rates accumulate across session filters
+(roughly 39% across 128 near-capacity independent filters); no resampling means
+these refusals also require operator recovery. Replay-preserving rollover or
+capacity migration must address the project-wide rate before activation.
+Positively never-spawned rejected nonces use a separate
 counter and 256-entry exact window, not that admission filter. See the design
 for capacity/migration details and the safety boundary of this exception.
 It is not called by a mail runner. Lost CLI responses reconcile queue presence,
@@ -195,8 +207,8 @@ presentation evidence. Delivery remains disabled. On Codex CLI/fixture daemon
 TUI ever attached**. Public loaded/idle fields do not distinguish attachment,
 including after TUI exit. Positive ATTACHED proof remains required, not a
 loaded-only check (or separately qualified unattended-turn budget/reporting).
-The proposed Privateer-owned hosted child/pidfd proof is **design only**, with
-explicit exit/navigation races and an upstream attachment-identity ask; it is
-not an implemented attachment detector or permission to run mail. Its authenticated operator-only resolve control and surfacing of
+B5b implements only the dormant Privateer-owned hosted child/pidfd custody
+prerequisite, with explicit exit/navigation races and an upstream attachment-identity
+ask; it is not an attachment detector or permission to run mail. Its authenticated operator-only resolve control and surfacing of
 the immediate bounded uncertainty diagnostic also remain B3; the dormant reducer
 is not an exposed command. No user history setting is changed.

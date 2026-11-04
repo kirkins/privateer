@@ -41,6 +41,8 @@ class Fixture:
         self.calls = []
         self.env = {"PATH": str(self.root / "bin") + os.pathsep + os.environ["PATH"],
                     "TERM": "xterm-256color", "PRIVATEER_SERVICE": "none"}
+        self.env.update({key: os.environ[key] for key in ("CARGO_HOME", "RUSTUP_HOME")
+                         if key in os.environ})
         for key, name in {"HOME": "home", "CODEX_HOME": "c", "PRIVATEER_HOME": "p",
                           "PRIVATEER_RESOURCE_HOME": "resources", "TMPDIR": "tmp",
                           "XDG_STATE_HOME": "state", "XDG_DATA_HOME": "data", "XDG_CONFIG_HOME": "config"}.items():

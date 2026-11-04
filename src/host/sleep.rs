@@ -230,13 +230,24 @@ pub(crate) fn supervise(
     holder: &str,
     child: &mut std::process::Child,
     after_secs: u64,
+    mut custody: Option<&mut super::codex_custody::Custody>,
 ) -> Result<Ended> {
     use std::time::{Duration, Instant};
     let mut refreshed = Instant::now();
     let mut checked = Instant::now();
     let mut leased = true;
     loop {
+        // Publish poison before consuming exit. Failure never abandons the child.
+        if let Some(proof) = custody.as_deref_mut()
+            && let Err(error) = proof.observe(store, ship, holder)
+        {
+            let _ = proof.revoke("custody_unavailable");
+            eprintln!("Codex custody unavailable; delivery remains disabled: {error:#}");
+        }
         if let Some(status) = child.try_wait()? {
+            if let Some(proof) = custody.as_deref_mut() {
+                proof.retire("pane_exit");
+            }
             return Ok(Ended::Exited(status));
         }
         if leased && refreshed.elapsed() >= Duration::from_secs(30) {
@@ -254,6 +265,9 @@ pub(crate) fn supervise(
             if holder.starts_with(crate::presence::HOSTED)
                 && crate::presence::moved_from(store, ship, holder).unwrap_or(false)
             {
+                if let Some(proof) = custody.as_deref_mut() {
+                    proof.retire("holder_changed");
+                }
                 stop(child)?;
                 store.audit("host.superseded", &json!({"ship": ship, "holder": holder}))?;
                 return Ok(Ended::Superseded);
@@ -265,18 +279,27 @@ pub(crate) fn supervise(
             if let Ok(Some((reason, fenced, through))) =
                 super::upgrade::fence(store, ship, holder, after_secs)
             {
+                if let Some(proof) = custody.as_deref_mut() {
+                    proof.retire("relaunch");
+                }
                 stop(child)?;
                 return Ok(Ended::Relaunch(reason, fenced, through));
             }
             // After the fence: an upgrade or requested relaunch due now wins,
             // since the new pane reads approvals at its launch too.
             if let Ok(Some(fresh)) = super::approvals::fence(store, ship, holder) {
+                if let Some(proof) = custody.as_deref_mut() {
+                    proof.retire("holder_changed");
+                }
                 stop(child)?;
                 return Ok(Ended::Refresh(fresh));
             }
             if after_secs > 0
                 && let Ok(Some(asleep)) = sleep(store, ship, holder, after_secs)
             {
+                if let Some(proof) = custody.as_deref_mut() {
+                    proof.retire("sleep");
+                }
                 stop(child)?;
                 return Ok(Ended::Asleep(asleep));
             }
@@ -540,7 +563,7 @@ mod tests {
             .arg("60")
             .spawn()
             .unwrap();
-        let ended = supervise(&store, ship, ours, &mut harness, 0).unwrap();
+        let ended = supervise(&store, ship, ours, &mut harness, 0, None).unwrap();
         assert!(matches!(ended, Ended::Superseded));
         assert!(harness.try_wait().unwrap().is_some());
         // The lease stays with the session that took it.
@@ -570,7 +593,7 @@ mod tests {
             .arg("6")
             .spawn()
             .unwrap();
-        let ended = supervise(&store, ship, ours, &mut harness, 0).unwrap();
+        let ended = supervise(&store, ship, ours, &mut harness, 0, None).unwrap();
         assert!(matches!(ended, Ended::Exited(_)));
     }
 

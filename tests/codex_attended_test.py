@@ -471,6 +471,22 @@ class BindingTests(unittest.TestCase):
         self.assertFalse(restored["delivery_enabled"])
         self.assertEqual(ledger.read_text(), '{"alpha":"unresolved nonce"}')
 
+    def test_exact_b5a_dispatcher_upgrade_preserves_native_trust(self):
+        path = self.registry.with_name("hook.py")
+        body = (ROOT / "tests/fixtures/codex-dispatcher-b5a.txt").read_bytes()
+        self.assertEqual(hashlib.sha256(body).hexdigest(), binding.B5A_DISPATCHER_SHA256)
+        hooks = (self.cwd / ".codex/hooks.json").read_bytes()
+        self.record["process_identity"]["bootId"] = "stale"
+        binding.atomic(self.registry, self.record)
+        path.write_bytes(body + b"\n")
+        with self.assertRaisesRegex(ValueError, "dispatcher differs"):
+            binding.prepare(self.argv, self.env)
+        path.write_bytes(body)
+        binding.prepare(self.argv, self.env)
+        self.assertEqual(path.read_text(), binding.DISPATCHER)
+        self.assertEqual((self.cwd / ".codex/hooks.json").read_bytes(), hooks)
+        self.assertFalse(codex_socket.load(self.registry)["delivery_enabled"])
+
     def test_near_b0_body_is_not_migrated(self):
         path = self.registry.with_name("hook.py")
         body = (ROOT / "tests/fixtures/codex-dispatcher-b0.txt").read_bytes() + b"\n"
@@ -512,6 +528,42 @@ class BindingTests(unittest.TestCase):
         binding.atomic(path, {"token": "not-a-uuid"})
         with self.assertRaises(ValueError):
             binding.require_fence(self.registry, bound)
+
+    def test_wrong_uuid_callback_poison_precedes_direct_and_dispatcher_lock(self):
+        bound = self.bind_current()
+        original = self.registry.read_bytes()
+        event = {**self.event, "session_id": str(uuid.uuid4())}
+        for native_dispatcher in (False, True):
+            with self.subTest(native_dispatcher=native_dispatcher):
+                before = codex_socket.load(self.registry.with_name("custody-poison.json"))["token"]
+                with binding.locked(self.registry.parent):
+                    if native_dispatcher:
+                        result = subprocess.run(shlex.split(bound["hook_command"]), input=json.dumps(event),
+                                                text=True, capture_output=True, timeout=5)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("state lock timed out", result.stderr)
+                    else:
+                        with self.assertRaises(TimeoutError):
+                            binding.bind(self.registry, event)
+                poison = codex_socket.load(self.registry.with_name("custody-poison.json"))
+                self.assertNotEqual(poison["token"], before)
+                self.assertEqual(poison["reason"], "callback_uuid_changed")
+                self.assertEqual(self.registry.read_bytes(), original)
+        # A later valid callback cannot repair the supervisor custody token.
+        poison = self.registry.with_name("custody-poison.json").read_bytes()
+        self.bind_current()
+        self.assertEqual(self.registry.with_name("custody-poison.json").read_bytes(), poison)
+
+    def test_daemon_change_callback_revokes_custody_without_enabling_delivery(self):
+        self.bind_current()
+        self.daemon.pid = 2
+        try:
+            record = self.bind_current()
+            poison = codex_socket.load(self.registry.with_name("custody-poison.json"))
+            self.assertEqual(poison["reason"], "daemon_changed")
+            self.assertFalse(record["delivery_enabled"])
+        finally:
+            self.daemon.pid = 1
 
     def test_direct_lock_timeout_leaves_sticky_poison_and_durable_facts(self):
         bound = self.bind_current()
@@ -1159,7 +1211,7 @@ class ReceiptTests(unittest.TestCase):
 
     def promote(self):
         self.append({"type": "task_started", "turn_id": "alpha-turn", "started_at": 123,
-                     "turn_attribution": {"turn_trigger": "queue"}},
+                     "turn_attribution": {"turn_trigger": "queue", "turn_id": "alpha-turn"}},
                     self.native_input(),
                     {"type": "task_complete", "turn_id": "alpha-turn"})
 
@@ -1257,6 +1309,62 @@ class ReceiptTests(unittest.TestCase):
                 self.assertEqual(result["acknowledged_through"], 0)
                 self.assertFalse(result["paused"])
 
+    def test_queue_item_id_change_preserves_original_evidence_and_pauses(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        queue = {"data": [{"id": "first", "clientUserMessageId": self.client_id, "input": [
+            {"type": "text", "text": self.body, "text_elements": []}]}], "nextCursor": None}
+        self.assertEqual(self.reconcile(queue)["state"], "queued")
+        queue["data"][0]["id"] = "second"
+        result = self.reconcile(queue)
+        self.assertEqual(result["state"], "uncertain")
+        self.assertEqual(result["evidence"]["queue_id"], "first")
+        self.assertEqual(result["accepted_through"], 0)
+
+    def test_queue_attribution_id_must_match_in_scan_and_anchor_recovery(self):
+        for bad_id in (None, "different-turn"):
+            for recovery in (False, True):
+                with self.subTest(bad_id=bad_id, recovery=recovery):
+                    # Each negative case gets its own isolated ledger/rollout.
+                    if hasattr(self, "transcript"):
+                        self.transcript.unlink()
+                        self.ledger.path.unlink()
+                    self.intent()
+                    self.append({"type": "task_started", "turn_id": "alpha-turn",
+                                 "turn_attribution": {"turn_trigger": "queue", "turn_id": bad_id}})
+                    self.ledger.invoking(self.session, self.nonce)
+                    if recovery:
+                        # Simulate an old checkpoint that had accepted mismatched
+                        # attribution; v2 must revalidate its saved boundary.
+                        value = self.ledger.read()
+                        intent = value["sessions"][self.session]["intent"]
+                        a = intent["scan"]
+                        a["offset"] = self.transcript.stat().st_size
+                        with self.transcript.open("rb") as stream:
+                            a["boundary_hash"] = receipts.checkpoint(stream, a["offset"])
+                        intent["open_turn"] = "alpha-turn"
+                        intent["open_turn_trigger"] = "queue"
+                        intent.pop("lifecycle_version")
+                        binding.atomic(self.ledger.path, value)
+                    self.append(self.native_input())
+                    result = self.reconcile()
+                    self.assertEqual(result["state"], "uncertain")
+                    self.assertEqual(result["accepted_through"], 0)
+                    self.assertIsNotNone(result["diagnostic"])
+
+    def test_prepare_seeds_anchor_lifecycle_without_recomputing_it(self):
+        self.intent()
+        self.reconcile(ack=4)
+        self.append({"type": "task_started", "turn_id": "mid-turn",
+                     "turn_attribution": {"turn_trigger": "queue", "turn_id": "mid-turn"}})
+        offer = self.intent(after=4, through=8)
+        self.assertEqual(offer["open_turn"], offer["scan"]["open_turn"])
+        self.assertEqual(offer["open_turn_trigger"], "queue")
+        self.ledger.invoking(self.session, self.nonce)
+        self.append(self.native_input())
+        with patch.object(receipts, "open_turn_at", side_effect=AssertionError("redundant lookup")):
+            self.assertEqual(self.reconcile()["state"], "presented")
+
     def test_noncanonical_queue_client_id_is_not_admission_evidence(self):
         self.intent()
         self.ledger.invoking(self.session, self.nonce)
@@ -1294,7 +1402,7 @@ class ReceiptTests(unittest.TestCase):
                 binding.atomic(self.ledger.path, baseline)
                 self.transcript.write_bytes(original)
                 self.append({"type": "task_started", "turn_id": "mid-turn",
-                             "turn_attribution": {"turn_trigger": trigger}})
+                             "turn_attribution": {"turn_trigger": trigger, "turn_id": "mid-turn"}})
                 offer = self.intent(after=4, through=8)
                 self.assertEqual(offer["scan"]["open_turn_trigger"], trigger)
                 self.ledger.invoking(self.session, self.nonce)
@@ -1426,7 +1534,7 @@ class ReceiptTests(unittest.TestCase):
         filler = {"type": "agent_message", "message": "x" * 3000}
         self.append(*([filler] * 750))
         self.append({"type": "task_started", "turn_id": "alpha-turn",
-                     "turn_attribution": {"turn_trigger": "queue"}})
+                     "turn_attribution": {"turn_trigger": "queue", "turn_id": "alpha-turn"}})
         result = self.reconcile()
         self.assertLessEqual(result["evidence"]["scan"]["offset"] - original["scan"]["offset"], receipts.LIMIT)
         self.assertFalse(result["evidence"]["scan_caught_up"])

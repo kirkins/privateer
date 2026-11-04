@@ -10,7 +10,8 @@ B4 addresses nonce-capacity diagnostics, qualifies one accepted queue input agai
 an isolated loopback mock (captain-approved scope change), and proposes a
 Privateer-owned attended-pane proof for review, **design only**.
 B5a fixes the B4 review findings below. The first mate approved separate B5b
-custody and B5c dormant-runner slices; neither is implemented here.
+custody and B5c dormant-runner slices. B5b now implements the Rust custody
+prerequisite and PR700 receipt carry-ins below; B5c is not implemented.
 No runner or B3c control/report integration is implemented; delivery stays disabled. The fresh
 reservation decision below is design only, not implementation approval.
 Goal: an explicitly launched Codex first-mate pane handles idle mail without
@@ -830,7 +831,97 @@ qualification and all documented barriers still need qualification/review.
 Delivery remains false, no Rust supervision path changes, no live qualification.
 **Paginated installs get no idle mail**, and no history-mode setting changes.
 
-### B4: Privateer-owned attended-pane proof (DESIGN ONLY, Opus review requested)
+### B5b: dormant Rust custody prerequisite (delivery disabled)
+
+`src/host/codex_custody.rs` is called only by the opted-in Codex hosted-pane
+supervisor in `src/cli.rs` / `src/host/sleep.rs`. It does not make Codex hosted
+eligible, start queue children, report delivered turns, or provide an enable
+path. The actual unreaped `Child` is required to acquire a Linux pidfd. The
+supervisor waits for the native wrapper to exec and the trusted callback to
+bind before publishing `custody.json`: a wrapper executable cannot qualify as
+the expected Codex payload. The record pins pane PID/boot/start, executable
+path/device/inode, launch generation, exact UUID/home/cwd/CODEX_HOME, holder,
+random custody epoch, supervisor PID/boot/start/executable, and daemon
+PID/boot/start/executable plus rendezvous target and socket device/inode.
+No public native attachment discriminator is claimed.
+
+**Shared fence protocol.** `prepare` alone initializes `custody-poison.json`
+with a new launch generation/token; neither callback nor supervisor can repair
+that token. The supervisor copies it into its owned record under the same
+project `flock` as Python. The file must still name that generation, with no
+revocation reason. Publication never refreshes the token, so a concurrent
+pre-lock revocation cannot be cleared by a late custody writer. Missing,
+unsafe or mismatched files refuse proof. The existing `invalidate.json` fence
+remains independently required for binding/callback generations. The stable
+hook command/trust declaration is unchanged; only the exact pinned B5a
+(and older explicitly known) dispatcher bodies upgrade. Near matches refuse.
+
+Wrong-UUID callbacks publish custody poison **before trying the project lock**
+in both direct and self-contained dispatcher paths, even when lock acquisition
+times out or the selected release is missing. The dispatcher passes its bounded
+saved callback input to the handler instead of reading stdin twice. A callback
+observing a changed daemon also poisons custody. Rust independently checks the
+pinned daemon process, executable, daemon.pid, socket inode and rendezvous on
+each local supervision pass (250 ms); it does not connect, start or signal the
+daemon. Pane exit is checked using pidfd readiness before reaping, and intended
+stops retire custody before waiting for the child. Unhandled supervision errors
+retire through Drop. A supervisor crash cannot run Drop: its recorded process
+identity/liveness must therefore also be checked by B5c; **the durable owned
+state alone is never authority**, and restart cannot reconstruct wait custody
+from an old registry PID.
+
+Presence replacement, release and handover synchronously poison local custody
+inside the SQLite writer transaction. Fixed order is **SQLite writer (when
+needed) -> project flock**; poison removal/file+parent fsync/publication comes
+before flock. There is no SQLite acquisition, daemon/report RPC, child wait or
+reap under flock. A lock timeout may leave the old record saying `owned`, but its
+old token is already unusable. Same-holder live renewal and stale leave do not
+rotate custody. Projects without launch/custody state are untouched. A failed
+transaction may conservatively leave custody revoked; it never rolls poison
+back or discards receipts. Revocation failures do not abandon a running native
+child. Filesystem persistence failure remains the same explicit limitation as
+B1; a consumer must refuse missing/unreadable proof.
+
+**B5c must** reread custody, both poison files, current holder/epoch, both binding
+generations and exact intent/UUID under the project fence immediately before
+spawn, acquire its own pidfds for pane and supervisor, and independently verify
+start time and executable device/inode plus daemon identity. It must not trust
+a Python Boolean, stored `owned` state, cached snapshot or pidfd acquisition
+alone. No such admission consumer is implemented or qualified here. Exit after
+the final check may still lead to a late admitted turn; every future delivered
+turn is **possibly unattended**, counted/reported against K=3 and the budget.
+There is no cancellation or instantaneous UI-navigation guarantee.
+
+PR700 receipt carry-ins: a queue trigger now requires
+`turn_attribution.turn_id == task_started.turn_id`, both in forward scanning
+and bounded anchor recovery. New intents seed their live lifecycle from the
+anchor's saved fields rather than recomputing them; older checkpoints are
+versioned and revalidated at their saved offset. Queue item **id and
+clientUserMessageId** must both stay unchanged across queue observations;
+promotion client_id remains a separate fact with no equality assumption.
+False-positive refusals accumulate across many nearly-full session filters:
+with n independent filters at 0.39% each the rough union probability is
+`1 - (1 - 0.0039)^n` (about 39% at 128), not 0.39% project-wide. Independence
+is an approximation, not a guarantee. Since the runner must not resample a
+refused nonce, even false positives need explicit operator recovery. Before
+activation, design replay-preserving rollover/capacity migration with that
+project-wide rate in mind; no filter reset/rollover or silent UUID switching is
+implemented here.
+
+Deterministic coverage uses actual owned subprocesses, pidfds and a shared
+flock: exit before reap, executable/PID/start/UUID/generation substitution,
+wrapper-vs-payload, daemon/socket replacement, poison-before-lock timeout,
+initial publication after poison, sticky supervision loss, holder replacement,
+handover/release and harmless stale leave. Python covers wrong-UUID pre-lock
+poison in the real dispatcher and direct path, daemon change, exact B5a migration,
+attribution-ID mismatch in scan/legacy recovery, lifecycle seeding and queue-ID
+change. These are custody/reducer tests, **not runner spawn-barrier evidence**.
+Real supervisor-crash recovery, before/after final-spawn barriers, lost queue
+responses, same-UUID second client, idle navigation, PTY draft preservation,
+K=3/busy accounting and live qualification remain B5c/C activation gates.
+**Paginated installs get no idle mail**; no history-mode setting changes.
+
+### B4: Privateer-owned attended-pane proof (reviewed design; implementation split above)
 
 0.166 loaded/idle is not ATTACHED. A future alternative can restrict attended
 mail to **Privateer's own hosted, supervised exact-resume pane**, rather than
