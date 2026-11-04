@@ -2,7 +2,7 @@
 """Run one shard of `cargo test --locked --all-features`, for CI jobs in parallel.
 
 Each named shard is the integration suites listed for it below. `rest` is
-every other target cargo metadata lists (the library, the binaries, every other
+every other target cargo metadata lists (the binaries, every other
 integration suite) and the doc tests, so a suite added later lands in `rest` and
 is never skipped. Together the shards run exactly what
 `cargo test --all-features` runs.
@@ -16,13 +16,27 @@ import time
 # Balance by whole-job time, including slow-1's MCP/pilot checks and slow-2's
 # clippy. See docs/ci.md for the measured baseline and how to review it again.
 SHARDS = {
-    # slow-1 holds the library tests and the MCP door checks; it takes no
-    # integration suite of its own.
-    "slow-1": (),
-    "slow-2": ("crew_park", "door", "hosted", "permissions", "workspaces"),
-    "slow-3": ("python_suites", "upgrade_linked", "desk_placement", "machines"),
+    # slow-1 keeps the MCP door checks, the dashboard smoke, the pilot and the
+    # minimal-build check (see test-shards.yml), so it takes only light suites.
+    "slow-1": ("activation", "attended", "files", "cli", "input", "watch"),
+    "slow-2": ("door", "hosted", "permissions", "workspaces", "plugins",
+               "tool_bundles", "crew_routes", "mail", "fleet", "jobs"),
+    "slow-3": ("crew_park", "upgrade_fetch", "mcp_broker", "review_gate",
+               "scheduling", "cross_ship_waits", "recovery_pilot"),
+    "slow-4": ("python_suites", "upgrade_linked", "machines", "dashboard_fleet",
+               "dashboard", "dashboard_yaml", "cursor_attended",
+               "cross_machine_waits", "pi_attention", "pi_calm", "pi_follow",
+               "pi_quiet"),
 }
-LIB_SHARD = "slow-1"
+# The library is one `cargo test --lib` run's worth of time on its own, so it is
+# split in two by module-path filter: LIB_SHARD runs the tests whose full name
+# contains one of LIB_INCLUDE; LIB_SKIP_SHARD runs the complement (one --skip
+# per prefix). The filters are substrings of the full test path and a prefix
+# ending in `::` matches exactly that module's tests, so the two halves
+# partition the library: every test matches the include list or is skipped.
+LIB_SHARD = "slow-3"
+LIB_INCLUDE = ("door::",)
+LIB_SKIP_SHARD = "rest"
 USAGE = "usage: test-shard.py " + "|".join([*SHARDS, "rest"]) + " [--print]"
 
 
@@ -32,9 +46,22 @@ def targets():
     return [t for p in json.loads(out)["packages"] for t in p["targets"]]
 
 
+def lib_guard(shard_names):
+    """The library halves must be a partition run by two different shards."""
+    if LIB_SHARD not in shard_names or LIB_SKIP_SHARD not in shard_names:
+        raise SystemExit("test-shard: no shard pair runs the library")
+    if LIB_SHARD == LIB_SKIP_SHARD:
+        raise SystemExit("test-shard: the library halves share a shard")
+    if not LIB_INCLUDE:
+        raise SystemExit("test-shard: the library include list is empty")
+    bare = sorted(p for p in LIB_INCLUDE if not p.endswith("::"))
+    if bare:
+        raise SystemExit(f"test-shard: library prefixes must end in '::': {' '.join(bare)}")
+
+
 def commands(shard):
-    if LIB_SHARD not in SHARDS:
-        raise SystemExit("test-shard: no shard runs the library")
+    shard_names = [*SHARDS, "rest"]
+    lib_guard(shard_names)
     found = targets()
     # A new kind of target (an example, a bench) would fall outside every
     # shard; refuse it until the shards say where it runs.
@@ -50,14 +77,30 @@ def commands(shard):
     if missing:
         raise SystemExit(f"test-shard: no such suite: {' '.join(missing)}")
     base = ["cargo", "test", "--locked", "--all-features"]
+    suite_args = [arg for name in SHARDS.get(shard, ()) for arg in ("--test", name)]
+    lib_half = ["--lib", "--", *LIB_INCLUDE] if shard == LIB_SHARD else None
+    lib_rest = ["--lib", "--", *(a for p in LIB_INCLUDE for a in ("--skip", p))] \
+        if shard == LIB_SKIP_SHARD else None
     if shard in SHARDS:
-        selected = ["--lib"] if shard == LIB_SHARD else []
-        return [base + selected + [arg for name in SHARDS[shard] for arg in ("--test", name)]]
+        # A filter applies to every binary in one cargo run, so a filtered
+        # library half never shares a run with unfiltered suites: a suite test
+        # that happened to match the filter would otherwise run in no shard.
+        selected = []
+        if lib_half:
+            selected.append(base + lib_half)
+        if suite_args:
+            selected.append(base + suite_args)
+        return selected
     if shard == "rest":
-        selected = ["--bins"]
-        selected += [arg for name in tests if name not in named for arg in ("--test", name)]
+        selected = []
+        if lib_rest:
+            selected.append(base + lib_rest)
+        bins = ["--bins"]
+        bins += [arg for name in tests if name not in named for arg in ("--test", name)]
+        selected.append(base + bins)
         # Doc tests cannot share a run with other targets.
-        return [base + selected, base + ["--doc"]]
+        selected.append(base + ["--doc"])
+        return selected
     raise SystemExit(USAGE)
 
 

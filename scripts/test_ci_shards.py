@@ -3,6 +3,7 @@ from collections import Counter
 import importlib.util
 import os
 from pathlib import Path
+import re
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -23,32 +24,63 @@ class ShardCoverage(unittest.TestCase):
             *({"kind": ["test"], "name": name} for name in names + ["new_suite"]),
         ]
 
-    def test_all_targets_and_future_suites_run_exactly_once(self):
+    def shard_commands(self):
         found = self.targets()
-        assigned = Counter()
         with patch.object(shard, "targets", return_value=found):
-            for name in [*shard.SHARDS, "rest"]:
-                for command in shard.commands(name):
-                    self.assertEqual(command[:4], ["cargo", "test", "--locked", "--all-features"])
-                    selected = command[4:]
-                    if "--doc" in selected:
-                        self.assertEqual(selected, ["--doc"])
-                        assigned["doc"] += 1
-                    for kind in ("lib", "bin"):
-                        flag = "--lib" if kind == "lib" else "--bins"
-                        if flag in selected:
-                            assigned.update((kind, t["name"]) for t in found if t["kind"] == [kind])
-                    assigned.update(("test", selected[i + 1]) for i, arg in enumerate(selected) if arg == "--test")
-        expected = Counter((t["kind"][0], t["name"]) for t in found)
+            return {name: shard.commands(name) for name in [*shard.SHARDS, "rest"]}
+
+    def test_all_targets_and_future_suites_run_exactly_once(self):
+        assigned = Counter()
+        lib_runs = []
+        for name, commands in self.shard_commands().items():
+            for command in commands:
+                self.assertEqual(command[:4], ["cargo", "test", "--locked", "--all-features"])
+                selected = command[4:]
+                if "--doc" in selected:
+                    self.assertEqual(selected, ["--doc"])
+                    assigned["doc"] += 1
+                if "--bins" in selected:
+                    assigned.update(("bin", t["name"]) for t in self.targets() if t["kind"] == ["bin"])
+                if "--lib" in selected:
+                    lib_runs.append((name, selected))
+                    assigned["lib"] += 0  # counted once below, as both halves
+                assigned.update(("test", selected[i + 1]) for i, arg in enumerate(selected) if arg == "--test")
+        # The two filter halves partition the library, so it runs exactly once.
+        self.assertEqual(len(lib_runs), 2)
+        assigned.update(("lib", t["name"]) for t in self.targets() if t["kind"] == ["lib"])
+        expected = Counter((t["kind"][0], t["name"]) for t in self.targets())
         expected["doc"] = 1
         self.assertEqual(assigned, expected)
+
+    def test_library_halves_partition_by_complementary_filters(self):
+        lib_runs = [(name, command) for name, commands in self.shard_commands().items()
+                    for command in commands if "--lib" in command]
+        # One run per half, on two different shards.
+        self.assertEqual(len(lib_runs), 2)
+        self.assertNotEqual(lib_runs[0][0], lib_runs[1][0])
+        halves = {name: command[command.index("--") + 1:] if "--" in command else []
+                  for name, command in lib_runs}
+        self.assertEqual(sorted(halves), sorted([shard.LIB_SHARD, shard.LIB_SKIP_SHARD]))
+        # The include half names the prefixes; the skip half skips each of them,
+        # so together they run every library test and share none.
+        include = halves[shard.LIB_SHARD]
+        skip = halves[shard.LIB_SKIP_SHARD]
+        self.assertEqual(include, list(shard.LIB_INCLUDE))
+        self.assertEqual(skip, [arg for p in shard.LIB_INCLUDE for arg in ("--skip", p)])
+        # A filtered library half never shares a cargo run with suites: the
+        # filter would apply to the suites too and could drop their tests.
+        for name, commands in self.shard_commands().items():
+            for command in commands:
+                if "--test" in command:
+                    self.assertNotIn("--lib", command)
 
     def test_missing_duplicate_and_unhandled_targets_fail_instead_of_skipping(self):
         found = self.targets()
         with patch.object(shard, "targets", return_value=found[:-2]):
             with self.assertRaisesRegex(SystemExit, "no such suite"):
                 shard.commands("rest")
-        with patch.object(shard, "SHARDS", {"slow-1": ("door", "door")}):
+        with patch.object(shard, "SHARDS", {**shard.SHARDS,
+                                             "slow-1": (*shard.SHARDS["slow-1"], "door")}):
             with patch.object(shard, "targets", return_value=found):
                 with self.assertRaisesRegex(SystemExit, "assigned twice"):
                     shard.commands("rest")
@@ -59,8 +91,25 @@ class ShardCoverage(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "no shard runs"):
                     shard.commands("rest")
         with patch.object(shard, "LIB_SHARD", "missing"):
-            with self.assertRaisesRegex(SystemExit, "no shard runs the library"):
+            with self.assertRaisesRegex(SystemExit, "no shard pair runs the library"):
                 shard.commands("rest")
+        with patch.object(shard, "LIB_SKIP_SHARD", shard.LIB_SHARD):
+            with self.assertRaisesRegex(SystemExit, "halves share a shard"):
+                shard.commands("rest")
+        with patch.object(shard, "LIB_INCLUDE", ()):
+            with self.assertRaisesRegex(SystemExit, "include list is empty"):
+                shard.commands("rest")
+        with patch.object(shard, "LIB_INCLUDE", ("door",)):
+            with self.assertRaisesRegex(SystemExit, "must end in '::'"):
+                shard.commands("rest")
+
+    def test_workflow_matrix_lists_every_shard(self):
+        """The reusable workflow must run exactly the shards the script knows."""
+        workflow = Path(__file__).resolve().parents[1] / ".github/workflows/test-shards.yml"
+        matrix = re.search(r"shard: \[([^]]+)\]", workflow.read_text())
+        self.assertIsNotNone(matrix, "test-shards.yml has no shard matrix")
+        listed = {name.strip() for name in matrix.group(1).split(",")}
+        self.assertEqual(listed, {*shard.SHARDS, "rest"})
 
     def test_failing_subprocess_stops_the_shard_and_records_its_status(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP", "/var/tmp")) as temp:

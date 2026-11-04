@@ -54,9 +54,13 @@ save only on main. Privateer's own binaries are rebuilt from the checkout.
 
 The [shard runner](../scripts/test-shard.py) assigns every integration target
 exactly once. Newly added integration suites go to `rest`; a missing or duplicate
-named suite, or an unsupported target kind, is an error. Library tests run in
-`slow-1` with no integration suite beside them, binary tests and doc tests in
-`rest`. Both platforms retain all-feature
+named suite, or an unsupported target kind, is an error. The library is split
+in two complementary halves by module-path filter (`door::` and its skip
+complement), so no single shard carries the whole library; binary tests and doc
+tests run in `rest`. A shard pair that stops partitioning the library is an
+error, and [the shard tests](../scripts/test_ci_shards.py), which the docs job
+runs on every PR, also check that the workflow matrix lists every shard. Both
+platforms retain all-feature
 tests, Linux's crew environment and the existing MCP, dashboard, pilot, lint
 and minimal-build checks.
 
@@ -89,3 +93,34 @@ the result. Each shard now appends Cargo invocation times and exit status to
 the Actions job summary. Use those summaries alongside per-suite timings in
 the logs to assess later balance; include the extra checks attached to each
 shard when comparing whole-job times.
+
+**Rebalance, 2026-11-04.** After the 11-02 rebalance `slow-1` kept growing:
+on [run 41827570345](https://github.com/kirkins/privateer/actions/runs/41827570345)
+(da6c78f4) macOS whole-job times were slow-1 22m35s, slow-2 18m28s, slow-3
+20m09s and rest 17m15s — four jobs sharing about 78 minutes of work against a
+25-minute limit each, with slow-1 cancelled at the limit on 11-03 (PRs 677 and
+680). Moving suites between four shards cannot fit that total under about
+70% of the limit, so the workflow gained a fifth shard, `slow-4`. Every
+integration suite was timed locally on the 11-04 checkout (one `cargo test
+--test <suite>` per suite, and `--lib` per top-level module), and the suites
+were dealt out so all five shards carry roughly equal measured work:
+
+| Shard | Measured work (local, s) | Content |
+| --- | ---: | --- |
+| slow-1 | ~550 | MCP door checks, dashboard smoke, pilot, minimal-build check, plus activation, attended, files, cli, input, watch |
+| slow-2 | ~560 | fmt and clippy, plus door, hosted, permissions, workspaces, plugins, tool_bundles, crew_routes, mail, fleet, jobs |
+| slow-3 | ~560 | library half `door::` (323 of 1469 tests, 339s locally), plus crew_park, upgrade_fetch, mcp_broker, review_gate, scheduling, cross_ship_waits, recovery_pilot |
+| slow-4 | ~555 | python_suites, upgrade_linked, machines, dashboard_fleet, dashboard, dashboard_yaml, cursor_attended, cross_machine_waits, pi_attention, pi_calm, pi_follow, pi_quiet |
+| rest | ~575 | library complement (`--skip door::`), bins, doc tests and the remaining suites, including desk_placement and placement |
+
+The two library halves are complements by construction (323 + 1146 = 1469
+listed tests), and each runs as its own cargo invocation so a filter can never
+hide a suite's tests. A fifth runner costs one more job of setup, cache restore
+and compile (about 5–10 minutes by the fits below), so the expected macOS
+whole-job times are roughly 15–18 minutes each against the 25-minute limit —
+typical runs under 70% of the limit, with the previous worst case (slow-1 at
+90–100%) gone. This is a projection from local timings plus whole-job macOS
+anchors, not a measurement of the changed workflow; the per-invocation times
+the shard runner appends to the Actions job summary will show the real split.
+If shards still run close to the limit, the next levers are a sixth shard or
+cutting per-job overhead, not moving suites again.
