@@ -21,6 +21,7 @@ pub(super) mod baseline;
 mod boot_clock;
 pub(super) mod completion;
 pub(crate) mod home;
+pub(crate) mod legacy;
 pub(super) mod proof;
 mod reconcile;
 pub(crate) mod release;
@@ -85,6 +86,8 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         "desk_home_release",
         "desk_home_loss_boundary",
         "desk_home_missing",
+        "desk_legacy_cut",
+        "desk_legacy_pin",
     ];
     let has_original_columns = |c: &Connection| -> Result<bool> {
         Ok(c.query_row(
@@ -253,6 +256,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
     tx.execute_batch("CREATE INDEX IF NOT EXISTS desk_intake_fact_order ON desk_intake_fact(domain,core,mailbox,source_order,id)")?;
     retention::replay::init(&tx)?;
     release::init(&tx)?;
+    legacy::init(&tx)?;
     if legacy {
         tx.execute("INSERT OR IGNORE INTO desk_intake_loss
             SELECT domain,source,state FROM desk_intake_gap

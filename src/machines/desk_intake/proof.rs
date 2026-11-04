@@ -6,7 +6,7 @@ use std::time::Instant;
 
 const HOMES: usize = 50;
 pub(super) const WIRE: usize = 64 * 1024;
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 
 // Mail delivery deliberately records a local created_ms. It is not the
 // origin's immutable creation time; never use it to reject or overwrite the
@@ -89,7 +89,8 @@ pub(super) fn registry_stamp(
         (SELECT state FROM desk_intake_gap WHERE domain=?1 AND source=?2),
         (SELECT state FROM desk_intake_loss WHERE domain=?1 AND source=?2),
         (SELECT epoch FROM desk_intake_loss_epoch WHERE domain=?1 AND source=?2),
-        EXISTS(SELECT 1 FROM desk_home_inventory_gap))",
+        EXISTS(SELECT 1 FROM desk_home_inventory_gap),
+        (SELECT digest FROM desk_legacy_cut WHERE domain=?1 AND source=?2))",
         params![m.domain, source],
         |r| r.get(0),
     )?;
@@ -100,6 +101,9 @@ pub(super) fn registry_stamp(
 #[serde(deny_unknown_fields)]
 pub(super) struct Evidence {
     version: u8,
+    // Required even when null: v2 deny_unknown_fields decoders drop v3.
+    #[serde(default)]
+    cut_digest: Option<String>,
     pub(super) checkpoint: Checkpoint,
     vector: reconcile::Proof,
     // Rechecked at each source contact; not persisted in the immutable issue.
@@ -123,6 +127,7 @@ fn candidate(conn: &Connection, m: &Manifest, cp: &Checkpoint) -> Result<Option<
     }
     let e = Evidence {
         version: VERSION,
+        cut_digest: legacy::load(conn, m, &cp.source)?.map(|(digest, _)| digest),
         checkpoint: cp.clone(),
         vector,
         valid: true,
@@ -226,7 +231,9 @@ pub(super) fn outgoing(
         .optional()?;
     let Some(raw) = raw else { return Ok(None) };
     let mut e: Evidence = serde_json::from_str(&raw)?;
-    e.valid = e.checkpoint == *cp
+    e.valid = e.version == VERSION
+        && e.cut_digest == legacy::load(conn, m, &cp.source)?.map(|(digest, _)| digest)
+        && e.checkpoint == *cp
         && sub_deadline(deadline).is_some_and(|deadline| {
             reconcile::revalidate(conn, m, &cp.source, &e.vector, deadline).unwrap_or(false)
         });
@@ -294,7 +301,14 @@ pub(super) fn eligible(
         params![m.domain, source],
         |r| r.get(0),
     )?;
-    Ok(done && !loss && copies_proved(conn, m, e)?)
+    let local = m.owner_core == source;
+    let loss_clear = if local {
+        e.cut_digest == legacy::load(conn, m, source)?.map(|(digest, _)| digest)
+            && legacy::loss_clear(conn, m, source)?
+    } else {
+        !loss
+    };
+    Ok(done && loss_clear && copies_proved(conn, m, e)?)
 }
 
 pub(super) fn receive(

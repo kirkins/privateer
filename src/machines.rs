@@ -3365,7 +3365,9 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             } else {
                 crate::mail::source::Provenance::Unresolved
             };
-            if !linked && let Some(fields) = args.as_object_mut() {
+            if (!linked || !matches!(caller, Caller::Operator))
+                && let Some(fields) = args.as_object_mut()
+            {
                 fields.remove("via");
             }
             if matches!(caller, Caller::Operator) {
@@ -3591,6 +3593,8 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 let provenance = mail_copies::provenance(args, envelope);
                 let mut envelope = envelope.clone();
                 envelope["unmatched"] = json!(!held);
+                // This operator-only path has authenticated the linked sender.
+                envelope["via"] = json!(from.name);
                 let outcome = Store::open(&home).and_then(|store| {
                     crate::mail::deliver_with_provenance(&store, &envelope, &provenance)
                 });
@@ -3779,6 +3783,9 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
     ("machine.desk.commit", &["proposal_id", "manifest_hash"]),
     ("machine.desk.status", &[]),
     ("machine.desk.home.plan", &["home", "ship", "operation"]),
+    ("machine.desk.legacy.plan", &["source"]),
+    ("machine.desk.legacy.apply", &["source", "digest", "reason"]),
+    ("machine.desk.legacy.revoke", &["source", "reason"]),
     (
         "machine.desk.home.release",
         &["home", "ship", "digest", "reason"],
@@ -3808,8 +3815,17 @@ pub fn desk_home_plan(args: &Value) -> Result<Value> {
     desk_intake::release::dispatch(&Caller::Operator, "machine.desk.home.plan", args)
 }
 
+/// Standalone read-only source cut planning, including for agents.
+pub fn desk_legacy_plan(args: &Value) -> Result<Value> {
+    crate::check_args("machine.desk.legacy.plan", args)?;
+    desk_intake::legacy::dispatch(&Caller::Operator, "machine.desk.legacy.plan", args)
+}
+
 /// The `machine.*` JSON commands, for the operator.
 pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
+    if command.starts_with("machine.desk.legacy.") {
+        return desk_intake::legacy::dispatch(store.caller(), command, &args);
+    }
     if command.starts_with("machine.desk.home.") {
         return desk_intake::release::dispatch(store.caller(), command, &args);
     }

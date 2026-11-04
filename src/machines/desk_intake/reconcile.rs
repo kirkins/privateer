@@ -13,11 +13,11 @@ mod tests;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct HomeProof {
-    home: String,
+    pub(super) home: String,
     retired: bool,
-    state: String,
-    mailbox: Option<String>,
-    nonce: Option<String>,
+    pub(super) state: String,
+    pub(super) mailbox: Option<String>,
+    pub(super) nonce: Option<String>,
     baseline_upper: Option<i64>,
     delta_upper: Option<i64>,
     unread: Option<i64>,
@@ -38,9 +38,9 @@ pub(super) struct Proof {
     source_upper: i64,
     inventory: String,
     membership_history_gap: bool,
-    membership_proved: bool,
+    pub(super) membership_proved: bool,
     history_proved: bool,
-    homes: Vec<HomeProof>,
+    pub(super) homes: Vec<HomeProof>,
 }
 #[cfg(test)]
 thread_local! {
@@ -60,6 +60,8 @@ fn home_proof(
     proof: &mut HomeProof,
     deadline: Instant,
     counts: bool,
+    legacy: Option<&legacy::HomeCut>,
+    ignore_pins: bool,
 ) -> Result<()> {
     crate::store::reject_symlinks(path)?;
     let db = path.join("privateer.sqlite");
@@ -118,14 +120,8 @@ fn home_proof(
     // setup; missing schema fails closed rather than scanning mail on contact.
     // Enrolled payload pins can outlive history.prune: only extant mail blocks
     // proof, so resolving the pin OR deleting the mail heals this obstacle.
-    let unresolved: bool = read.query_row(
-        "SELECT EXISTS(SELECT 1 FROM mail_source_origin AS origin INDEXED BY mail_source_origin_unresolved
-         WHERE provenance IN ('\"Unresolved\"','\"Local\"')
-         AND EXISTS(SELECT 1 FROM mail WHERE mail.id=origin.id))",
-        [],
-        |r| r.get(0),
-    )?;
-    if unresolved {
+    let legacy = legacy.filter(|cut| cut.mailbox == proof.mailbox && cut.nonce == proof.nonce);
+    if !ignore_pins && legacy::blocked(&read, legacy)? {
         proof.state = "unresolved".into();
         return Ok(());
     }
@@ -197,7 +193,31 @@ fn inspect_with_missing(
     participant(m, source)?;
     let _budget = transport::Budget::new(conn, deadline)?;
     let read = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
-    let conn = &read;
+    inspect_snapshot(&read, m, source, skipped, deadline, false)
+}
+
+pub(super) fn inspect_legacy(
+    conn: &Connection,
+    m: &Manifest,
+    source: &str,
+    deadline: Instant,
+) -> Result<Proof> {
+    Ok(inspect_snapshot(conn, m, source, &[], deadline, true)?.0)
+}
+
+fn inspect_snapshot(
+    conn: &Connection,
+    m: &Manifest,
+    source: &str,
+    skipped: &[std::path::PathBuf],
+    deadline: Instant,
+    ignore_pins: bool,
+) -> Result<(Proof, Vec<std::path::PathBuf>)> {
+    let cut = if ignore_pins {
+        None
+    } else {
+        legacy::load(conn, m, source)?
+    };
     let census = home::census_until(conn, skipped, Some(deadline))?;
     let inventory = crate::core::hash(&json!(
         census
@@ -235,7 +255,18 @@ fn inspect_with_missing(
             proof.facts_cached = proof.unread.is_some() || proof.open.is_some();
         }
         if home.state == "retained" {
-            if let Err(error) = home_proof(&home.path, &bound, &mut proof, deadline, true) {
+            if let Err(error) = home_proof(
+                &home.path,
+                &bound,
+                &mut proof,
+                deadline,
+                true,
+                legacy::home_cut(
+                    cut.as_ref().map(|(_, c)| c),
+                    &crate::core::hash(&json!(home.path)),
+                ),
+                ignore_pins,
+            ) {
                 proof.state = if error.to_string().starts_with("integrity_gap") {
                     "integrity_gap"
                 } else if error.to_string().starts_with("stale_generation") {
@@ -267,7 +298,13 @@ fn inspect_with_missing(
     // advertise the same name as an authorized participant. Check both core
     // membership and the ship's participant binding, as on desk status reads.
     let topology_proved = super::completion::topology_proved(conn, m)?;
-    let unresolved: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_home_receipt WHERE domain=?1 AND source=?2 AND (json_extract(event,'$.provenance') IN ('Unresolved','Local'))) OR EXISTS(SELECT 1 FROM desk_home_copy WHERE domain=?1 AND source=?2)", params![m.domain, source], |r| r.get(0))?;
+    let unresolved_origin = legacy::unresolved(conn, m, source)?;
+    let unresolved = unresolved_origin
+        || conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM desk_home_copy WHERE domain=?1 AND source=?2)",
+            params![m.domain, source],
+            |r| r.get::<_, bool>(0),
+        )?;
     // Imported home pointers cannot discharge registry-side loss (for
     // example a mismatched reclamation receipt). All retained gap kinds
     // remain conservative until explicit reconciliation proves them healed.
@@ -278,18 +315,15 @@ fn inspect_with_missing(
     )?;
     let membership_proved = !census.membership_history_gap && local == expected && topology_proved;
     let (copies, copies_complete) = super::proof::copies(conn, m, source)?;
-    let unresolved_origin: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_home_receipt WHERE domain=?1 AND source=?2 AND json_extract(event,'$.provenance') IN ('Unresolved','Local'))", params![m.domain,source], |r| r.get(0))?;
-    let loss: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM desk_intake_loss WHERE domain=?1 AND source=?2)",
-        params![m.domain, source],
-        |r| r.get(0),
-    )?;
+    let loss = !legacy::loss_clear(conn, m, source)?;
+    let integrity: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_gap WHERE domain=?1 AND source=?2 AND state='integrity_gap')", params![m.domain,source], |r|r.get(0))?;
     let registry_stamp = super::proof::registry_stamp(conn, m, source)?;
     Ok((
         Proof {
             candidate: registry_stamp.is_some()
                 && membership_proved
                 && !loss
+                && !integrity
                 && !unresolved_origin
                 && copies_complete
                 && homes.iter().all(accepted_home),
@@ -378,6 +412,7 @@ pub(super) fn revalidate_step(
         return Ok((false, 0));
     }
     let bound = format!("{}:{source}", binding(m)?);
+    let cut = legacy::load(conn, m, source)?;
     for (index, ((path, active), old)) in paths.into_iter().zip(&p.homes).enumerate().skip(start) {
         #[cfg(test)]
         let exhausted =
@@ -400,7 +435,17 @@ pub(super) fn revalidate_step(
             continue;
         }
         let mut new = old.clone();
-        if home_proof(Path::new(&path), &bound, &mut new, deadline, false).is_err() {
+        if home_proof(
+            Path::new(&path),
+            &bound,
+            &mut new,
+            deadline,
+            false,
+            legacy::home_cut(cut.as_ref().map(|(_, c)| c), &old.home),
+            false,
+        )
+        .is_err()
+        {
             return Ok((
                 false,
                 if source::work_now() >= deadline {

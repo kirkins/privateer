@@ -76,6 +76,34 @@ fn send(h: &mut Store, id: &str) {
 }
 
 #[test]
+fn v2_peer_rejects_v3_evidence_sidecar() {
+    // Exact v2 evidence field set/parser policy; its optional sidecar decoder
+    // ignores an Err rather than rejecting the strict intake frame.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct V2Evidence {
+        #[serde(rename = "version")]
+        _version: u8,
+        #[serde(rename = "checkpoint")]
+        _checkpoint: Checkpoint,
+        #[serde(rename = "vector")]
+        _vector: reconcile::Proof,
+        #[serde(rename = "valid")]
+        _valid: bool,
+    }
+    let (_dir, r, h, m) = setup();
+    capture(&h, &r, &m);
+    let (_, e) = issued(&r, &m);
+    let wire = json!(e.unwrap());
+    assert_eq!(wire["version"], 3);
+    assert!(serde_json::from_value::<V2Evidence>(wire.clone()).is_err());
+    let mut v2 = wire.clone();
+    v2.as_object_mut().unwrap().remove("cut_digest");
+    v2["version"] = json!(2);
+    assert!(serde_json::from_value::<V2Evidence>(v2).is_ok());
+}
+
+#[test]
 fn vector_is_barrier_bound_replayable_and_read_only_without_claiming_completion() {
     let (dir, r, mut h, m) = setup();
     send(&mut h, "old-open");

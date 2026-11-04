@@ -3517,9 +3517,10 @@ fn deliver_inner(store: &Store, args: &Value, provenance: &source::Provenance) -
             now,
             matches!(kind, "request" | "decision").then_some("open"),
             because_of,
-            // Only the runtime names the delivering machine: the gateway keeps
-            // `via` only for a machine linked to it, and collect stamps it.
-            via.filter(|_| from == CAPTAIN)
+            // Only operator dispatch carries runtime-authenticated identity:
+            // the gateway strips unlinked claims, and collect stamps it.
+            // A local agent's envelope is not provenance.
+            via.filter(|_| matches!(store.caller(), Caller::Operator))
         ],
     )?;
     audit_captain_send(
