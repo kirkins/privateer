@@ -4,6 +4,8 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import copy
 import hashlib
+import importlib.util
+import io
 import json
 import multiprocessing
 import os
@@ -15,6 +17,7 @@ import sys
 import subprocess
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 import uuid
 from unittest.mock import patch
@@ -1118,6 +1121,10 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
 
 
 class ReceiptTests(unittest.TestCase):
+    # Captured from the real 0.166.0 B4 loopback probe, not invented fields.
+    native_events = [json.loads(line)["payload"] for line in
+                     (ROOT / "tests/fixtures/codex-queue-accepted.jsonl").read_text().splitlines()]
+    client_id = native_events[1]["client_id"]
     setUp = BindingTests.setUp
     bind_current = BindingTests.bind_current
 
@@ -1147,10 +1154,51 @@ class ReceiptTests(unittest.TestCase):
         return self.ledger.reconcile(self.session, self.nonce,
             queue if queue is not None else {"data": [], "nextCursor": None}, ack, failure)
 
+    def native_input(self, body=None):
+        return {**copy.deepcopy(self.native_events[1]), "message": self.body if body is None else body}
+
     def promote(self):
-        self.append({"type": "task_started", "turn_id": "alpha-turn", "started_at": 123},
-                    {"type": "user_message", "message": self.body, "client_id": "alpha-client"},
+        self.append({"type": "task_started", "turn_id": "alpha-turn", "started_at": 123,
+                     "turn_attribution": {"turn_trigger": "queue"}},
+                    self.native_input(),
                     {"type": "task_complete", "turn_id": "alpha-turn"})
+
+    def test_captured_native_queue_record_settles_anchored_receipt(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        events = copy.deepcopy(self.native_events)
+        events[1]["message"] = self.body  # only substitute the per-test mail body
+        self.append(*events)
+        result = self.reconcile()
+        self.assertEqual(result["state"], "presented")
+        self.assertEqual(result["evidence"]["receipt"], {"turn_id": events[0]["turn_id"],
+                                                        "client_id": events[1]["client_id"]})
+        self.assertNotIn("turn_id", events[1])
+        self.assertEqual(result["accepted_through"], 4)
+        self.assertEqual(result["acknowledged_through"], 0)
+
+    def test_unqualified_native_input_shape_pauses_with_clear_reason(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        original = self.transcript.read_bytes()
+        good = self.native_input()
+        missing = {key: value for key, value in good.items() if key != "images"}
+        alias = {key: value for key, value in good.items() if key != "client_id"}
+        alias["clientId"] = self.client_id
+        for event in (missing, alias, {**good, "client_id": None}, {**good, "client_id": "alpha"},
+                      {**good, "turn_id": "alpha"}, {**good, "audio": ["alpha"]},
+                      {**good, "text_elements": None}):
+            with self.subTest(event=event):
+                self.transcript.write_bytes(original)
+                self.append({"type": "task_started", "turn_id": "alpha-turn"}, event)
+                result = self.reconcile()
+                self.assertTrue(result["paused"])
+                self.assertEqual(result["state"], "uncertain")
+                self.assertIn("user_message schema unqualified", result["evidence"]["pause_reason"])
+                self.assertEqual(result["accepted_through"], 0)
+        self.transcript.write_bytes(original)
+        self.promote()
+        self.assertEqual(self.reconcile()["state"], "presented")
 
     def test_lost_response_recovers_from_anchored_promotion_without_cli_receipt(self):
         self.intent()
@@ -1160,7 +1208,7 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(result["state"], "presented")
         self.assertEqual(result["accepted_through"], 4)
         self.assertEqual(result["acknowledged_through"], 0)
-        self.assertEqual(result["evidence"]["receipt"], {"turn_id": "alpha-turn", "client_id": "alpha-client"})
+        self.assertEqual(result["evidence"]["receipt"], {"turn_id": "alpha-turn", "client_id": self.client_id})
         # New process and same UUID: durable receipt despite unacknowledged mail.
         self.ledger = receipts.Ledger(self.registry, self.record["home"], "alpha")
         self.assertEqual(self.reconcile()["accepted_through"], 4)
@@ -1170,13 +1218,98 @@ class ReceiptTests(unittest.TestCase):
     def test_queue_presence_is_admission_not_presentation_or_ack(self):
         self.intent()
         self.ledger.invoking(self.session, self.nonce)
-        queue = {"data": [{"id": "alpha-queue", "clientUserMessageId": "alpha-client", "input": [
+        queue = {"data": [{"id": "alpha-queue", "clientUserMessageId": self.client_id, "input": [
             {"type": "text", "text": self.body, "text_elements": []}]}], "nextCursor": "more"}
         result = self.reconcile(queue)
         self.assertEqual(result["state"], "queued")
         self.assertEqual(result["accepted_through"], 0)
         self.promote()
         self.assertEqual(self.reconcile()["state"], "presented")
+
+    def test_queue_and_promotion_ids_are_independent_including_b4_recovery(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                self.intent(after=4 if legacy else 0, through=8 if legacy else 4)
+                self.ledger.invoking(self.session, self.nonce)
+                queue_client = str(uuid.uuid4())
+                queue = {"data": [{"id": "alpha-queue", "clientUserMessageId": queue_client, "input": [
+                    {"type": "text", "text": self.body, "text_elements": []}]}], "nextCursor": None}
+                self.assertEqual(self.reconcile(queue)["evidence"]["queue_client_id"], queue_client)
+                if legacy:
+                    value = self.ledger.read()
+                    offer = value["sessions"][self.session]["intent"]
+                    offer["client_id"] = offer.pop("queue_client_id")
+                    binding.atomic(self.ledger.path, value)
+                    migrated = self.reconcile(queue)["evidence"]
+                    self.assertEqual(migrated["queue_client_id"], queue_client)
+                    self.assertNotIn("client_id", migrated)
+                # Persisted fact still guards against queue-to-queue ID changes.
+                changed = copy.deepcopy(queue)
+                changed["data"][0]["clientUserMessageId"] = str(uuid.uuid4())
+                self.assertEqual(self.reconcile(changed)["state"], "uncertain")
+                self.promote()
+                self.ledger = receipts.Ledger(self.registry, self.record["home"], "alpha")
+                result = self.reconcile(queue)
+                self.assertEqual(result["state"], "presented")
+                self.assertEqual(result["evidence"]["queue_client_id"], queue_client)
+                self.assertEqual(result["evidence"]["receipt"]["client_id"], self.client_id)
+                self.assertNotEqual(queue_client, self.client_id)
+                self.assertEqual(result["acknowledged_through"], 0)
+                self.assertFalse(result["paused"])
+
+    def test_noncanonical_queue_client_id_is_not_admission_evidence(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        queue = {"data": [{"id": "alpha-queue", "clientUserMessageId": "not-a-uuid", "input": [
+            {"type": "text", "text": self.body, "text_elements": []}]}], "nextCursor": None}
+        result = self.reconcile(queue)
+        self.assertEqual(result["state"], "uncertain")
+        self.assertEqual(result["accepted_through"], 0)
+        self.assertNotIn("queue_client_id", result["evidence"])
+
+    def test_receipt_requires_queue_trigger_on_its_open_turn(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        original = self.transcript.read_bytes()
+        for attribution in (None, {}, {"turn_trigger": "user"}, "queue"):
+            with self.subTest(attribution=attribution):
+                self.transcript.write_bytes(original)
+                self.append({"type": "task_started", "turn_id": "alpha-turn",
+                             "turn_attribution": attribution}, self.native_input())
+                result = self.reconcile()
+                self.assertEqual(result["state"], "uncertain")
+                self.assertEqual(result["accepted_through"], 0)
+                self.assertIsNotNone(result["diagnostic"])
+        self.transcript.write_bytes(original)
+        self.promote()
+        self.assertEqual(self.reconcile()["state"], "presented")
+
+    def test_mid_turn_trigger_and_old_checkpoint_recovery(self):
+        self.intent()
+        self.reconcile(ack=4)
+        baseline = self.ledger.read()
+        original = self.transcript.read_bytes()
+        for trigger, legacy in (("user", False), ("user", True), ("queue", True)):
+            with self.subTest(trigger=trigger, legacy=legacy):
+                binding.atomic(self.ledger.path, baseline)
+                self.transcript.write_bytes(original)
+                self.append({"type": "task_started", "turn_id": "mid-turn",
+                             "turn_attribution": {"turn_trigger": trigger}})
+                offer = self.intent(after=4, through=8)
+                self.assertEqual(offer["scan"]["open_turn_trigger"], trigger)
+                self.ledger.invoking(self.session, self.nonce)
+                self.reconcile()  # checkpoint in the middle of this turn
+                if legacy:
+                    value = self.ledger.read()
+                    intent = value["sessions"][self.session]["intent"]
+                    del intent["open_turn_trigger"]
+                    intent["scan"].pop("open_turn_trigger", None)
+                    binding.atomic(self.ledger.path, value)
+                self.append(self.native_input())
+                self.ledger = receipts.Ledger(self.registry, self.record["home"], "alpha")
+                result = self.reconcile()
+                self.assertEqual(result["state"], "presented" if trigger == "queue" else "uncertain")
+                self.assertEqual(result["accepted_through"], 8 if trigger == "queue" else 4)
 
     def test_no_evidence_never_proves_rejection_and_ack_self_heals(self):
         self.intent()
@@ -1278,9 +1411,9 @@ class ReceiptTests(unittest.TestCase):
         self.intent()
         self.ledger.invoking(self.session, self.nonce)
         self.append({"type": "task_started", "turn_id": "alpha-turn"},
-                    {"type": "user_message", "message": self.body + "quoted", "client_id": "alpha"},
+                    self.native_input(self.body + "quoted"),
                     {"type": "task_complete", "turn_id": "alpha-turn"},
-                    {"type": "user_message", "message": self.body, "client_id": "alpha"})
+                    self.native_input())
         result = self.reconcile()
         self.assertTrue(result["paused"])
         self.assertEqual(result["accepted_through"], 0)
@@ -1292,7 +1425,8 @@ class ReceiptTests(unittest.TestCase):
         # Place receipt beyond two bounded scans, then more than any tail window.
         filler = {"type": "agent_message", "message": "x" * 3000}
         self.append(*([filler] * 750))
-        self.append({"type": "task_started", "turn_id": "alpha-turn"})
+        self.append({"type": "task_started", "turn_id": "alpha-turn",
+                     "turn_attribution": {"turn_trigger": "queue"}})
         result = self.reconcile()
         self.assertLessEqual(result["evidence"]["scan"]["offset"] - original["scan"]["offset"], receipts.LIMIT)
         self.assertFalse(result["evidence"]["scan_caught_up"])
@@ -1300,7 +1434,7 @@ class ReceiptTests(unittest.TestCase):
         result = self.reconcile()
         self.assertEqual(result["evidence"]["open_turn"], "alpha-turn")
         offset = result["evidence"]["scan"]["offset"]
-        line = json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": self.body, "client_id": "alpha-client"}})
+        line = json.dumps({"type": "event_msg", "payload": self.native_input()})
         with self.transcript.open("a") as stream:
             stream.write(line[:30])
         self.assertEqual(self.reconcile()["evidence"]["scan"]["offset"], offset)
@@ -1539,9 +1673,10 @@ class ReceiptTests(unittest.TestCase):
         self.assertNotIn(hashes[0], saved["nonce_digests"])
         self.assertTrue(all(receipts.seen_nonce(saved, h) for h in hashes))
         body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, old_nonce, 4, 8))
-        with self.assertRaisesRegex(ValueError, "nonce reused"):
+        with self.assertRaises(receipts.NonceFilterClosed) as closed:
             receipts.Ledger(self.registry, self.record["home"], "alpha").prepare(
                 self.offer_record, body, 4, 8, old_nonce)
+        self.assertEqual(closed.exception.diagnostic["kind"], "nonce_filter_possible_reuse")
         # Saturation safely rejects; corrupt filters fail closed as well.
         for filter_value in ("f" * (receipts.NONCE_FILTER_BITS // 4), "bad"):
             value = self.ledger.read()
@@ -1551,6 +1686,89 @@ class ReceiptTests(unittest.TestCase):
             body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, nonce, 4, 8))
             with self.assertRaises(ValueError):
                 self.ledger.prepare(self.offer_record, body, 4, 8, nonce)
+
+    def test_filter_collision_and_capacity_have_distinct_closed_diagnostics(self):
+        self.intent()
+        self.reconcile(ack=4)
+        value = self.ledger.read()
+        nonce = str(uuid.uuid4())
+        body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, nonce, 4, 8))
+        bits = sum(1 << bit for bit in set(receipts.nonce_bits(receipts.digest(nonce.encode()))))
+        state = value["sessions"][self.session]
+        # Force a false positive for a never-used nonce, not exact reuse.
+        state["nonce_filter"] = format(bits, f"0{receipts.NONCE_FILTER_BITS // 4}x")
+        for saturated in (False, True):
+            if saturated:
+                # Avoid a random Bloom match obscuring the saturation case.
+                excluded = receipts.nonce_bits(receipts.digest(nonce.encode()))[0]
+                threshold_bits = (1 << (receipts.NONCE_FILTER_BITS // 4 + 1)) - 1
+                threshold_bits &= ~(1 << excluded) if excluded < receipts.NONCE_FILTER_BITS // 4 + 1 else ~1
+                state["nonce_filter"] = format(threshold_bits, f"0{receipts.NONCE_FILTER_BITS // 4}x")
+            binding.atomic(self.ledger.path, value)
+            before = self.ledger.path.read_bytes()
+            with self.assertRaises(receipts.NonceFilterClosed) as closed:
+                self.ledger.prepare(self.offer_record, body, 4, 8, nonce)
+            diag = closed.exception.diagnostic
+            self.assertEqual(diag["kind"], "nonce_filter_saturated" if saturated else "nonce_filter_possible_reuse")
+            self.assertEqual(diag["session"], self.session)
+            self.assertEqual(diag["fill_ratio"], 0.25 if saturated else len(set(receipts.nonce_bits(receipts.digest(nonce.encode())))) / receipts.NONCE_FILTER_BITS)
+            self.assertIn("do not resample", diag["next"])
+            self.assertEqual(self.ledger.path.read_bytes(), before)
+
+    def test_other_session_saturation_keeps_reuse_checks_without_project_stall(self):
+        self.intent()
+        self.reconcile(ack=4)
+        other = str(uuid.uuid4())
+        nonce = str(uuid.uuid4())
+        target_bits = receipts.nonce_bits(receipts.digest(nonce.encode()))
+        # Exactly 25% fill, but a definite negative for this new nonce.
+        bits = (1 << (receipts.NONCE_FILTER_BITS // 4 + 1)) - 1
+        bits &= ~(1 << target_bits[0]) if target_bits[0] < receipts.NONCE_FILTER_BITS // 4 + 1 else ~1
+        value = self.ledger.read()
+        value["sessions"][other] = {"accepted_through": 7, "acknowledged_through": 3,
+            "nonce_digests": [], "nonce_filter": format(bits, f"0{receipts.NONCE_FILTER_BITS // 4}x")}
+        binding.atomic(self.ledger.path, value)
+        body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, nonce, 4, 8))
+        self.ledger.prepare(self.offer_record, body, 4, 8, nonce)
+        self.nonce = nonce
+        self.reconcile(ack=8)
+        saved = self.ledger.read()
+        self.assertEqual(saved["sessions"][other], value["sessions"][other])
+        # The saturated session itself still refuses new inserts. No UUID
+        # switching is performed by the adapter to evade this backpressure.
+        with self.assertRaises(receipts.NonceFilterClosed) as closed:
+            receipts.check_nonce(saved["sessions"], str(uuid.uuid4()), other)
+        self.assertEqual(closed.exception.diagnostic["kind"], "nonce_filter_saturated")
+        # The very same filter remains useful for cross-session reuse checks.
+        reused = str(uuid.uuid4())
+        for bit in receipts.nonce_bits(receipts.digest(reused.encode())):
+            bits |= 1 << bit
+        saved["sessions"][other]["nonce_filter"] = format(bits, f"0{receipts.NONCE_FILTER_BITS // 4}x")
+        binding.atomic(self.ledger.path, saved)
+        before = self.ledger.path.read_bytes()
+        body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, reused, 8, 12))
+        with self.assertRaises(receipts.NonceFilterClosed) as closed:
+            self.ledger.prepare(self.offer_record, body, 8, 12, reused)
+        self.assertEqual(closed.exception.diagnostic["kind"], "nonce_filter_possible_reuse")
+        self.assertEqual(self.ledger.path.read_bytes(), before)
+        self.assertEqual(self.ledger.read()["sessions"][self.session]["accepted_through"], 8)
+
+    def test_never_spawned_rejections_do_not_consume_admission_filter(self):
+        # Exceed both the exact window and the cumulative body cap. Reduce the
+        # window only, leaving real filter size/capacity intact.
+        with patch.object(receipts, "MAX_NONCE_DIGESTS", 8):
+            for _ in range(33):
+                self.intent(padding=300000)
+                self.ledger.invoking(self.session, self.nonce)
+                self.reconcile(failure=True)
+            self.intent()
+        state = self.ledger.read()["sessions"][self.session]
+        self.assertEqual(state["rejected_count"], 33)
+        self.assertEqual(len(state["rejected_nonce_digests"]), 8)
+        self.assertNotIn("nonce_filter", state)
+        self.assertNotIn("nonce_digests", state)
+        self.assertLess(self.ledger.path.stat().st_size, 20000)
+        self.assertEqual(state["accepted_through"], 0)
 
     def test_old_abandon_audit_migration_preserves_range_hash_and_unresolved(self):
         self.intent()
@@ -1611,6 +1829,57 @@ class ReceiptTests(unittest.TestCase):
         item = {"id": "alpha", "clientUserMessageId": "alpha-client", "input": [
             {"type": "text", "text": self.body, "text_elements": []}]}
         self.assertTrue(self.reconcile({"data": [item, item], "nextCursor": None})["paused"])
+
+
+class QueueFixtureHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location("queue_fixture", ROOT / "scripts/codex-queue-spike.py")
+        cls.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.module)
+
+    def fixture(self):
+        fixture = self.module.Fixture.__new__(self.module.Fixture)
+        fixture.calls = []
+        fixture.allow_body = "fixture-only-notification"
+        fixture.server = SimpleNamespace(server_port=12345)
+        return fixture
+
+    def handler(self, data=b'{"input":"fixture-only-notification"}'):
+        statuses = []
+        return SimpleNamespace(path="/v1/responses", client_address=("127.0.0.1", 1),
+            headers={"Host": "127.0.0.1:12345", "Content-Length": str(len(data))}, command="POST",
+            rfile=io.BytesIO(data), wfile=io.BytesIO(), send_response=statuses.append,
+            send_header=lambda *args: None, end_headers=lambda: None, statuses=statuses)
+
+    def test_invalid_requests_record_violation_and_return_500_without_thread_assertion(self):
+        for kind in ("count", "peer", "host", "path", "method", "size", "oversize", "json", "body"):
+            with self.subTest(kind=kind):
+                fixture, handler = self.fixture(), self.handler()
+                if kind == "count":
+                    fixture.calls.append({"violation": "earlier request"})
+                elif kind == "peer":
+                    handler.client_address = ("192.0.2.1", 1)
+                elif kind in ("path", "method"):
+                    setattr(handler, "path" if kind == "path" else "command", "unexpected")
+                elif kind == "host":
+                    handler.headers["Host"] = "unexpected"
+                elif kind in ("size", "oversize"):
+                    handler.headers["Content-Length"] = "invalid" if kind == "size" else str((1 << 20) + 1)
+                elif kind in ("json", "body"):
+                    handler = self.handler(b"not-json" if kind == "json" else b"{}")
+                fixture.mock_request(handler)
+                self.assertEqual(handler.statuses, [500])
+                self.assertIn("violation", fixture.calls[-1])
+                with self.assertRaises(AssertionError):
+                    fixture.check_calls()
+
+    def test_one_permitted_loopback_request_returns_terminal_response(self):
+        fixture, handler = self.fixture(), self.handler()
+        fixture.mock_request(handler)
+        self.assertEqual(handler.statuses, [200])
+        self.assertIn(b"response.completed", handler.wfile.getvalue())
+        fixture.check_calls()
 
 
 if __name__ == "__main__":

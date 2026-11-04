@@ -21,6 +21,7 @@ MAX_LEDGER = 8 * LIMIT
 MAX_SESSIONS = 128
 MAX_NONCE_DIGESTS = 256
 NONCE_FILTER_BITS = 65536
+NONCE_FILTER_MAX_FILL = 0.25
 FINAL = {"presented", "acked", "rejected", "abandoned", "operator_presented"}
 
 
@@ -57,10 +58,39 @@ def remember_nonces(state, additions):
     state["nonce_digests"] = hashes[-MAX_NONCE_DIGESTS:]
 
 
+class NonceFilterClosed(ValueError):
+    """Capacity/collision backpressure, not positive proof of nonce reuse."""
+    def __init__(self, kind, session, fill):
+        self.diagnostic = {"kind": kind, "session": session, "fill_ratio": fill,
+                           "filter_bits": NONCE_FILTER_BITS, "max_fill_ratio": NONCE_FILTER_MAX_FILL,
+                           "next": "Pause offers; do not resample nonces or retry on a timer. Operator capacity review required."}
+        super().__init__(encode(self.diagnostic))
+
+
 def seen_nonce(state, nonce_hash):
+    # Compatibility helper for offline inspection; a positive filter test is
+    # only possible reuse, NEVER the exact-reuse diagnostic used by prepare.
     return (nonce_hash in state.get("nonce_digests", [])
+            or nonce_hash in state.get("rejected_nonce_digests", [])
             or ("nonce_filter" in state and all(nonce_filter(state) & (1 << bit)
                                                for bit in nonce_bits(nonce_hash))))
+
+
+def check_nonce(sessions, nonce, target_session):
+    nonce_hash = digest(nonce.encode())
+    for state in sessions.values():
+        if (nonce_hash in state.get("nonce_digests", [])
+                or nonce_hash in state.get("rejected_nonce_digests", [])
+                or any(nonce == offer.get("nonce")
+                       for offer in [state.get("intent", {}), *state.get("history", [])])):
+            raise ValueError("receipt nonce reused")
+    for session, state in sessions.items():
+        bits = nonce_filter(state)
+        fill = bin(bits).count("1") / NONCE_FILTER_BITS
+        if session == target_session and fill >= NONCE_FILTER_MAX_FILL:
+            raise NonceFilterClosed("nonce_filter_saturated", session, fill)
+        if all(bits & (1 << bit) for bit in nonce_bits(nonce_hash)):
+            raise NonceFilterClosed("nonce_filter_possible_reuse", session, fill)
 
 
 def exact_uuid(value):
@@ -143,12 +173,14 @@ def open_turn_at(stream, offset):
                 turn = event.get("turn_id")
                 if not isinstance(turn, str) or not turn:
                     raise ValueError("native anchor lifecycle lacks turn ID")
-                return turn if kind == "task_started" else None
+                attribution = event.get("turn_attribution")
+                trigger = attribution.get("turn_trigger") if isinstance(attribution, dict) else None
+                return (turn, trigger) if kind == "task_started" else (None, None)
             if kind in ("context_compacted", "thread_rolled_back", "turn_started", "turn_complete"):
                 raise ValueError("native anchor lifecycle/schema needs reconciliation")
     if position:
         raise ValueError("native open-turn anchor exceeds lookup budget")
-    return None
+    return None, None
 
 
 def anchor(binding, cwd):
@@ -165,9 +197,32 @@ def anchor(binding, cwd):
             raise ValueError("receipt anchor has an incomplete native record")
         if binding.get("transcript_identity") != {"device": info.st_dev, "inode": info.st_ino}:
             raise ValueError("binding rollout identity changed")
+        turn, trigger = open_turn_at(stream, offset)
         return {"path": path, "device": info.st_dev, "inode": info.st_ino,
                 "offset": offset, "meta_hash": meta, "boundary_hash": checkpoint(stream, offset),
-                "open_turn": open_turn_at(stream, offset)}
+                "open_turn": turn, "open_turn_trigger": trigger}
+
+
+class NativeInputUnqualified(ValueError):
+    def __init__(self):
+        super().__init__("native text-only user_message schema unqualified; idle mail paused")
+
+
+def native_client(event):
+    """Observed 0.166.0 text-only queue input, B4 loopback fixture.
+
+    No turn_id is persisted on this event: association comes ONLY from the
+    anchored lifecycle. Refuse aliases/multimedia/unknown shape, not guesses.
+    """
+    arrays = {"images", "local_images", "audio", "local_audio", "text_elements"}
+    if (set(event) != {"type", "client_id", "message", *arrays}
+            or event.get("type") != "user_message" or not isinstance(event.get("message"), str)
+            or any(event.get(key) != [] for key in arrays)):
+        raise NativeInputUnqualified()
+    try:
+        return exact_uuid(event.get("client_id"))
+    except ValueError:
+        raise NativeInputUnqualified() from None
 
 
 def scan(intent, session, cwd):
@@ -175,8 +230,9 @@ def scan(intent, session, cwd):
 
     task_started/task_complete are the native v1 rollout spellings on 0.166.
     A user_message has no turn_id; associate it only with the unambiguous open
-    task_started in this same anchored stream. Assistant/response_item text and
-    mere turn-start/queue removal are never presentation evidence.
+    queue-triggered task_started in this same anchored stream. Queue and
+    promoted client IDs are separate facts; equality is unqualified.
+    Assistant/response_item text and queue removal are never presentation evidence.
     """
     a = intent["scan"]
     stream, info, meta = open_rollout(a["path"], session, cwd)
@@ -185,10 +241,10 @@ def scan(intent, session, cwd):
                 or info.st_size < a["offset"] or meta != a["meta_hash"]
                 or checkpoint(stream, a["offset"]) != a["boundary_hash"]):
             raise ValueError("receipt anchor lost: replacement, truncation or rewrite")
-        # B2 anchors lacked the lifecycle seed. Recover it from the validated
-        # saved boundary, never from today's EOF or by ignoring a terminal.
-        if "open_turn" not in intent:
-            intent["open_turn"] = a.get("open_turn") if "open_turn" in a else open_turn_at(stream, a["offset"])
+        # Older checkpoints lack trigger provenance. Recover BOTH facts at
+        # the validated scan boundary, never infer queue origin from the body.
+        if "open_turn" not in intent or "open_turn_trigger" not in intent:
+            intent["open_turn"], intent["open_turn_trigger"] = open_turn_at(stream, a["offset"])
         stream.seek(a["offset"])
         data = stream.read(LIMIT)
         complete = data.rfind(b"\n") + 1
@@ -209,17 +265,21 @@ def scan(intent, session, cwd):
                 if not isinstance(turn, str) or not turn or intent.get("open_turn"):
                     raise ValueError("ambiguous native turn association")
                 intent["open_turn"] = turn
+                attribution = event.get("turn_attribution")
+                intent["open_turn_trigger"] = (attribution.get("turn_trigger")
+                                               if isinstance(attribution, dict) else None)
             elif kind in ("task_complete", "turn_aborted"):
                 if event.get("turn_id") != intent.get("open_turn"):
                     raise ValueError("native terminal turn mismatch")
                 intent["open_turn"] = None
+                intent["open_turn_trigger"] = None
             elif kind == "user_message" and event.get("message") == intent["body"]:
                 turn = intent.get("open_turn")
-                client = event.get("client_id")
-                if not turn or not isinstance(client, str) or not client:
-                    raise ValueError("native mail input lacks turn/client association")
-                if intent.get("client_id") not in (None, client):
-                    raise ValueError("native mail client ID mismatch")
+                client = native_client(event)
+                if not turn:
+                    raise ValueError("native mail input lacks open-turn association")
+                if intent.get("open_turn_trigger") != "queue":
+                    raise ValueError("native mail input lacks queue-triggered turn association")
                 receipt = {"turn_id": turn, "client_id": client}
                 if intent.get("receipt") not in (None, receipt):
                     raise ValueError("duplicate native mail promotion")
@@ -257,8 +317,10 @@ class Ledger:
 
     Watermarks and nonce digests survive explicit same-UUID restart. Historical
     settled bodies are pruned; operator audits survive. Recent exact nonce
-    digests plus a bounded non-deleting filter refuse reuse, even after eviction
-    from the exact window. False positives and pinned facts apply backpressure.
+    digests plus a bounded non-deleting filter refuse possible admission-nonce
+    reuse, even after eviction from the exact window. Never-spawned rejections
+    use a separate counter/recent exact window. Filter capacity/collisions and
+    pinned facts apply explicit backpressure.
     The project directory and lock are shared with binding transactions.
     """
     def __init__(self, registry, home, ship):
@@ -291,7 +353,15 @@ class Ledger:
                            or (offer["state"] in FINAL
                                and offer["through_seq"] <= state["accepted_through"]))
                 if settled:
-                    hashes.append(digest(exact_uuid(offer["nonce"]).encode()))
+                    nonce_hash = digest(exact_uuid(offer["nonce"]).encode())
+                    if offer["state"] == "rejected":
+                        # Proven exec failure: no native request ever existed.
+                        # Do not consume the non-deleting admission filter.
+                        state["rejected_count"] = state.get("rejected_count", 0) + 1
+                        state["rejected_nonce_digests"] = [
+                            *state.get("rejected_nonce_digests", []), nonce_hash][-MAX_NONCE_DIGESTS:]
+                    else:
+                        hashes.append(nonce_hash)
                     # Retain the exact range and body commitment, also when
                     # migrating older audits that predate these audit fields.
                     if "operator_resolution" in offer:
@@ -338,10 +408,7 @@ class Ledger:
             state = sessions[session]
             if after_seq < max(state["accepted_through"], state.get("suppressed_through", 0)):
                 raise ValueError("receipt range would replay accepted mail or operator-abandoned offer")
-            if (any(seen_nonce(s, digest(nonce.encode())) for s in sessions.values())
-                    or any(nonce == offer.get("nonce") for s in sessions.values()
-                           for offer in [s.get("intent", {}), *s.get("history", [])])):
-                raise ValueError("receipt nonce reused")
+            check_nonce(sessions, nonce, session)
             if state.get("intent"):
                 state.setdefault("history", []).append(state["intent"])
             intent = {"state": "prepared", "nonce": nonce, "body": body, "body_hash": digest(body.encode()),
@@ -390,13 +457,17 @@ class Ledger:
             elif intent["state"] not in FINAL:
                 candidate = copy.deepcopy(intent)
                 try:
+                    # B4 stored queue IDs in client_id too. Preserve that fact
+                    # separately before scan records the native promotion ID.
+                    if candidate.get("queue_id") and "queue_client_id" not in candidate:
+                        candidate["queue_client_id"] = exact_uuid(candidate.pop("client_id"))
                     caught_up = scan(candidate, session, candidate["cwd"])
                     match = queued_match(queue, candidate)
                     if match:
-                        client = match["clientUserMessageId"]
-                        if candidate.get("client_id") not in (None, client):
+                        client = exact_uuid(match["clientUserMessageId"])
+                        if candidate.get("queue_client_id") not in (None, client):
                             raise ValueError("queued mail client ID changed")
-                        candidate.update(client_id=client, queue_id=match["id"])
+                        candidate.update(queue_client_id=client, queue_id=match["id"])
                         if candidate["state"] != "presented":
                             candidate["state"] = "queued"
                     elif pre_request_failure and candidate["state"] in ("prepared", "invoking"):
@@ -405,13 +476,15 @@ class Ledger:
                         candidate["state"] = "uncertain"
                     candidate["scan_caught_up"] = caught_up
                     candidate.pop("pause_reason", None)
+                    intent.clear()
                     intent.update(candidate)
-                except (OSError, ValueError, KeyError, TypeError):
+                except (OSError, ValueError, KeyError, TypeError) as error:
                     # Commit only the last good checkpoint; never reset an
                     # anchor or turn missing evidence into rejection.
                     if intent["state"] != "prepared":
                         intent["state"] = "uncertain"
-                    intent["pause_reason"] = "native receipt evidence unavailable or discontinuous"
+                    intent["pause_reason"] = (str(error) if isinstance(error, NativeInputUnqualified)
+                                              else "native receipt evidence unavailable or discontinuous")
             if intent["state"] in ("presented", "acked", "operator_presented"):
                 intent.pop("pause_reason", None)
                 state["accepted_through"] = max(state["accepted_through"], intent["through_seq"])

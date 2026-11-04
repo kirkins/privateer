@@ -1050,13 +1050,26 @@ impl App {
             if n.item["evidence"] == "scheduling_fault" {
                 lines.push(Line::from("Scheduling fault: work needs reassessment before another attempt. No automatic model retry."));
             } else if n.item["evidence"] == "stuck_heavy_capacity" {
-                lines.push(Line::from("Waiting behind capacity no live process holds. Check that each job below is gone, then recover it:"));
+                lines.push(Line::from("Capacity is retained by the reservations below. Absence of a live owner does not prove payload absence."));
                 for held in n.item["blocking"].as_array().into_iter().flatten() {
-                    lines.push(Line::from(format!(
-                        "{} · {}",
-                        clean(held["job_id"].as_str().unwrap_or("?"), 160),
-                        clean(held["recover"].as_str().unwrap_or(""), 1024)
-                    )));
+                    let job = clean(held["job_id"].as_str().unwrap_or("?"), 160);
+                    let recover = held["recover"].as_str().filter(|s| !s.trim().is_empty());
+                    if held["inspection_required"] == true || recover.is_none() {
+                        lines.push(Line::from(format!(
+                            "{job} · inspection required, outcome unknown, capacity retained"
+                        )));
+                        if let Some(outcome) = held["outcome"].as_str() {
+                            lines.push(Line::from(format!("Outcome: {}", clean(outcome, 160))));
+                        }
+                        if let Some(reason) = held["reason"].as_str() {
+                            lines.push(Line::from(format!("Reason: {}", clean(reason, 1024))));
+                        }
+                    } else if let Some(recover) = recover {
+                        lines.push(Line::from(format!(
+                            "{job} · Check that this job is gone, then recover it: {}",
+                            clean(recover, 1024)
+                        )));
+                    }
                 }
             } else if n.item["kind"] == "blocker" {
                 lines.push(Line::from(format!("Recorded {} · status {} · incarnation {}. No live process proof; no inline mutation.",n.item["evidence"],n.item["status"],n.item["incarnation"])));
@@ -1295,6 +1308,90 @@ fn privileged_lines(lines: &mut Vec<Line<'static>>, privileged: &serde_json::Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn capacity_details(blocking: serde_json::Value) -> String {
+        use super::super::bridge::{Identity, Need, Source};
+        let mut app = App {
+            needs_focus: true,
+            ..App::default()
+        };
+        let mut source = Source::default();
+        source.available = true;
+        source.items.push(Need {
+            home: PathBuf::from("/alpha"),
+            identity: Identity::default(),
+            stale: false,
+            item: serde_json::json!({"id":"job:alpha", "kind":"blocker",
+                "evidence":"stuck_heavy_capacity", "blocking":blocking}),
+        });
+        app.attention.sources.push(source);
+        app.need_details()
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn inspection_only_capacity_has_no_recovery_instruction() {
+        let text = capacity_details(serde_json::json!([{
+            "job_id":"deployment-alpha", "inspection_required":true,
+            "outcome":"unknown", "recover":null,
+            "reason":"deployment handoff; inspect local payload and remote outcome"
+        }]));
+        assert!(
+            text.contains(
+                "deployment-alpha · inspection required, outcome unknown, capacity retained"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Outcome: unknown"), "{text}");
+        assert!(
+            text.contains("Reason: deployment handoff; inspect local payload and remote outcome"),
+            "{text}"
+        );
+        assert!(!text.contains("recover"), "{text}");
+        assert!(!text.contains("Check that"), "{text}");
+    }
+
+    #[test]
+    fn mixed_capacity_offers_recovery_only_for_actionable_holds() {
+        let text = capacity_details(serde_json::json!([
+            {"job_id":"deployment-alpha", "inspection_required":true,
+             "outcome":"unknown", "reason":"inspect payload", "recover":"must-not-render"},
+            {"job_id":"beta", "recover":"privateer resource.recover"}
+        ]));
+        assert!(
+            text.contains(
+                "deployment-alpha · inspection required, outcome unknown, capacity retained"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "beta · Check that this job is gone, then recover it: privateer resource.recover"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("must-not-render"), "{text}");
+        assert!(!text.contains("each job"), "{text}");
+    }
+
+    #[test]
+    fn missing_or_empty_capacity_command_fails_closed_to_inspection() {
+        let text = capacity_details(serde_json::json!([
+            {"job_id":"alpha"}, {"job_id":"beta", "recover":"  "}
+        ]));
+        for job in ["alpha", "beta"] {
+            assert!(
+                text.contains(&format!(
+                    "{job} · inspection required, outcome unknown, capacity retained"
+                )),
+                "{text}"
+            );
+        }
+        assert!(!text.contains("recover"), "{text}");
+    }
 
     #[test]
     fn recorded_completions_read_as_relative_ages() {

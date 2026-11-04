@@ -111,8 +111,28 @@ B3a seeds mid-turn anchors (bounded lifecycle lookup at the saved offset), prune
 covered settled history to nonce digests while preserving watermarks/operator
 audits, and skips unchanged poll writes. Current/unresolved evidence stays pinned;
 the 8 MiB/128-session bound still applies backpressure, never fact eviction.
-The user-message/client-ID schema remains synthetic and unqualified natively;
-B3b must verify it and positive ATTACHED proof before activation, or fail closed.
+B4 qualifies the real 0.166.0 text-only `event_msg/user_message` shape using one
+captain-approved loopback mock request. Its canonical UUID `client_id`, exact
+message and empty `images/local_images/audio/local_audio/text_elements` arrays
+are required; it has no turn ID, so only the anchored open native lifecycle with
+`turn_attribution.turn_trigger:queue` can associate it. B5a requires that trigger,
+including recovery from older checkpoints. Unknown/aliased/multimedia shapes pause
+with a clear reason. Queue `clientUserMessageId` and promoted `client_id` are
+separate canonical facts: equality has not been observed before promotion and
+is not required. The exact saved body/nonce and queue-triggered lifecycle prove
+the receipt. Native attachment remains unqualified; future hosted-pane custody
+and possibly-unattended turn accounting need separate implementation and review.
+Activation remains blocked.
+
+The fixed non-deleting admission-nonce filter has separate possible-reuse and
+saturation errors with fill-ratio diagnostics (25% fill limit, about 4,700 unique
+retirements per session). Saturation blocks inserts only into that session;
+other sessions still check its filter for possible reuse. No rollover or
+automatic UUID switching is provided. These are not exact-reuse claims. Future runners must
+pause/surface the error, never resample or retry on a timer; operator capacity
+review is required. Positively never-spawned rejected nonces use a separate
+counter and 256-entry exact window, not that admission filter. See the design
+for capacity/migration details and the safety boundary of this exception.
 It is not called by a mail runner. Lost CLI responses reconcile queue presence,
 anchored native promotion or a covering runtime ack; **absence alone never proves
 rejection or permits replay**. Evidence-free uncertainty pauses immediately and
@@ -161,14 +181,22 @@ python3 -B scripts/codex-queue-spike.py \
 
 It inherits the same isolation/owned-daemon cleanup, creates only fixture legacy
 threads, and compares an exact-resume TUI with a loaded thread that has never had
-a TUI. Fixture-only SessionStart **and UserPromptSubmit** stoppers prevent all
-provider calls. Native queue-triggered turn/hook evidence is promotion, not a
-presentation receipt: stopped input never passes native acceptance. Delivery
-remains disabled. On Codex CLI/fixture daemon **0.166.0**, the fixture proved
-**the daemon promotes a loaded thread even with no TUI ever attached** (one native
-queue-triggered turn; zero provider requests). B3 therefore needs positive
-ATTACHED proof, not a loaded-only check (or separately qualified explicit
-unattended-turn budget/reporting), plus native promoted-input receipt
-qualification. Its authenticated operator-only resolve control and surfacing of
+a TUI, plus that owned TUI's thread after the TUI exits (still loaded and idle).
+Fixture-only SessionStart **and UserPromptSubmit** stoppers protect all but one
+nonce-selected queued input: B4's captain-approved scope allows exactly **one
+request to the fixture's own loopback mock**, not a real provider or login.
+Retries are disabled, the one-use hook allowance rejects repeats, and the
+fixture asserts exactly one POST to its own `127.0.0.1` port. It captures real
+accepted native input, verifies its observed text-only client-ID shape and
+lifecycle ordering, and recovers a durable anchored ledger receipt using a new
+reducer instance (accepted range, no mailbox ack). Stopped turns are still not
+presentation evidence. Delivery remains disabled. On Codex CLI/fixture daemon
+**0.166.0**, the fixture proved **the daemon promotes a loaded thread even with no
+TUI ever attached**. Public loaded/idle fields do not distinguish attachment,
+including after TUI exit. Positive ATTACHED proof remains required, not a
+loaded-only check (or separately qualified unattended-turn budget/reporting).
+The proposed Privateer-owned hosted child/pidfd proof is **design only**, with
+explicit exit/navigation races and an upstream attachment-identity ask; it is
+not an implemented attachment detector or permission to run mail. Its authenticated operator-only resolve control and surfacing of
 the immediate bounded uncertainty diagnostic also remain B3; the dormant reducer
 is not an exposed command. No user history setting is changed.
