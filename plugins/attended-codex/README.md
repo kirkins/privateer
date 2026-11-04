@@ -114,13 +114,21 @@ the 8 MiB/128-session bound still applies backpressure, never fact eviction.
 B4 qualifies the real 0.166.0 text-only `event_msg/user_message` shape using one
 captain-approved loopback mock request. Its canonical UUID `client_id`, exact
 message and empty `images/local_images/audio/local_audio/text_elements` arrays
-are required; it has no turn ID, so only the anchored open native lifecycle can
-associate it. Unknown/aliased/multimedia shapes pause with a clear reason.
-Positive ATTACHED proof is still unqualified and activation remains blocked.
+are required; it has no turn ID, so only the anchored open native lifecycle with
+`turn_attribution.turn_trigger:queue` can associate it. B5a requires that trigger,
+including recovery from older checkpoints. Unknown/aliased/multimedia shapes pause
+with a clear reason. Queue `clientUserMessageId` and promoted `client_id` are
+separate canonical facts: equality has not been observed before promotion and
+is not required. The exact saved body/nonce and queue-triggered lifecycle prove
+the receipt. Native attachment remains unqualified; future hosted-pane custody
+and possibly-unattended turn accounting need separate implementation and review.
+Activation remains blocked.
 
 The fixed non-deleting admission-nonce filter has separate possible-reuse and
 saturation errors with fill-ratio diagnostics (25% fill limit, about 4,700 unique
-retirements per session). These are not exact-reuse claims. Future runners must
+retirements per session). Saturation blocks inserts only into that session;
+other sessions still check its filter for possible reuse. No rollover or
+automatic UUID switching is provided. These are not exact-reuse claims. Future runners must
 pause/surface the error, never resample or retry on a timer; operator capacity
 review is required. Positively never-spawned rejected nonces use a separate
 counter and 256-entry exact window, not that admission filter. See the design
