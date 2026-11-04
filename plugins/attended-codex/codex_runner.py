@@ -23,6 +23,7 @@ from codex_socket import Daemon, LIMIT, load, process_identity, safe
 
 K = 3
 TURN_BUDGET = 3  # Cumulative per project, never reset by ack/rebind/restart.
+STICKY = ("codex-custody-lost-after-invocation", "codex-queue-cleanup-unproven")
 
 
 def require(condition, message):
@@ -211,12 +212,28 @@ def accounting(value):
         require(type(result.get(key)) is int and result[key] >= 0, "invalid runner accounting")
     require(result["possibly_unattended_spent"] <= TURN_BUDGET and result["declines"] <= K
             and type(result.get("human_paused")) is bool, "invalid runner budget/pause")
+    # Sticky diagnostics survive the transient native-evidence one. Older
+    # ledgers stored a sticky name in "diagnostic"; move it, never drop it.
+    sticky = result.setdefault("sticky", [])
+    require(isinstance(sticky, list) and all(name in STICKY for name in sticky), "invalid runner diagnostics")
+    if result.get("diagnostic") in STICKY:
+        name = result.pop("diagnostic")
+        if name not in sticky:
+            sticky.append(name)
     return result
+
+
+def diagnostic(a):
+    return a["sticky"][0] if a["sticky"] else a.get("diagnostic")
+
+
+def diagnostics_pause(a):
+    return bool(a["sticky"]) or "diagnostic" in a
 
 
 def progress(value):
     a = accounting(value)
-    accepted = max(s.get("accepted_through", 0) for s in value["sessions"].values())
+    accepted = max((s.get("accepted_through", 0) for s in value["sessions"].values()), default=0)
     if accepted > a["accepted_through"]:
         a.update(accepted_through=accepted, declines=0, retry_after_ms=0)
 
@@ -285,7 +302,7 @@ class Runner:
             cursor = state.get("lifecycle", {})
             uncertain = intent.get("state") in ("invoking", "uncertain")
             paused = (uncertain or state.get("native_stop", False) or a["human_paused"] or a["declines"] >= K
-                      or a["possibly_unattended_spent"] >= TURN_BUDGET or "diagnostic" in a)
+                      or a["possibly_unattended_spent"] >= TURN_BUDGET or diagnostics_pause(a))
             eligible = False
             handles = None
             try:
@@ -318,7 +335,8 @@ class Runner:
                                       and (not cursor.get("open_turn") or cursor.get("turn_started_ms") is not None),
                     "possibly_unattended_spent": a["possibly_unattended_spent"],
                     "possibly_unattended_budget": TURN_BUDGET,
-                    "diagnostic": ("codex-uncertain-" + intent["nonce"]) if uncertain else a.get("diagnostic")}
+                    "diagnostic": ("codex-uncertain-" + intent["nonce"]) if uncertain else diagnostic(a),
+                    "diagnostics": list(a["sticky"])}
 
     def observe(self, acknowledged_through=0):
         """Read-only native evidence; no queue mutation and no enable path."""
@@ -331,7 +349,9 @@ class Runner:
         if acknowledged_through:
             value = self.ledger.read()
             intent = value["sessions"].get(session, {}).get("intent")
-            if intent:
+            # A synthetic empty queue is safe only when the ack alone settles
+            # the whole range; otherwise wait for real queue evidence below.
+            if intent and acknowledged_through >= intent["through_seq"]:
                 self.ledger.reconcile(session, intent["nonce"], {"data": [], "nextCursor": None},
                                       acknowledged_through)
         try:
@@ -428,7 +448,7 @@ class Runner:
             require(not a["human_paused"] and a["declines"] < K
                     and a["possibly_unattended_spent"] < TURN_BUDGET
                     and time.time_ns() // 1_000_000 >= a["retry_after_ms"]
-                    and not a.get("observation_lost", True) and "diagnostic" not in a,
+                    and not a.get("observation_lost", True) and not diagnostics_pause(a),
                     "runner paused, unavailable or budget exhausted")
             require(intent["state"] == "prepared" and not state["lifecycle"]["open_turn"]
                     and not state.get("native_stop", False), "outstanding attempt, native stop or native busy")
@@ -455,13 +475,14 @@ class Runner:
             save(self.ledger, value)  # Crash thereafter = uncertain, never refund.
             # After durable invoking, immediately at the real spawn boundary.
             require(load(self.registry) == current, "binding changed before spawn")
-            require_fence(self.registry, current)
-            custody_check(self.registry, current, custody)
             daemon_check(daemon, current, custody)
             handles = Handles(custody)
             try:
                 handles.check()
                 presence_check(lease, current)  # No stale lease after slow fsync.
+                # Both fences last: the poison read is the final step before Popen.
+                require_fence(self.registry, current)
+                custody_check(self.registry, current, custody)
                 try:
                     child = subprocess.Popen(argv, cwd=current["cwd"], env=env, stdin=subprocess.DEVNULL,
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -500,9 +521,10 @@ class Runner:
                 for saved in [state.get("intent", {}), *state.get("history", [])]:
                     if saved.get("nonce") == intent["nonce"] and saved["state"] == "invoking":
                         saved["state"] = "uncertain"
-                if post_spawn_lost:
-                    accounting(value)["diagnostic"] = "codex-custody-lost-after-invocation"
-                if not cleaned:
-                    accounting(value)["diagnostic"] = "codex-queue-cleanup-unproven"
+                a = accounting(value)
+                for name, failed in (("codex-custody-lost-after-invocation", post_spawn_lost),
+                                     ("codex-queue-cleanup-unproven", not cleaned)):
+                    if failed and name not in a["sticky"]:
+                        a["sticky"].append(name)  # Both kept; neither hides the other.
                 save(self.ledger, value)
         return self.report(record["session"], record, custody)

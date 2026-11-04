@@ -278,6 +278,8 @@ class RunnerTests(unittest.TestCase):
             value = self.runner.ledger.read()
             self.assertEqual(value["sessions"][self.session]["intent"]["state"], "rejected")
             self.assertEqual(value["runner"]["declines"], i + 1)
+            # Exec failure never refunds the reserved possibly-unattended turn.
+            self.assertEqual(value["runner"]["possibly_unattended_spent"], i + 1)
             if i < 2:
                 self.prepare()
                 with self.assertRaisesRegex(ValueError, "paused"):
@@ -564,6 +566,70 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(self.runner.report(self.session)["paused"])
         self.assert_not_invoked()
 
+
+    def test_poison_published_during_final_pidfd_check_still_refuses_spawn(self):
+        # PR 710 carry-in: the poison reads follow handles.check(), so a revoke
+        # landing while the pidfds are checked still stops the Popen.
+        self.runner._observe_lifecycle(self.record)
+        original = runner.Handles.check
+        def check(handles):
+            original(handles)
+            binding.publish_request(self.registry, "custody-poison.json", reason="barrier")
+        with patch.object(runner.Handles, "check", new=check):
+            with self.assertRaisesRegex(ValueError, "poison"):
+                self.runner._spawn(self.record, self.custody, self.daemon_class(None))
+        self.assert_not_invoked()
+        self.assertEqual(self.runner.report(self.session)["diagnostic"], "codex-uncertain-" + self.nonce)
+
+    def test_partial_ack_does_not_use_a_synthetic_empty_queue(self):
+        self.runner.ledger.reconcile(self.session, self.nonce, {"data": [], "nextCursor": None}, 1)
+        self.prepare(4)  # Range (4, 5].
+        self.runner.ledger.invoking(self.session, self.nonce)
+        seen = []
+        original = self.runner.ledger.reconcile
+        def reconcile(session, nonce, queue, acknowledged_through=0, **kw):
+            seen.append((queue, acknowledged_through))
+            return original(session, nonce, queue, acknowledged_through, **kw)
+        with patch.object(self.runner.ledger, "reconcile", side_effect=reconcile), \
+                patch.object(self.daemon_class, "call", side_effect=ConnectionError("fixture daemon gone")):
+            self.runner.observe(acknowledged_through=4)
+        self.assertEqual(seen, [])  # Partial ack: no synthetic queue absence.
+        with patch.object(self.runner.ledger, "reconcile", side_effect=reconcile), \
+                patch.object(self.daemon_class, "call", side_effect=ConnectionError("fixture daemon gone")):
+            self.runner.observe(acknowledged_through=5)
+        self.assertEqual(seen, [({"data": [], "nextCursor": None}, 5)])
+        self.assertEqual(self.runner.ledger.read()["sessions"][self.session]["intent"]["state"], "acked")
+
+    def test_progress_on_an_empty_ledger_is_zero(self):
+        value = {"sessions": {}}
+        runner.progress(value)
+        self.assertEqual(value["runner"]["accepted_through"], 0)
+
+    def test_custody_loss_and_cleanup_failure_keep_both_sticky_diagnostics(self):
+        original = subprocess.Popen
+        def spawn(*args, **kwargs):
+            binding.publish_request(self.registry)
+            return original(*args, **kwargs)
+        with patch.object(runner.subprocess, "Popen", side_effect=spawn), \
+                patch.object(runner, "drain", return_value=False):
+            result = self.runner.dispatch()
+        self.assertEqual(result["diagnostics"], ["codex-custody-lost-after-invocation",
+                                                 "codex-queue-cleanup-unproven"])
+        # A later native-evidence gap never hides either sticky diagnostic.
+        with patch.object(self.daemon_class, "call", side_effect=ConnectionError("fixture disconnect")):
+            result = self.runner.observe()
+        self.assertEqual(result["diagnostics"], ["codex-custody-lost-after-invocation",
+                                                 "codex-queue-cleanup-unproven"])
+        self.assertTrue(result["paused"])
+
+    def test_legacy_single_sticky_diagnostic_migrates_without_loss(self):
+        self.mutate(lambda v: v.setdefault("runner", {"possibly_unattended_spent": 0, "declines": 0,
+            "accepted_through": 0, "retry_after_ms": 0, "human_paused": False,
+            "diagnostic": "codex-queue-cleanup-unproven"}))
+        result = self.runner.report(self.session)
+        self.assertEqual(result["diagnostics"], ["codex-queue-cleanup-unproven"])
+        self.assertEqual(result["diagnostic"], "codex-queue-cleanup-unproven")
+        self.assertTrue(result["paused"])
 
 if __name__ == "__main__":
     unittest.main()
