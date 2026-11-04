@@ -5197,10 +5197,10 @@ fn recover(store: &Store, args: &Value) -> Result<Value> {
         .optional()?
         .context("unknown reservation")?;
     let reservation: Reservation = serde_json::from_str(&raw)?;
-    // A legacy ordinary job may have a deployment-prefixed caller-chosen ID.
-    // Its name alone must not redirect it away from ordinary job recovery.
-    if reservation.job_id.starts_with("deployment-") && reservation.state.starts_with("deployment-")
-    {
+    // Route by custody state, not caller-chosen name. Deployment recovery
+    // independently checks the id/key and refuses malformed rows. A legacy
+    // ordinary-state job with a deployment-prefixed id still uses job recovery.
+    if reservation.state.starts_with("deployment-") {
         return deployment_admission::recover_reserved(store, &conn, &raw, &reservation, force);
     }
     // Prefer this home's job record; the ledger copy may lag behind it.

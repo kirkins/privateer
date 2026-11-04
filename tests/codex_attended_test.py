@@ -1475,7 +1475,7 @@ class ReceiptTests(unittest.TestCase):
         value = self.ledger.read()
         state = value["sessions"][self.session]
         state["history"] = [{**offer, "nonce": str(uuid.uuid4()), "state": "acked", "through_seq": 2},
-                            {**offer, "nonce": str(uuid.uuid4()), "state": "rejected", "through_seq": 8}]
+                            {**offer, "nonce": str(uuid.uuid4()), "state": "abandoned", "through_seq": 8}]
         state["accepted_through"] = 2
         binding.atomic(self.ledger.path, value)
         before = self.ledger.path.read_bytes()
@@ -1489,6 +1489,85 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(state["history"][0]["through_seq"], 8)
         self.assertEqual(state["intent"]["nonce"], self.nonce)
         self.assertEqual(state["intent"]["body"], offer["body"])
+
+    def test_rejected_and_abandoned_bodies_compact_without_acceptance(self):
+        first_nonce = None
+        # Each case exceeds the old 8 MiB cap in cumulative body bytes.
+        for operation in ("reject", "abandon"):
+            for i in range(32):
+                start = 0 if operation == "reject" else i * 4
+                self.intent(after=start, through=start + 4, padding=300000)
+                first_nonce = first_nonce or self.nonce
+                self.ledger.invoking(self.session, self.nonce)
+                if operation == "reject":
+                    self.assertEqual(self.reconcile(failure=True)["state"], "rejected")
+                else:
+                    self.reconcile()
+                    self.ledger.resolve_operator(self.session, self.nonce, "abandon", "alpha", i,
+                                                 caller_role="operator")
+                state = self.ledger.read()["sessions"][self.session]
+                self.assertEqual(state.get("history", []), [])
+                self.assertEqual(state["accepted_through"], 0)
+                self.assertEqual(state["acknowledged_through"], 0)
+                self.assertLess(self.ledger.path.stat().st_size, 400000)
+        self.intent(after=128, through=132)
+        state = self.ledger.read()["sessions"][self.session]
+        self.assertEqual(len(state["operator_audits"]), 32)
+        for i, audit in enumerate(state["operator_audits"]):
+            self.assertEqual((audit["after_seq"], audit["through_seq"]), (i * 4, i * 4 + 4))
+            self.assertEqual(len(audit["body_hash"]), 64)
+        self.reconcile(ack=132)
+        body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, first_nonce, 132, 136))
+        with self.assertRaisesRegex(ValueError, "nonce reused"):
+            self.ledger.prepare(self.offer_record, body, 132, 136, first_nonce)
+
+    def test_nonce_window_migrates_without_forgetting_evicted_hashes(self):
+        self.intent()
+        self.reconcile(ack=4)
+        old_nonce = str(uuid.uuid4())
+        other_session = str(uuid.uuid4())
+        value = self.ledger.read()
+        # Older ledgers have only the unbounded digest list, not a filter.
+        hashes = [receipts.digest(old_nonce.encode())] + [receipts.digest(str(i).encode()) for i in range(400)]
+        value["sessions"][other_session] = {"accepted_through": 0, "acknowledged_through": 0,
+                                            "nonce_digests": hashes}
+        binding.atomic(self.ledger.path, value)
+        self.reconcile()
+        saved = self.ledger.read()["sessions"][other_session]
+        self.assertEqual(len(saved["nonce_digests"]), receipts.MAX_NONCE_DIGESTS)
+        self.assertEqual(len(saved["nonce_filter"]), receipts.NONCE_FILTER_BITS // 4)
+        self.assertNotIn(hashes[0], saved["nonce_digests"])
+        self.assertTrue(all(receipts.seen_nonce(saved, h) for h in hashes))
+        body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, old_nonce, 4, 8))
+        with self.assertRaisesRegex(ValueError, "nonce reused"):
+            receipts.Ledger(self.registry, self.record["home"], "alpha").prepare(
+                self.offer_record, body, 4, 8, old_nonce)
+        # Saturation safely rejects; corrupt filters fail closed as well.
+        for filter_value in ("f" * (receipts.NONCE_FILTER_BITS // 4), "bad"):
+            value = self.ledger.read()
+            value["sessions"][other_session]["nonce_filter"] = filter_value
+            binding.atomic(self.ledger.path, value)
+            nonce = str(uuid.uuid4())
+            body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, nonce, 4, 8))
+            with self.assertRaises(ValueError):
+                self.ledger.prepare(self.offer_record, body, 4, 8, nonce)
+
+    def test_old_abandon_audit_migration_preserves_range_hash_and_unresolved(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        self.reconcile()
+        value = self.ledger.read()
+        state = value["sessions"][self.session]
+        old = {**state["intent"], "nonce": str(uuid.uuid4()), "state": "abandoned",
+               "operator_resolution": {"actor": "operator", "reason": "alpha"}}
+        state.update(history=[old], suppressed_through=4)
+        binding.atomic(self.ledger.path, value)
+        self.reconcile()
+        state = self.ledger.read()["sessions"][self.session]
+        self.assertEqual(state["intent"]["state"], "uncertain")
+        self.assertEqual(state["history"], [])
+        self.assertEqual(state["operator_audits"], [{**old["operator_resolution"],
+            **{key: old[key] for key in ("after_seq", "through_seq", "body_hash")}}])
 
     def test_index_bound_and_cross_uuid_outstanding_offer_backpressure(self):
         self.intent()

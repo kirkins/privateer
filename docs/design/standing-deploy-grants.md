@@ -625,6 +625,54 @@ charter. Tool executability and the shebang prohibition are checked on the held
 inode that supplied the executable hash, not on an independent earlier path
 open. The verified-private-copy execution requirement remains unchanged.
 
+## Slice 2b-ii-b2c-b1: dormant consuming custody handoff
+
+The approved b2c-b split delivers the two b2c-a review nits first, then the
+bounded adapter supervisor as b2c-b2. This slice adds **no adapter execution,
+command registration, activation or restart wiring**. Production and
+nonproduction deployment entry points remain unavailable.
+
+`resource.recover` routes by the reservation's `deployment-` **state prefix**
+alone. The deployment recovery path independently requires a deployment-prefixed
+job id, canonical key and unchanged pre-handoff custody. A malformed
+ordinary-id/deployment-state row must refuse there, never fall through to the
+ordinary job recovery path. Legacy ordinary-state jobs retain ordinary recovery
+even when their historical caller-chosen id has a deployment prefix.
+
+`Admitted::handoff(self)` consumes the process-local admission token and
+compare-and-swaps the **entire original host reservation** under the host writer
+lock to `deployment-handoff`. Only a committed transition yields a new private,
+nonserializable `Handoff` token. Recovery and handoff therefore serialize: if
+recovery removes the hold first, no handoff token can be returned; if handoff
+wins, pre-handoff recovery refuses. A changed record or failed write returns no
+token and never releases capacity. Dropping either token retains its hold.
+No generic spawn closure or reservation-to-token reconstruction is exposed.
+
+This transition records host capacity custody only: it neither consumes a grant
+nor authorizes upload, changes deployment intent state, or proves any payload
+exists. It is not a cross-database transaction. A crash after the host commit
+but before receiving the token leaves an ambiguous handoff for later inspection,
+never automatic replay or pre-handoff compensation. The subsequent supervisor
+must make its sole spawn path consume `Handoff`, recompare its exact durable
+record and bind a fresh sealed claim before giving an adapter authority.
+
+### b2c-b2 child-gate design requirements (not implemented here)
+
+Prepare and verify the private pinned adapter before giving it deployment
+metadata or artifact bytes. Start a gated child, commit its real process identity
+and exact claim/hold binding before releasing authority bytes, and leave the
+handoff ambiguous if either ledger write or the gate acknowledgement fails.
+Do not infer that a missing wrapper means upload stopped, and never reconstruct
+launch permission from historical status. Hash the actual artifact stream and
+bound stdin/stdout/stderr, retained diagnostics and runtime with nonblocking IO
+and an admitted hard deadline. The deadline path must not run unbounded external
+`ps`: the existing ordinary-job descendant census is not sufficient for this
+supervisor. The next design must address immediate reparent/double-fork escapes,
+not just sample a cooperative parent's children. Escaped or unprovable payload
+custody retains capacity and an unknown outcome; neither wrapper exit nor group
+cleanup proves arbitrary escaped payloads stopped. Fake subprocess fixtures must
+cover these boundaries before activation is considered.
+
 ## Required validation before enabling
 
 - Operator-only create/edit/pause/resume/revoke, including direct dispatch and
