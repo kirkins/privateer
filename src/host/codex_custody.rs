@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Child;
@@ -133,10 +133,13 @@ fn pidfd(pid: u32) -> Result<OwnedFd> {
     {
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
         ensure!(fd >= 0, "Codex custody requires pidfd_open");
-        Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+        Ok(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd as i32) })
     }
     #[cfg(not(target_os = "linux"))]
-    anyhow::bail!("Codex custody requires Linux");
+    {
+        let _ = pid;
+        anyhow::bail!("Codex custody requires Linux");
+    }
 }
 
 fn live(fd: &OwnedFd) -> Result<bool> {
