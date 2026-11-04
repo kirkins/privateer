@@ -28,6 +28,33 @@ pub(crate) struct Handoff {
     record: String,
 }
 
+/// A failure before the host writer lock was acquired returns custody for
+/// explicit retry/compensation. Once a write is attempted, no reusable token is
+/// returned, even if rollback succeeds: callers must inspect the durable hold.
+#[derive(Debug)]
+pub(crate) struct HandoffError {
+    cause: anyhow::Error,
+    admitted: Option<Box<Admitted>>,
+}
+
+impl HandoffError {
+    pub(crate) fn into_admitted(self) -> Option<Admitted> {
+        self.admitted.map(|token| *token)
+    }
+}
+
+impl std::fmt::Display for HandoffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "deployment handoff failed: {}", self.cause)
+    }
+}
+
+impl std::error::Error for HandoffError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
 impl Admitted {
     pub(crate) fn key(&self) -> &str {
         &self.reservation.key
@@ -37,25 +64,43 @@ impl Admitted {
     /// spawn. Recovery winning the host writer race prevents token creation;
     /// handoff winning prevents pre-handoff recovery. This is host custody only,
     /// not a grant/claim transition or cross-database atomicity guarantee.
-    pub(crate) fn handoff(mut self) -> Result<Handoff> {
-        self.reservation.state = "deployment-handoff".into();
-        let record = serde_json::to_string(&self.reservation)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        ensure!(
-            tx.execute(
-                "UPDATE reservations SET record=?3 WHERE key=?1 AND record=?2",
-                params![self.reservation.key, self.record, record],
-            )? == 1,
-            "deployment reservation custody changed; handoff refused"
-        );
-        tx.commit()?;
-        Ok(Handoff {
-            conn: self.conn,
-            reservation: self.reservation,
-            record,
-        })
+    /// BEGIN failure returns unchanged Admitted custody, never spawn authority.
+    pub(crate) fn handoff(mut self) -> std::result::Result<Handoff, HandoffError> {
+        if let Err(cause) = self.conn.execute_batch("BEGIN IMMEDIATE") {
+            // A failed BEGIN on this private, autocommit connection wrote
+            // nothing. Do not mutate the in-memory reservation before this.
+            return Err(HandoffError {
+                cause: cause.into(),
+                admitted: Some(Box::new(self)),
+            });
+        }
+        let result = (|| -> Result<String> {
+            self.reservation.state = "deployment-handoff".into();
+            let record = serde_json::to_string(&self.reservation)?;
+            ensure!(
+                self.conn.execute(
+                    "UPDATE reservations SET record=?3 WHERE key=?1 AND record=?2",
+                    params![self.reservation.key, self.record, record],
+                )? == 1,
+                "deployment reservation custody changed; handoff refused"
+            );
+            self.conn.execute_batch("COMMIT")?;
+            Ok(record)
+        })();
+        match result {
+            Ok(record) => Ok(Handoff {
+                conn: self.conn,
+                reservation: self.reservation,
+                record,
+            }),
+            Err(cause) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(HandoffError {
+                    cause,
+                    admitted: None,
+                })
+            }
+        }
     }
 
     /// Explicit compensation, not proof of process death. The exact original

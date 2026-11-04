@@ -645,7 +645,9 @@ lock to `deployment-handoff`. Only a committed transition yields a new private,
 nonserializable `Handoff` token. Recovery and handoff therefore serialize: if
 recovery removes the hold first, no handoff token can be returned; if handoff
 wins, pre-handoff recovery refuses. A changed record or failed write returns no
-token and never releases capacity. Dropping either token retains its hold.
+handoff token and never releases capacity. The b2c-b2a refinement below returns
+unchanged admission custody only on a failed BEGIN before any write. Dropping
+either token retains its hold.
 No generic spawn closure or reservation-to-token reconstruction is exposed.
 
 This transition records host capacity custody only: it neither consumes a grant
@@ -656,22 +658,98 @@ never automatic replay or pre-handoff compensation. The subsequent supervisor
 must make its sole spawn path consume `Handoff`, recompare its exact durable
 record and bind a fresh sealed claim before giving an adapter authority.
 
-### b2c-b2 child-gate design requirements (not implemented here)
+## Slice 2b-ii-b2c-b2a: contract and pre-launch custody refinements
+
+This reviewable slice records the supervisor contract and addresses PR 691's
+remaining local nits. It adds no spawn method, adapter execution, command
+registration, activation dispatcher or restart wiring. The consuming spawn,
+cgroup supervisor, claim bindings and six fake-adapter fixtures are deferred to
+b2c-b2b. Both production and nonproduction activation remain unavailable.
+
+`Admitted::handoff` now returns a typed error with the unchanged admission token
+when `BEGIN IMMEDIATE` fails before any write. The caller can explicitly retry
+handoff or compensate using `release_unlaunched`; dropping the error/token keeps
+capacity reserved. This token is not a handoff or upload authority. Recovery can
+still invalidate it, and every later handoff still compares the full original
+record. Once the writer lock is acquired, any failed CAS, update or commit
+returns no reusable token; rollback is attempted and custody remains subject to
+inspection. No grant use is refunded, and ambiguous handoffs are never replayed.
+
+Stale post-handoff deployment reservations (including unknown future deployment
+states) now report `outcome:unknown`, `inspection_required:true` and `recover:null`.
+They never suggest the pre-handoff-only `resource.recover force:true` path.
+Observation retains the record and capacity. Ordinary reservations and unchanged
+pre-handoff deployment holds retain their existing recovery suggestions.
+
+### b2c-b2b child-gate contract (supervisor not implemented here)
 
 Prepare and verify the private pinned adapter before giving it deployment
-metadata or artifact bytes. Start a gated child, commit its real process identity
-and exact claim/hold binding before releasing authority bytes, and leave the
-handoff ambiguous if either ledger write or the gate acknowledgement fails.
-Do not infer that a missing wrapper means upload stopped, and never reconstruct
-launch permission from historical status. Hash the actual artifact stream and
-bound stdin/stdout/stderr, retained diagnostics and runtime with nonblocking IO
-and an admitted hard deadline. The deadline path must not run unbounded external
-`ps`: the existing ordinary-job descendant census is not sufficient for this
-supervisor. The next design must address immediate reparent/double-fork escapes,
-not just sample a cooperative parent's children. Escaped or unprovable payload
-custody retains capacity and an unknown outcome; neither wrapper exit nor group
-cleanup proves arbitrary escaped payloads stopped. Fake subprocess fixtures must
-cover these boundaries before activation is considered.
+metadata or artifact bytes. The adapter inherits the verifier's launch contract:
+clear the environment, set only fixed protocol variables, use a fresh private
+working directory, set umask 077, and close inherited descriptors at exec
+(including home/host-ledger connections and retained artifact descriptors).
+Execute only a verified private copy made from the held executable inode, never
+a reopened configured path. Pin and verify all interpreter/script/config inputs
+before launch; no shebang or ambient PATH resolution may substitute another
+executable. No credentials or deployment metadata belong in argv or ambient env.
+
+The sole spawn method consumes `Handoff` and a fresh, nonserializable `Claim`.
+It must compare the entire durable host hold again and bind its canonical key,
+incarnation, claim identity and immutable deployment use, checking the same home,
+ship, task and admitted timeout. A historical JSON status cannot recreate either
+token. Start a gated child with no deployment authority, commit its real process
+identity and exact claim/hold binding before releasing authority bytes, and leave
+the handoff ambiguous if either ledger write or the gate acknowledgement fails.
+Home and host commits are not atomic: any partial commit retains capacity and
+requires inspection, not replay. No spawn closure may bypass these checks.
+
+Hash the actual artifact stream delivered to the adapter and hash its observed
+stdout/stderr streams incrementally. Bound protocol metadata, artifact bytes,
+combined stdout/stderr, retained diagnostics and per-iteration IO work; a child
+that writes continuously must not starve deadline checks. Use nonblocking IO and
+the admitted hard deadline measured on `std::time::Instant` (monotonic), never
+`Store::now_ms` wall time. Clock changes must neither extend nor shorten runtime.
+Cleanup has its own bounded monotonic deadline; no unbounded wait/reap or external
+`ps` is permitted on either path. Protocol/stream mismatch or partial delivery
+never implies a successful remote deployment.
+
+**Positive containment choice:** Linux cgroup v2, a dedicated per-attempt cgroup
+with kernel-enforced membership inherited across fork, double-fork, setsid and
+reparenting. The child must join it before executing the adapter. A supported
+activation environment must provide a trusted, pinned cgroup delegation and
+prevent adapter-initiated migration outside the attempt's subtree; merely having
+a writable `cgroup.procs` path is not a containment qualification. Same-account
+workflow controls alone do not establish that migration restriction. Unsupported
+platforms, missing delegation/controller support, or unqualified migration
+restrictions refuse activation before executing the adapter. Never fall back to
+process-group signals, descendant sampling or "wrapper disappeared" as proof.
+
+Before releasing authority, durably record the cgroup identity together with the
+payload's kernel process identity and the exact claim/hold binding. Cleanup
+writes `cgroup.kill` and proves `populated 0` via `cgroup.events` on that same held
+cgroup within its cleanup deadline. Failure to kill, read, match identity or
+prove emptiness retains capacity and records an unknown outcome, even if the
+leader exited successfully. Only a kill-and-empty proof establishes local
+payload absence; it never proves remote rollback or remote outcome. An escaped
+or unprovable payload is durably recorded, never automatically re-run, and never
+released by pre-handoff recovery. A supervisor crash leaves its persisted cgroup
+custody for explicit later inspection; no restart launch hook is added here.
+
+Fake subprocess fixtures must cover success, failure, hard-deadline hang,
+oversized output, identity mismatch before authority, and an immediate
+reparent/double-fork child. Containment tests must exercise the real kernel
+boundary on a qualified isolated delegation; fake cgroup files or parent-child
+sampling are not evidence of escape containment. Positive escape tests run only
+where a real, qualified delegated cgroup-v2 subtree is available. Elsewhere,
+including CI and macOS, the test must assert activation refusal and record that
+the environment is unqualified, not substitute fake containment.
+
+PR 691 follow-ups also require stale `deployment-handoff` reservations to be
+presented as unknown outcomes needing inspection, not as actionable
+`resource.recover force:true` suggestions. A host writer-lock failure before any
+handoff write should return pre-handoff custody to its caller for explicit
+compensation or retry; failures at/after a write or commit remain conservatively
+ambiguous and must not return a reusable admission token.
 
 ## Required validation before enabling
 
