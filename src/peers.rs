@@ -485,6 +485,20 @@ pub(crate) fn direct_machine(store: &Store, name: &str) -> Result<bool> {
     )?)
 }
 
+/// Whether a peer's transport runs on this machine. A local peer's delivery is
+/// this runtime spawning our own executable, so a write refused by the
+/// recipient's home is the caller's own reach, not the far side's answer; a
+/// collected peer is never called and an ssh peer's failure is the other
+/// machine's or the link's to report.
+pub(crate) fn local_transport(store: &Store, name: &str) -> Result<bool> {
+    init(store)?;
+    Ok(store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM peer_endpoints WHERE name=?1 AND json_extract(config_json, '$.transport')='local')",
+        [name],
+        |r| r.get(0),
+    )?)
+}
+
 /// Forget a peer and the ships this home knew to live behind it.
 pub(crate) fn forget(store: &Store, name: &str) -> Result<()> {
     init(store)?;
