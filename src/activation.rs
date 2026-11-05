@@ -708,8 +708,12 @@ fn wake_text(
     let mail = &page.mail;
     let mut text = format!("Wake {wake} for ship {ship}.\n");
     // A resumed session already has its bearings and notes in context.
+    let mut child_foci_in_bearings = Vec::new();
     if !resumed {
         let bearings = crate::context::bearings(store, ship)?;
+        if let Some(statuses) = bearings["child_statuses"].as_object() {
+            child_foci_in_bearings.extend(statuses.keys().cloned());
+        }
         text.push_str(bearings["text"].as_str().unwrap_or(""));
     } else if let Some(line) = crate::stale_mail::line(&crate::stale_mail::read(store, ship)?, ship)
     {
@@ -752,7 +756,12 @@ fn wake_text(
     let mut shown = 0;
     for focus in &foci {
         let mut section = format!("## {focus}\n");
-        section.push_str(&crate::context::child_status_text(store, ship, focus)?);
+        if !child_foci_in_bearings
+            .iter()
+            .any(|shown| shown.as_str() == *focus)
+        {
+            section.push_str(&crate::context::child_status_text(store, ship, focus)?);
+        }
         let note = if resumed {
             None
         } else {

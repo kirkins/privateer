@@ -97,6 +97,7 @@ fn parent_reads_show_finished_child_facts_without_rewriting_commentary() {
     let finished = &children[0];
     assert_eq!(finished["id"], "index");
     assert_eq!(finished["status"], "done");
+    assert_eq!(finished["status_changed_approx"], false);
     assert!(finished["status_changed_ms"].as_i64().unwrap() >= started);
     assert_eq!(finished["closing_evidence"]["task_done"], true);
     assert_eq!(finished["closing_evidence"]["merge"]["pr"], 42);
@@ -115,12 +116,7 @@ fn parent_reads_show_finished_child_facts_without_rewriting_commentary() {
         bearings["child_statuses"]["task:repair"],
         after["child_status"]
     );
-    assert!(
-        bearings["text"]
-            .as_str()
-            .unwrap()
-            .contains("\"merge_sha\":\"def456\"")
-    );
+    assert!(bearings["text"].as_str().unwrap().contains("PR#42 def456"));
     // Audit retention and a restart must not discard closing facts or times.
     s.connection().execute("DELETE FROM audit", []).unwrap();
     drop(s);
@@ -222,11 +218,21 @@ fn legacy_child_times_are_recovered_once_without_inventing_missing_history() {
         json!({"id":"known","actor":"infra","status":"done"}),
     )
     .unwrap();
+    // Include repeated same-status updates and unrelated audit traffic.
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"id":"known","actor":"infra","status":"done"}),
+    )
+    .unwrap();
     s.connection().execute_batch(
-        "DELETE FROM audit WHERE json_extract(payload,'$.id')='unknown';
+        "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5000)
+         INSERT INTO audit(time_ms,kind,payload) SELECT x,'unrelated','{}' FROM n;
+         DELETE FROM audit WHERE json_extract(payload,'$.id')='unknown';
          UPDATE audit SET time_ms=1234 WHERE kind='task.update' AND json_extract(payload,'$.id')='known';
          DROP TRIGGER task_status_created; DROP TRIGGER task_status_changed;
-         DROP INDEX tasks_parent_status_time; ALTER TABLE tasks DROP COLUMN status_changed_ms;"
+         DROP INDEX tasks_parent_status_time; ALTER TABLE tasks DROP COLUMN status_changed_ms;
+         ALTER TABLE tasks DROP COLUMN status_changed_approx;"
     ).unwrap();
     drop(s);
     let mut s = Store::open(&temp.path().join("home")).unwrap();
@@ -237,10 +243,64 @@ fn legacy_child_times_are_recovered_once_without_inventing_missing_history() {
         1234
     );
     assert!(read["child_status"]["children"][1]["status_changed_ms"].is_null());
+    assert_eq!(
+        read["child_status"]["children"][0]["status_changed_approx"],
+        true
+    );
+    // A same-status audit update need not be a real edge; the recovered time
+    // must remain visibly approximate until a new, observed transition.
+    let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap();
+    assert!(bearings["text"].as_str().unwrap().contains("~1970-"));
     s.connection().execute("DELETE FROM audit", []).unwrap();
     drop(s);
     let mut s = Store::open(&temp.path().join("home")).unwrap();
     assert_eq!(read_parent(&mut s), read);
+    s.connection()
+        .execute("UPDATE tasks SET status='done' WHERE id='known'", [])
+        .unwrap();
+    assert_eq!(
+        read_parent(&mut s)["child_status"]["children"][0]["status_changed_approx"],
+        true
+    );
+    s.connection()
+        .execute("UPDATE tasks SET status='open' WHERE id='known'", [])
+        .unwrap();
+    assert_eq!(
+        read_parent(&mut s)["child_status"]["children"][0]["status_changed_approx"],
+        false
+    );
+}
+
+#[test]
+fn bearings_marks_children_omitted_by_the_shared_budget() {
+    let (_temp, mut s) = fleet();
+    // The first parent fills the budget exactly; another parent is omitted.
+    for n in 0..20 {
+        child(&mut s, &format!("child-{n}"), "cleanup");
+    }
+    child(&mut s, "last-child", "repair");
+    s.connection()
+        .execute(
+            "UPDATE tasks SET status='done' WHERE parent IS NOT NULL",
+            [],
+        )
+        .unwrap();
+    let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap();
+    let statuses = bearings["child_statuses"].as_object().unwrap();
+    assert_eq!(
+        statuses
+            .values()
+            .map(|v| v["children"].as_array().unwrap().len())
+            .sum::<usize>(),
+        20
+    );
+    assert_eq!(bearings["child_statuses_more"], true);
+    assert!(
+        bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains("More child status omitted")
+    );
 }
 
 #[test]
