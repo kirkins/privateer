@@ -532,8 +532,16 @@ class Runner:
             loaded = daemon.call("thread/loaded/list", {"limit": 32})
             require(loaded.get("nextCursor") is None and isinstance(loaded.get("data"), list)
                     and len(loaded["data"]) <= 32 and session in loaded["data"], "thread not loaded")
-            thread = daemon.call("thread/read", {"threadId": session})["thread"]
-            require(thread.get("id") == session and thread.get("cwd") == record["cwd"]
+            # Idle /new has no SessionStart callback yet: the old UUID can
+            # remain loaded while the attended pane watches another thread.
+            # Refuse ambiguous cwd custody; only a trusted callback may rebind.
+            threads = [daemon.call("thread/read", {"threadId": identity})["thread"]
+                       for identity in loaded["data"]]
+            matches = [thread for thread in threads if thread.get("cwd") == record["cwd"]]
+            require(len(matches) == 1, "concurrent Codex threads in this cwd are ambiguous")
+            thread = matches[0]
+            require(thread.get("id") == session, "loaded thread for this cwd is not the bound UUID")
+            require(thread.get("cwd") == record["cwd"]
                     and thread.get("historyMode") == "legacy" and not thread.get("ephemeral")
                     and thread.get("status") == {"type": "idle"}, "native thread not qualified idle")
             queue = daemon.call("thread/queue/list", {"threadId": session, "limit": 128})

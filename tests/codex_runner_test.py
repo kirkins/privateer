@@ -55,6 +55,8 @@ class RunnerTests(unittest.TestCase):
         binding.atomic(codex / "app-server-daemon/daemon.pid", {
             "pid": self.daemon_process.pid, "processIdentity": process_identity(self.daemon_process.pid)})
         self.session = str(uuid.uuid4())
+        self.loaded_sessions = [self.session]
+        self.other_threads = {}
         self.status = {"type": "idle"}
         token, custody_token = str(uuid.uuid4()), str(uuid.uuid4())
         self.rollout = codex / "rollout.jsonl"
@@ -106,10 +108,12 @@ class RunnerTests(unittest.TestCase):
                 runner.native_check(fixture.record, fixture.custody)
             def call(self, method, params):
                 if method == "thread/loaded/list":
-                    return {"data": [fixture.session], "nextCursor": None}
+                    return {"data": list(fixture.loaded_sessions), "nextCursor": None}
                 if method == "thread/read":
-                    return {"thread": {"id": fixture.session, "cwd": str(fixture.root), "historyMode": "legacy",
-                                       "status": fixture.status}}
+                    thread = fixture.other_threads.get(params["threadId"], {
+                        "id": fixture.session, "cwd": str(fixture.root), "historyMode": "legacy",
+                        "status": fixture.status})
+                    return {"thread": copy.deepcopy(thread)}
                 if method == "thread/queue/list":
                     return {"data": [], "nextCursor": None}
                 raise AssertionError(method)
@@ -190,6 +194,69 @@ class RunnerTests(unittest.TestCase):
 
     def assert_not_invoked(self):
         self.assertFalse((self.root / "invoked.json").exists())
+
+    def test_idle_new_refuses_dispatch_then_first_turn_poison_holds(self):
+        new_session = str(uuid.uuid4())
+        self.loaded_sessions.append(new_session)
+        self.other_threads[new_session] = {"id": new_session, "cwd": self.record["cwd"],
+                                          "historyMode": "legacy", "status": {"type": "idle"}}
+        original = self.registry.read_bytes()
+        ledger = self.runner.ledger.read()
+        poison_path = self.directory / "custody-poison.json"
+        poison = poison_path.read_bytes()
+        # Idle /new has not fired a callback: binding and custody still look
+        # current, but the pane is no longer watching the bound UUID.
+        with patch.object(runner.subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(ValueError, "concurrent Codex threads in this cwd"):
+                self.runner.dispatch()
+            spawn.assert_not_called()  # Neither the old nor the new UUID.
+        self.assert_not_invoked()
+        self.assertEqual(self.registry.read_bytes(), original)
+        self.assertEqual(poison_path.read_bytes(), poison)
+        self.assertEqual(self.runner.ledger.read(), ledger)
+
+        # The first turn in the new UUID emits the trusted SessionStart. It
+        # must revoke old custody, never silently rebind or transfer the offer.
+        event = {"session_id": new_session, "cwd": self.record["cwd"],
+                 "hook_event_name": "SessionStart", "source": "startup"}
+        with patch.object(binding, "Daemon", return_value=self.daemon_class(None)):
+            with self.assertRaisesRegex(ValueError, "fresh/fork/clear"):
+                binding.bind(self.registry, event)
+        self.assertEqual(load(poison_path)["reason"], "callback_uuid_changed")
+        self.assertEqual(load(self.registry)["state"], "unbound")
+        self.assertEqual(load(self.registry)["session"], self.session)
+        with self.assertRaisesRegex(ValueError, "custody poisoned"):
+            runner.custody_check(self.registry, self.record, self.custody)
+        # Even if the new thread unloads, callback invalidation blocks an old
+        # offer, including after a runner restart.
+        self.loaded_sessions = [self.session]
+        for consumer in (self.runner, runner.Runner(self.registry)):
+            with self.assertRaisesRegex(ValueError, "binding changed or disabled"):
+                consumer.dispatch()
+        self.assertEqual(set(self.runner.ledger.read()["sessions"]), {self.session})
+        self.assertEqual(self.runner.ledger.read()["sessions"][self.session]["intent"]["state"], "prepared")
+        self.assert_not_invoked()
+
+    def test_only_loaded_thread_in_cwd_must_be_the_bound_uuid(self):
+        new_session = str(uuid.uuid4())
+        self.loaded_sessions.append(new_session)
+        self.other_threads[self.session] = {"id": self.session, "cwd": str(self.root / "elsewhere")}
+        self.other_threads[new_session] = {"id": new_session, "cwd": self.record["cwd"],
+                                          "historyMode": "legacy", "status": {"type": "idle"}}
+        with patch.object(runner.subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(ValueError, "loaded thread for this cwd is not the bound UUID"):
+                self.runner.dispatch()
+            spawn.assert_not_called()
+        self.assertEqual(load(self.registry)["session"], self.session)
+        self.assert_not_invoked()
+
+    def test_loaded_threads_in_other_cwds_do_not_block_bound_dispatch(self):
+        other_session = str(uuid.uuid4())
+        self.loaded_sessions.append(other_session)
+        self.other_threads[other_session] = {"id": other_session, "cwd": str(self.root / "elsewhere")}
+        self.runner.dispatch()
+        invoked = json.loads((self.root / "invoked.json").read_text())["argv"]
+        self.assertEqual(invoked[invoked.index("--thread") + 1], self.session)
 
     def test_no_grant_reservation_and_b0_fence_cannot_deliver(self):
         # launch.json's delivery_enabled is not authority; only the pinned
