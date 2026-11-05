@@ -32,6 +32,36 @@ Two per-route settings, whole percents from 1 to 100, with defaults of **80** an
 
 A route the captain has not named in the routes file (a ship's own first-mate profile) takes the defaults: 80 and 95.
 
+### Releasing the reserve near a reset
+
+A fixed reserve strands the end of an allowance: a route at 83% of its weekly window, ten hours before the reset, refuses work while the last 17% expires unused. The kept share therefore releases as the reset approaches. Each window releases against its own reset, and the reserve that applies is the one from the window furthest past its own effective share: the window a refusal would come from. A weekly window still far from its reset can be inside its share while the five-hour window is the one that refuses. For that window (Claude's five-hour or weekly window, or a run budget's window), the reserve shrinks in proportion to the time still left:
+
+```
+effective reserve = configured reserve × (time left ÷ window length)
+effective threshold = 1 − effective reserve
+```
+
+At the start of a window the threshold is the configured `crew_headroom_pct` or `first_mate_headroom_pct`; halfway through, half the reserve has been released; in the last minutes the threshold is almost 100%, so the route reaches its limit around the reset rather than forfeiting it. A window with no known reset, or one already past, keeps the configured share. The release is the same for both shares: the first mate's reserve protects interactive use while the window still has a long way to run, not after the reset is about to replace it.
+
+`reserve_release` is per route. The default is `"proportional"`; `"fixed"` keeps today's configured share until the reset for an operator who wants a hard reserve. The curve is a pure function of the configured reserve, `now`, the reset time and the window length, so it needs no provider knowledge and no wall clock in tests. Bearings show the effective reserve on the window that would refuse, the configured share and why it is released or fixed; a refusal likewise says why the reserve is at that figure.
+
+### Keeping a margin below the first mate
+
+Releasing both shares proportionally lets the two limits meet. The gap between the crew limit and the first-mate limit is the configured difference times the time left over the window length, so a reading just inside the crew limit is also just inside the first mate's: crews can spend the last of a plan down to the provider's own limit and lock the first mate out until the reset, about an hour on a five-hour window and most of a day on the weekly one. Crews and errands therefore keep a margin below the first mate's effective limit, always:
+
+```
+crew effective limit = min(crew proportional limit, first-mate effective limit − margin)
+errand effective limit = first-mate effective limit − margin
+```
+
+Or, in the terms the code keeps the share in, `crew reserve = max(crew released reserve, first-mate released reserve + margin)` and `errand reserve = first-mate released reserve + margin`. Crews are judged on the crew share; errands run on the first mate's share, since an errand is a first mate's thinking done elsewhere, so the margin is what always binds for them. With the default 95 and 3, an errand is refused at 92% while the reserve is still at its configured share, and stays three points below the first mate's released limit as that rises toward 100%; the first mate's own wake is admitted up to that released limit. The margin is `first_mate_margin_pct`, a whole percent of the window from 0 to 50, 3 by default and documented beside `reserve_release`. A margin of zero is the behaviour before this rule. A route that keeps no first-mate share (`first_mate_headroom_pct: 100`) has nothing to protect, so the margin does not apply there either.
+
+With `reserve_release: "fixed"` the first mate's share keeps its configured figure, so the margin binds for errands always (92% against a first-mate share of 95) and for crews only when the configured crew share is closer to the first-mate share than the margin itself: with the default 80 and 95 it never binds, and a crew share of 97 against a first-mate share of 95 still stops three points below the first mate. The first mate's own share is unchanged by the margin, released proportionally as before.
+
+When the margin is what holds the crew share back, the reason says so: a refusal and bearings read `kept 3% below the first mate's limit`, in place of the release reason.
+
+The rule needs a window length as well as a reset. Claude's five-hour and weekly readings have fixed lengths; a run budget's length comes from the route's `allowance` (`daily_utc` is a day, `window_hours` is that many hours). A reading without a known reset or length keeps the fixed share.
+
 ### The run budget
 
 `allowance.runs` is the number of runs the window holds. It has **no default**, because no runtime can tell what a plan allows; the captain states it. A route with no budget is never measured by runs.
@@ -53,28 +83,31 @@ A task error is not retried early. The same first mate with the same brief on an
 
 ## Changes by file
 
-- `src/routes.rs`: `Who`; `Spent` and `spent`; `refusal_for`, `held_off` and the headroom refusal; `route_usage` gains `runs` and `runs_window_ends_ms` (migrated under the write lock); `Allowance.runs` counted in `record_job`; Claude windows recorded for every Claude route.
-- `src/crew_routes.rs`: `Limits` (the two shares and the run budget), `limits`, `limits_of`; `runs` in the allowance shape and its validation; `choose` refuses at the crew share, and `resume_route` is blocked only by a hold; `first_mate_fallback` and the new `retry_fallback` at the first-mate share; `RouteState.spent` shows the share in bearings and in the fleet snapshot.
+- `src/routes.rs`: `Who`; `Spent` (now carrying its window's reset and length) and `spent`; `reserve` (the release curve and its reason), `crew_reserve` and `errand_reserve` (that curve floored a margin below the first mate's, for the crew share and the first-mate share) and `binding` (the window a refusal comes from); `refusal_for`, `held_off` and the headroom refusal; `route_usage` gains `runs` and `runs_window_ends_ms` (migrated under the write lock); `Allowance.runs` counted in `record_job`; Claude windows recorded for every Claude route.
+- `src/crew_routes.rs`: `Limits` (the two shares, the first-mate margin, the run budget, its window length and the release setting), `Release`, `limits`, `limits_of`; `reserve_release` and `first_mate_margin_pct` in route validation; `runs` in the allowance shape and its validation; `choose` refuses at the crew share, and `resume_route` is blocked only by a hold; `first_mate_fallback` and the new `retry_fallback` at the first-mate share; `RouteState.spent` shows the share in bearings and in the fleet snapshot, and bearings add the effective reserve on the binding window, its configured share and why it is released, fixed or kept below the first mate's limit, using the identity's share for each list (errand and review are selected on the crew share).
 - `src/activation.rs`: `own_route_blocked` reads the first-mate share; `Last`, `Retry` and `retryable`; the wake row records `retry_of`; the retry is taken outside both waits and skips its answered mail; `wake_text` tells the retry what it is retrying.
 - `src/lib.rs`: a launch is judged as the kind it is, so a first mate's own wake is not refused at the crew share.
 - `src/snapshot.rs`: each route row carries `used`, the share spent and the window it is from.
 
 ## Tests
 
-Unit tests: the share is the furthest window and names it, and a closed window or an unstated budget counts for nothing; runs count whether the run succeeded or was refused, and the count resets with its window; a Claude reading is kept for a route that declares no allowance; the defaults are 80 and 95 with no budget, and a run budget needs a whole number of runs.
+Unit tests: the share is the furthest window and names it, and a closed window or an unstated budget counts for nothing; the reserve release curve just after a reset, mid window, the final minutes, exactly at and past a reset, beyond a whole window ahead, and with no reset or window length; the crew share keeps three points below the first mate's released limit in the final minutes of a five-hour and of a weekly window, and the errand share does the same; an errand stops at 92% on the default shares while the first mate's reserve is configured and stays three points below it as it releases; a zero margin is exactly the old release for crews and errands, a route with no first-mate share keeps no margin, and a fixed route keeps its configured shares unless the margin is stricter; the binding window is the one furthest past its own share; the opt-out keeps the configured share; runs count whether the run succeeded or was refused, and the count resets with its window; a Claude reading is kept for a route that declares no allowance; the defaults are 80, 95 and a 3-point margin with no budget, and a run budget needs a whole number of runs.
 
 Integration, with an isolated routes file and ledger (`PRIVATEER_FLEET`, `PRIVATEER_RESOURCE_HOME`) and fake harnesses:
 
 - A fake Claude Code that reports a share of each window on every run: crew are refused past 80 percent and take the next route, the refusal names the window and both shares, bearings and the snapshot show the share, and a first mate is still inside its own reserve at 90 percent.
 - A run budget of three: the third run starts, the fourth takes the next route, the refusal says "run budget (3 of 3 runs)", and a closed window counts from nothing.
-- Bounded settings: percents outside 1 to 100 and budgets outside 1 to 10000 are refused, and two names for one model must agree on the budget as well as the shape.
+- Bounded settings: percents outside 1 to 100, margins outside 0 to 50 and budgets outside 1 to 10000 are refused, and two names for one model must agree on the budget as well as the shape.
 - A first mate with a budget on its own route: it wakes there, keeps the route at four fifths, moves to the fallback in a fresh session past nineteen twentieths, and returns when the window renews.
+- A weekly reading at 83% with six days left refuses new crew, the same reading ten hours before the reset takes them, and after the reset the route is clear; a route with `reserve_release: "fixed"` keeps refusing at the configured share, and bearings show the effective reserve and why.
+- An hour before a weekly reset, a reading two points under the first mate's limit refuses crews, with a refusal that says the margin is what binds, refuses an errand on the same route through the first_mate list, and admits the first mate's own wake; the same route with `first_mate_margin_pct: 0` takes the crew again.
 - A wake that answers one request and is then refused by the provider: it is retried at once on the fallback with `retry_backoff_secs` of an hour and `max_wakes_per_hour` of one, the retry's prompt names the wake and the answered request and does not carry it, and the answered request is never answered twice.
 - A retry that fails is not retried again: the wake after it is an ordinary one, with no retry line in its prompt.
 
 ## Not in this change
 
 - **A pace-based check**: percent used against percent of the window elapsed. This is the planned next step, and it is the one that would catch a plan being drained too early rather than too late. It needs the window's start, which a run budget records lazily (`runs_window_ends_ms`) and Claude reports (`resetsAt` gives only the end).
+- **Releasing against a window whose start is unknown**: the release uses the reset and the window's declared length, not the observed window start. A rolling window opened late in the day is treated as a full-length window, so its reserve releases more slowly than a start-based curve would.
 - **Stopping or queueing running work** at the high share. The captain's answer was not to.
 - **A default run budget**, which no runtime can invent.
 - **Per-account budgets** for routes that share one plan under different names. The share is per route identity today, as `route_usage` is keyed.

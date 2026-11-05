@@ -19,8 +19,15 @@
 //! the window holds, with no default, because no runtime can guess one.
 //! `crew_headroom_pct` and `first_mate_headroom_pct` (both whole percents, 80
 //! and 95 by default) are the shares at which the route stops taking new
-//! crew and errands, and at which a first mate moves to its fallback. Running
-//! work is never stopped: it is what spends the reserve.
+//! crew and errands, and at which a first mate moves to its fallback. By
+//! default the kept share releases as the window's reset approaches: it
+//! shrinks in proportion to the time left, reaching zero at the reset, so the
+//! end of an allowance is used rather than lost. `reserve_release: "fixed"`
+//! keeps the configured share until the reset. Crews and errands always stop
+//! `first_mate_margin_pct` (3 by default) below the first mate's own released
+//! limit on the same window, so they cannot spend the last of a plan and lock
+//! the first mate out until the reset. Running work is never stopped:
+//! it is what spends the reserve.
 //!
 //! A `routes.set` may be temporary: with `until_ms`, or `until_reset` naming a
 //! route whose allowance has a fixed reset, the file keeps the routes it
@@ -51,6 +58,9 @@ pub(crate) const USES: [&str; 4] = ["implement", "review", "diagnose", "design"]
 pub(crate) const CREW_HEADROOM_PCT: f64 = 80.0;
 /// The larger share a first mate keeps for itself by default.
 pub(crate) const FIRST_MATE_HEADROOM_PCT: f64 = 95.0;
+/// The points of the window crews and errands keep below the first mate's
+/// released limit by default, so they never spend the last of a plan.
+pub(crate) const FIRST_MATE_MARGIN_PCT: f64 = 3.0;
 /// The largest run budget a window may hold: far past any plan, so a
 /// mistyped figure refuses rather than refusing nothing.
 const MAX_RUNS: u64 = 10_000;
@@ -63,13 +73,29 @@ const MAX_TEMPORARY_MS: i64 = 31 * DAY_MS;
 
 /// What a route keeps in reserve: the share of its plan at which new crew and
 /// errands are refused, the share at which a first mate moves to its fallback,
-/// and the runs its window holds when the harness reports no usage of its own.
+/// the points of the window crew always keep below that first-mate share, and
+/// the runs its window holds when the harness reports no usage of its own.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Limits {
     pub crew: f64,
     pub first_mate: f64,
+    /// How far below the first mate's released limit crews and errands stop.
+    pub first_mate_margin: f64,
     pub runs: Option<u64>,
+    /// The length of the window a run budget counts in, so its reserve can
+    /// release with the time left. None when the route has no allowance.
+    pub runs_window_ms: Option<i64>,
     pub max_running: Option<u64>,
+    pub release: Release,
+}
+
+/// How a route's kept share behaves before its window resets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Release {
+    /// The kept share shrinks in proportion to the time left in the window.
+    Proportional,
+    /// The configured share is kept until the window resets.
+    Fixed,
 }
 
 impl Default for Limits {
@@ -77,8 +103,11 @@ impl Default for Limits {
         Limits {
             crew: CREW_HEADROOM_PCT / 100.0,
             first_mate: FIRST_MATE_HEADROOM_PCT / 100.0,
+            first_mate_margin: FIRST_MATE_MARGIN_PCT / 100.0,
             runs: None,
+            runs_window_ms: None,
             max_running: None,
+            release: Release::Proportional,
         }
     }
 }
@@ -87,11 +116,27 @@ impl Default for Limits {
 /// shares and no budget at all, since only the captain knows one.
 pub(crate) fn limits(route: &Value) -> Limits {
     let pct = |name: &str, default: f64| route[name].as_f64().unwrap_or(default) / 100.0;
+    let declared = allowance(route);
     Limits {
         crew: pct("crew_headroom_pct", CREW_HEADROOM_PCT),
         first_mate: pct("first_mate_headroom_pct", FIRST_MATE_HEADROOM_PCT),
-        runs: allowance(route).and_then(|allowance| allowance.runs),
+        first_mate_margin: pct("first_mate_margin_pct", FIRST_MATE_MARGIN_PCT),
+        runs: declared.and_then(|allowance| allowance.runs),
+        runs_window_ms: declared.map(run_window_ms),
         max_running: route["max_running"].as_u64(),
+        release: match route["reserve_release"].as_str() {
+            Some("fixed") => Release::Fixed,
+            _ => Release::Proportional,
+        },
+    }
+}
+
+/// The length of a run budget's window: a day for a daily allowance, or the
+/// rolling window's own hours.
+fn run_window_ms(allowance: Allowance) -> i64 {
+    match allowance.shape {
+        Shape::Daily(_) => DAY_MS,
+        Shape::Rolling { window_ms, .. } => window_ms,
     }
 }
 
@@ -222,6 +267,8 @@ fn validate_at(value: &Value, depth: usize) -> Result<()> {
                         | "uses"
                         | "crew_headroom_pct"
                         | "first_mate_headroom_pct"
+                        | "first_mate_margin_pct"
+                        | "reserve_release"
                         | "explicit_only"
                         | "max_running"
                 ),
@@ -287,6 +334,18 @@ fn validate_at(value: &Value, depth: usize) -> Result<()> {
                 "route {name} {key} must be a whole percent from 1 to 100"
             );
         }
+        ensure!(
+            route
+                .get("first_mate_margin_pct")
+                .is_none_or(|p| p.as_u64().is_some_and(|p| p <= 50)),
+            "route {name} first_mate_margin_pct must be a whole percent from 0 to 50"
+        );
+        ensure!(
+            route
+                .get("reserve_release")
+                .is_none_or(|release| matches!(release.as_str(), Some("proportional" | "fixed"))),
+            "route {name} reserve_release must be \"proportional\" or \"fixed\""
+        );
         if let Some(uses) = route.get("uses") {
             ensure!(
                 route.get("tier").is_some(),
@@ -2289,9 +2348,14 @@ pub(crate) fn states(
         states.push(RouteState {
             running,
             max_running,
-            spent: used
-                .as_ref()
-                .and_then(|used| crate::routes::spent(used, declared.and_then(|a| a.runs), now)),
+            spent: used.as_ref().and_then(|used| {
+                crate::routes::spent(
+                    used,
+                    declared.and_then(|a| a.runs),
+                    declared.map(run_window_ms),
+                    now,
+                )
+            }),
             name: Some(name.clone()),
             route: id,
             cost: route["cost"].as_str().map(str::to_owned),
@@ -2315,7 +2379,7 @@ pub(crate) fn states(
         states.push(RouteState {
             spent: used
                 .as_ref()
-                .and_then(|used| crate::routes::spent(used, None, now)),
+                .and_then(|used| crate::routes::spent(used, None, None, now)),
             name: None,
             running: crate::routes::running(ledger, &key)?,
             max_running: None,
@@ -2390,6 +2454,21 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
                     .map(str::to_owned),
             );
             let declared = allowance(route);
+            // A refusal looks up the first name for the route's identity, so
+            // an alias must show that name's share and release setting too.
+            let route_limits = identity(route)
+                .as_deref()
+                .map_or_else(Limits::default, |id| named_limits(&policy, id));
+            // Crew, errand and review launches are all selected on the crew
+            // share (`choose` and `choose_reviewer` use `Who::Crew`), so the
+            // line names that share for those lists. A first mate keeps its
+            // own, larger share.
+            let who = match kind {
+                "first_mate" => Who::FirstMate,
+                _ => Who::Crew,
+            };
+            let reserve =
+                reserve_note(&route_limits, read.and_then(|r| r.usage.as_ref()), who, now);
             if let Some(allowance) = declared {
                 shaped = true;
                 let mut about = format!("{}, {}", describe(allowance.shape), strength(route));
@@ -2407,6 +2486,9 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
                 }) {
                     about.push_str(&format!(", {runs} of {budget} runs"));
                 }
+                if let Some(reserve) = reserve {
+                    about.push_str(&format!(", {reserve}"));
+                }
                 details.push(about);
             } else {
                 let mut about = strength(route);
@@ -2418,6 +2500,9 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
                         spent.share * 100.0,
                         spent.what
                     ));
+                }
+                if let Some(reserve) = reserve {
+                    about.push_str(&format!(", {reserve}"));
                 }
                 details.push(about);
             }
@@ -2490,6 +2575,37 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
         text.push_str(&format!("\nIdle allowances: {}.", idle.join(", ")));
     }
     Ok(Some(text))
+}
+
+/// The reserve state bearings show for a route with usage readings: the share
+/// kept now for the window a refusal would come from, the configured share it
+/// came from, and why it is released or fixed.
+fn reserve_note(
+    limits: &Limits,
+    usage: Option<&crate::routes::Usage>,
+    who: Who,
+    now: i64,
+) -> Option<String> {
+    let usage = usage?;
+    let configured = 1.0
+        - match who {
+            Who::Crew => limits.crew,
+            Who::FirstMate | Who::Errand => limits.first_mate,
+        };
+    let binding =
+        crate::routes::binding(usage, limits.runs, limits.runs_window_ms, limits, who, now)?;
+    let what = match who {
+        Who::Crew => "crew",
+        Who::FirstMate => "first mate",
+        Who::Errand => "errand",
+    };
+    Some(format!(
+        "{:.0}% reserve for {what} on its {} (of {:.0}%, {})",
+        binding.kept * 100.0,
+        binding.reading.what,
+        configured * 100.0,
+        binding.reason.why()
+    ))
 }
 
 pub(crate) fn describe(shape: Shape) -> String {
@@ -2922,6 +3038,7 @@ mod tests {
         assert_eq!(default.crew, 0.8);
         assert_eq!(default.first_mate, 0.95);
         assert_eq!(default.runs, None, "no runtime can guess a run budget");
+        assert_eq!(default.release, Release::Proportional);
         let mut own = route(
             "own",
             json!({"crew_headroom_pct": 60,
@@ -2931,9 +3048,24 @@ mod tests {
         assert_eq!(limits(&own).crew, 0.6);
         assert_eq!(limits(&own).first_mate, 0.9);
         assert_eq!(limits(&own).runs, Some(12));
+        assert_eq!(limits(&own).runs_window_ms, Some(5 * 3_600_000));
+        // Crew keep three points below the first mate's limit by default, and
+        // a route may state its own margin or none at all.
+        assert_eq!(default.first_mate_margin, 0.03);
+        own["first_mate_margin_pct"] = json!(0);
+        assert_eq!(limits(&own).first_mate_margin, 0.0);
+        own["first_mate_margin_pct"] = json!(7);
+        assert_eq!(limits(&own).first_mate_margin, 0.07);
+        assert!(
+            validate(&json!({"routes": {"own": own.clone()},
+            "first_mate": ["own"]}))
+            .is_ok()
+        );
         // A run budget needs no share settings, and shares alone no budget.
         own["allowance"] = json!({"window_hours": 5});
         assert_eq!(limits(&own).runs, None);
+        own["reserve_release"] = json!("fixed");
+        assert_eq!(limits(&own).release, Release::Fixed);
         assert_eq!(runs(&json!({"daily_utc": "07:00"})).unwrap(), None);
         for bad in [
             json!({"runs": 0}),

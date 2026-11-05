@@ -771,8 +771,11 @@ fn crew_on_the_first_mate_list_pass_a_route_past_the_crew_share() {
     let mut mate = codex("model-mate", "plan");
     mate["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
     mate["tier"] = json!(1);
+    mate["reserve_release"] = json!("fixed");
+    let mut spare = codex("model-spare", "plan");
+    spare["reserve_release"] = json!("fixed");
     f.routes(json!({
-        "routes": {"mate": mate, "spare": codex("model-spare", "plan")},
+        "routes": {"mate": mate, "spare": spare},
         "first_mate": ["mate", "spare"]
     }));
     f.tick();
@@ -1265,6 +1268,8 @@ fn a_reported_window_keeps_new_crew_off_the_route_and_leaves_the_first_mate_room
     let mut shared = claude("sonnet");
     shared["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
     shared["tier"] = json!(1);
+    // This test pins the fixed-reserve behaviour; the release has its own test.
+    shared["reserve_release"] = json!("fixed");
     f.routes(json!({
         "routes": {"shared": shared, "other": codex("model-other", "plan")},
         "crew": ["shared", "other"],
@@ -1322,6 +1327,311 @@ fn a_reported_window_keeps_new_crew_off_the_route_and_leaves_the_first_mate_room
     );
 }
 
+/// A route's kept share releases as the window's reset approaches: the same
+/// weekly reading refuses crew with six days left, takes them ten hours before
+/// the reset, and is clear after it. `reserve_release: "fixed"` keeps the
+/// configured share until the reset instead.
+#[test]
+fn a_reserve_releases_as_the_weekly_reset_nears() {
+    let f = Fleet::new();
+    let mut shared = claude("sonnet");
+    shared["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
+    shared["tier"] = json!(1);
+    f.routes(json!({
+        "routes": {"shared": shared, "other": codex("model-other", "plan")},
+        "crew": ["shared", "other"]
+    }));
+    f.tick();
+    let ledger = || rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    let now = privateer::store::Store::now_ms();
+    let set_reset = |ends: i64| {
+        ledger()
+            .execute(
+                "INSERT OR REPLACE INTO route_usage(route, weekly_utilization, weekly_ends_ms, updated_ms)
+                 VALUES('claude/-/sonnet', 0.83, ?1, ?2)",
+                rusqlite::params![ends, now],
+            )
+            .unwrap();
+    };
+
+    // Six days still to run: the reserve is nearly the configured one, and
+    // 83% is past the crew share.
+    set_reset(now + 6 * 24 * 3_600_000);
+    let refused = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"shared"}),
+    );
+    assert!(refused.contains("83% of its weekly window"), "{refused}");
+    assert!(refused.contains("reserve of the configured"), "{refused}");
+    assert!(refused.contains("released as the reset nears"), "{refused}");
+
+    // Ten hours before the reset the kept share has shrunk, so the same
+    // reading is inside it; the margin below the first mate's limit is what
+    // it is inside now.
+    set_reset(now + 10 * 3_600_000);
+    let allowed = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"shared"}),
+    );
+    assert_eq!(f.model(&allowed), "sonnet", "{allowed}");
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(text.contains("reserve for crew"), "{text}");
+    assert!(
+        text.contains("kept 3% below the first mate's limit"),
+        "{text}"
+    );
+
+    // A route can keep the configured share instead.
+    let mut fixed = claude("sonnet");
+    fixed["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
+    fixed["tier"] = json!(1);
+    fixed["reserve_release"] = json!("fixed");
+    f.routes(json!({
+        "routes": {"shared": fixed, "other": codex("model-other", "plan")},
+        "crew": ["shared", "other"]
+    }));
+    let refused = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"shared"}),
+    );
+    assert!(refused.contains("80% for crew"), "{refused}");
+    assert!(refused.contains("fixed until the reset"), "{refused}");
+
+    // Past the reset the reading expires and the route takes crew again.
+    set_reset(now - 1_000);
+    let allowed = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"shared"}),
+    );
+    assert_eq!(f.model(&allowed), "sonnet", "{allowed}");
+}
+
+/// Crews stop a margin below the first mate's limit even in the last minutes
+/// of a window, so a crew cannot spend the plan down and lock the first mate
+/// out until the reset. An hour before a weekly reset a reading two points
+/// under the first mate's limit refuses crew and admits the first mate; the
+/// same route with `first_mate_margin_pct: 0` takes the crew again.
+#[test]
+fn crews_stop_below_the_first_mates_limit_near_the_reset() {
+    let f = Fleet::new();
+    let mut shared = claude("sonnet");
+    shared["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
+    shared["tier"] = json!(1);
+    let lists = |route: Value| {
+        json!({
+            "routes": {"shared": route, "other": codex("model-other", "plan")},
+            "crew": ["shared", "other"],
+            "first_mate": ["shared"]
+        })
+    };
+    f.routes(lists(shared.clone()));
+    f.tick();
+    let now = privateer::store::Store::now_ms();
+    let window = 7 * 24 * 3_600_000;
+    let left = 3_600_000;
+    // The first mate's released limit an hour before the weekly reset, and a
+    // reading two points inside it: a crew would take the last of the plan.
+    let mate_kept = 0.05 * (left as f64 / window as f64);
+    let reading = 1.0 - mate_kept - 0.02;
+    let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    ledger
+        .execute(
+            "INSERT OR REPLACE INTO route_usage(route, weekly_utilization, weekly_ends_ms,
+               updated_ms)
+             VALUES('claude/-/sonnet', ?1, ?2, ?3)",
+            rusqlite::params![reading, now + left, now],
+        )
+        .unwrap();
+
+    // Crew are refused, and the refusal says the margin is what binds.
+    let refused = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"shared"}),
+    );
+    assert!(
+        refused.contains("kept 3% below the first mate's limit"),
+        "{refused}"
+    );
+    // An errand, which runs on the first mate's share through the first_mate
+    // list, keeps the same margin: it is refused below the first mate's limit.
+    let refused = f.refused(
+        Some("engineering"),
+        "errand.start",
+        json!({"focus":"task:fix","brief":"Review the fix."}),
+    );
+    assert!(
+        refused.contains("kept 3% below the first mate's limit"),
+        "{refused}"
+    );
+    assert!(refused.contains("nothing is queued"), "{refused}");
+    // The first mate's own wake is admitted on the same route, same reading.
+    f.in_process(|store| {
+        store
+            .connection()
+            .execute(
+                "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms)
+                 VALUES('wake-margin','engineering','duty',0,'wake-margin','fresh','running',0)",
+                [],
+            )
+            .unwrap();
+    });
+    let wake = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"wake-margin"}),
+    );
+    assert_eq!(f.model(&wake), "sonnet", "{wake}");
+    // Bearings say why the crew share is where it is, and the first mate's
+    // own share is still released as the reset nears.
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("reserve for crew") && text.contains("kept 3% below the first mate's limit"),
+        "{text}"
+    );
+    assert!(
+        text.contains("reserve for first mate") && text.contains("released as the reset nears"),
+        "{text}"
+    );
+
+    // With no margin the route takes the crew again: the old behaviour.
+    shared["first_mate_margin_pct"] = json!(0);
+    f.routes(lists(shared));
+    let crew = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-margin-zero","route":"shared"}),
+    );
+    assert_eq!(f.model(&crew), "sonnet", "{crew}");
+}
+
+/// Bearings show the share and release setting of the first name for the
+/// route's identity, the same lookup a refusal uses, not the alias's own.
+#[test]
+fn bearings_show_the_identity_share_a_refusal_uses_for_an_alias() {
+    let f = Fleet::new();
+    let mut strict = claude("sonnet");
+    strict["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
+    strict["tier"] = json!(1);
+    strict["crew_headroom_pct"] = json!(50);
+    strict["reserve_release"] = json!("fixed");
+    let mut alias = strict.clone();
+    alias["crew_headroom_pct"] = json!(100);
+    alias["reserve_release"] = json!("proportional");
+    f.routes(json!({
+        "routes": {"a-strict": strict, "z-alias": alias,
+            "other": codex("model-other", "plan")},
+        "crew": ["z-alias", "other"]
+    }));
+    f.tick();
+    let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    let now = privateer::store::Store::now_ms();
+    ledger
+        .execute(
+            "INSERT OR REPLACE INTO route_usage(route, weekly_utilization, weekly_ends_ms, updated_ms)
+             VALUES('claude/-/sonnet', 0.90, ?1, ?2)",
+            rusqlite::params![now + 6 * 24 * 3_600_000, now],
+        )
+        .unwrap();
+
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(text.contains("50% reserve for crew"), "{text}");
+    assert!(text.contains("fixed until the reset"), "{text}");
+}
+
+/// The reserve line comes from the window a refusal would come from, not the
+/// most-spent one: a weekly window at 95% an hour before its reset is inside
+/// its released share while the five-hour window at 82% is the one refusing.
+#[test]
+fn bearings_report_the_window_that_would_refuse_the_reserve() {
+    let f = Fleet::new();
+    let mut shared = claude("sonnet");
+    shared["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
+    shared["tier"] = json!(1);
+    f.routes(json!({
+        "routes": {"shared": shared, "other": codex("model-other", "plan")},
+        "crew": ["shared", "other"]
+    }));
+    f.tick();
+    let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    let now = privateer::store::Store::now_ms();
+    ledger
+        .execute(
+            "INSERT OR REPLACE INTO route_usage(route, window_utilization, window_ends_ms,
+               weekly_utilization, weekly_ends_ms, updated_ms)
+             VALUES('claude/-/sonnet', 0.82, ?1, 0.95, ?2, ?3)",
+            rusqlite::params![now + 4_900 * 3_600, now + 3_600_000, now],
+        )
+        .unwrap();
+
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("20% reserve for crew on its five-hour window"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("0% reserve for crew on its weekly window"),
+        "{text}"
+    );
+}
+
+/// Errand and review launches are selected on the crew share, so bearings name
+/// that share for those lists rather than the first mate's larger one.
+#[test]
+fn bearings_use_the_crew_share_for_errand_and_review_lists() {
+    let f = Fleet::new();
+    let mut shared = claude("sonnet");
+    shared["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
+    shared["tier"] = json!(1);
+    shared["uses"] = json!(["review"]);
+    shared["crew_headroom_pct"] = json!(70);
+    shared["first_mate_headroom_pct"] = json!(95);
+    shared["reserve_release"] = json!("fixed");
+    f.routes(json!({
+        "routes": {"shared": shared},
+        "errand": ["shared"],
+        "review": ["shared"]
+    }));
+    f.tick();
+    let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    let now = privateer::store::Store::now_ms();
+    ledger
+        .execute(
+            "INSERT OR REPLACE INTO route_usage(route, weekly_utilization, weekly_ends_ms, updated_ms)
+             VALUES('claude/-/sonnet', 0.90, ?1, ?2)",
+            rusqlite::params![now + 6 * 24 * 3_600_000, now],
+        )
+        .unwrap();
+
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    let errand = text
+        .split("errand: ")
+        .nth(1)
+        .unwrap()
+        .split("review: ")
+        .next()
+        .unwrap();
+    assert!(errand.contains("30% reserve for crew"), "{text}");
+    assert!(!errand.contains("5% reserve"), "{text}");
+    let review = text
+        .split("review: ")
+        .nth(1)
+        .unwrap()
+        .split('\n')
+        .next()
+        .unwrap();
+    assert!(review.contains("30% reserve for crew"), "{text}");
+}
+
 /// An expired window counts as 0, so crew are not refused once the window's
 /// reset time has passed.
 #[test]
@@ -1330,6 +1640,7 @@ fn an_expired_window_lets_crew_back_onto_the_route() {
     let mut shared = claude("sonnet");
     shared["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
     shared["tier"] = json!(1);
+    shared["reserve_release"] = json!("fixed");
     f.routes(json!({
         "routes": {"shared": shared, "other": codex("model-other", "plan")},
         "crew": ["shared", "other"]
@@ -1437,6 +1748,7 @@ fn a_parked_crew_resumes_on_its_route_at_eighty_five_percent() {
     let mut shared = claude("sonnet");
     shared["crew_headroom_pct"] = json!(80);
     shared["first_mate_headroom_pct"] = json!(95);
+    shared["reserve_release"] = json!("fixed");
     f.routes(json!({
         "routes": {"shared": shared},
         "crew": ["shared"]
@@ -1633,11 +1945,32 @@ fn headroom_settings_and_run_budgets_are_bounded_and_agree_across_one_identity()
             json!(95.5),
             "must be a whole percent from 1 to 100",
         ),
+        (
+            "first_mate_margin_pct",
+            json!(51),
+            "must be a whole percent from 0 to 50",
+        ),
+        (
+            "first_mate_margin_pct",
+            json!(-1),
+            "must be a whole percent from 0 to 50",
+        ),
+        (
+            "first_mate_margin_pct",
+            json!(1.5),
+            "must be a whole percent from 0 to 50",
+        ),
     ] {
         let mut route = codex("model-a", "plan");
         route[setting] = value;
         refuse(json!({"routes": {"a": route}}), wanted);
     }
+    let mut bad_release = codex("model-a", "plan");
+    bad_release["reserve_release"] = json!("sometimes");
+    refuse(
+        json!({"routes": {"a": bad_release}}),
+        "reserve_release must be",
+    );
     let mut none = budget.clone();
     none["allowance"] = json!({"window_hours": 5, "runs": 0});
     refuse(
@@ -2065,10 +2398,8 @@ fn the_fleet_snapshot_shows_each_route_in_the_state_bearings_show() {
         text.contains("busy (credits; unranked) backing off"),
         "{text}"
     );
-    assert!(
-        text.contains("tier 1, no uses, window 97% used) capped until"),
-        "{text}"
-    );
+    assert!(text.contains("tier 1, no uses, window 97% used"), "{text}");
+    assert!(text.contains(") capped until"), "{text}");
     assert!(
         text.contains("Idle allowances: flash (daily 07:00 UTC"),
         "{text}"
