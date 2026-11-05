@@ -84,6 +84,61 @@ continues to stop the initial turn. Idle settings/update also worked, but is not
 as a potentially racy first-turn update. `thread/start` config effort alone is
 not relied on across attach. No credentials, real inference or live pane is used.
 
+## ACT3b: PTY qualification and remaining attachment gap
+
+Reproduce against the installed binary and a **new**, private fixture root:
+
+```sh
+python3 -B scripts/codex-attended-pty-spike.py --codex /absolute/path/to/codex \
+  --root /var/tmp/act3b-pty-probe
+```
+
+The fixture uses real PTYs and an owned, peer-verified daemon with isolated homes,
+a fixture-only presence/report double and trusted stopping hooks. Exactly one
+nonce-selected mail reaches its own loopback mock; there is no login, real
+provider request, Rust hosted supervisor/grant, live pane or Herdr session.
+Logs remain in the root. Native 0.166.0 evidence is checked into
+`tests/fixtures/codex-attended-pty.json`; offline tests replay its receipt and
+assert its negative attachment/navigation findings. See the design's ACT3b
+section for barriers and scope.
+
+- An unsent draft survives a queued mail turn and reaches its submit hook exactly
+  once, only after explicit captain Enter.
+- In both delivery-first and captain-submit-first races, exact captain/mail
+  prompts reach their hooks once. Delivery-first preserves typing and native
+  Tab-queued follow-up input; captain-first holds exactly one pending native
+  mail until the captain turn ends. The one accepted mock mail has an exact
+  queue-triggered turn/client receipt, recovered after reducer restart with
+  accepted 1 / ack 0. Hook-stopped inputs are **not** presentation receipts.
+- After both clients exit, a new production prepare-generated exact-UUID resume
+  on the same daemon fires SessionStart and binds with explicit `ship-model` /
+  `high` read back. An owned-daemon restart plus explicit relaunch also recovers
+  the same UUID/watermark without replay. Dead PID state is not renewed custody.
+- Idle `/new` fires no callback: the old binding remains bound until a new-UUID
+  turn enters SessionStart, then becomes unbound with sticky custody poison
+  `callback_uuid_changed`. This is not instantaneous navigation detection.
+
+**Known upstream per-client identity gap:** an idle second TUI attaching the
+same UUID fires no SessionStart, and its first submit emits only
+UserPromptSubmit with no client/attachment identity. Neither is fenced; the
+binding remains bound. Public idle/loaded fields cannot prove exclusive/current
+TUI attachment. This negative evidence does not block the separately authorized
+PR C pilot, but is not second-client safety qualification. Another client can
+also change shared model/effort; attach read-back is not continuous enforcement.
+Upstream needs authenticated per-TUI attach identity/epoch, ordered navigation
+and detach events, a reconnect snapshot and conditional queue admission.
+
+When a same-UUID **resume callback does occur after custody is already owned**,
+the adapter conservatively poisons custody before taking the state lock:
+`resume_callback_requires_relaunch`. The runner pauses with `custody poisoned:
+resume callback requires explicit hosted relaunch`; later compact/rebind or a
+runner restart cannot clear it. Only a new explicit hosted launch can do so.
+Deterministic dispatcher/direct-handler/runner tests prove this fence, including
+lock timeout. It does **not** detect the silent second-client case above.
+Pane-exit/spawn and daemon-replacement races retain the existing pidfd/poison and
+possibly-unattended budget boundary. No live mail/autonomy/deployment claim is
+made; paginated installs still get no idle mail.
+
 Explicit opt-in: set `PRIVATEER_CODEX_ATTENDED=1` for a Privateer attended Codex
 launch **with `codex resume <exact UUID>`**. Fresh launches are refused before
 exec: a stable project hook cannot prove which pane created a new thread when
@@ -115,8 +170,9 @@ hash: **review and re-trust the new declaration through `/hooks`** before bindin
 An older non-isolated dispatcher also requires explicit review/removal before
 reinstall; its command trust hash changes with `-I`. Unexpected dispatcher file
 contents are never silently overwritten, except for explicit migrations of the
-**exact known B0, B1, B2 and B5a dispatcher bytes** (SHA-256 pinned in `codex_binding.py`,
-fixtures in `tests/fixtures/codex-dispatcher-b{0,1,2,5a}.txt`). Prepare upgrades that body atomically
+**exact known B0, B1, B2, B5a and ACT3a dispatcher bytes** (SHA-256 pinned in `codex_binding.py`,
+fixtures in `tests/fixtures/codex-dispatcher-b{0,1,2,5a}.txt` and
+`tests/fixtures/codex-dispatcher-act3a.txt`). Prepare upgrades that body atomically
 only after refusing a live owner and while holding the project lock. A changed
 B0 body is refused. The command/declaration and native trust remain untouched;
 the new launch is UNBOUND and delivery-disabled, never grandfathered in.

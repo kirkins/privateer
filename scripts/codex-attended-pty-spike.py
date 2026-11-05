@@ -2,6 +2,7 @@
 """ACT3b native PTY evidence, NOT a live hosted-mail/autonomy pilot.
 
 Installed Codex, owned app-server, isolated homes, one loopback mock request.
+Use a new private /var/tmp root; all logs and evidence are retained there.
 No credentials, managed daemon installation, production grant or route changes.
 The raw bounded logs/evidence remain in --root. Native attachment gaps are
 reported as negative qualification, never inferred from loaded/idle.
@@ -399,7 +400,8 @@ trust_level = "trusted"
         assert not any(e.get("type") == "user_message" for e in reverse)
         self.evidence["qualification"]["submit_first_race"] = {"captain_hook_count": self.prompt_count(submit_first),
             "mail_hook_count": self.prompt_count(queued_later), "pending_count_before_release": 1,
-            "turn_triggers": ["user", "queue"], "stopped_hooks_are_not_receipts": True}
+            "turn_triggers": ["user", "queue"], "pending": pending,
+            "events": reverse, "stopped_hooks_are_not_receipts": True}
         # 3: Same UUID second idle client is a known negative discriminator.
         # Fixture-owned subset of the Rust custody record, for the callback
         # revocation consumer only. NOT a runtime lease/grant or runner proof.
@@ -443,7 +445,8 @@ trust_level = "trusted"
         self.evidence["qualification"]["same_daemon_reconnect"] = {
             "state": same_record["state"], "delivery_enabled": same_record["delivery_enabled"],
             "new_generation": True, "same_uuid": True, "same_daemon": True,
-            "settings": same_record["binding"]["settings"], "session_start": True}
+            "settings": same_record["binding"]["settings"], "session_start": True,
+            "prepare_argv": same_record["argv"], "attach_daemon": same_record["attach_daemon"]}
         same_daemon.stop()
         self.stop_daemon()
         self.start_daemon()
@@ -452,10 +455,14 @@ trust_level = "trusted"
         assert fresh["generation"] != old_generation and fresh["session"] == self.session
         assert fresh["state"] == "bound"
         assert fresh["binding"]["settings"] == {"model": "ship-model", "effort": "high"}
+        assert fresh["attach_daemon"] != same_record["attach_daemon"]
+        assert self.thread()["modelProvider"] == "fixture"
         recovered = receipts.Ledger(self.registry, record["home"], "alpha").reconcile(self.session, nonce, queue)
         assert recovered["accepted_through"] == 1 and recovered["acknowledged_through"] == 0
         self.evidence["qualification"]["reconnect"] = {"dead_old_process_refused": True,
-            "new_generation": True, "same_uuid": True, "accepted_through": 1, "replayed": False}
+            "new_generation": True, "same_uuid": True, "accepted_through": 1, "replayed": False,
+            "settings": fresh["binding"]["settings"], "new_daemon": True,
+            "prepare_argv": fresh["argv"], "attach_daemon": fresh["attach_daemon"]}
         self.wait(self.terminal)
         # Idle /new is invisible to SessionStart until first turn entry.
         hooks_before = len(self.hooks())

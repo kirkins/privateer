@@ -840,10 +840,14 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(value["runner"]["accepted_through"], 0)
 
     def test_custody_loss_and_cleanup_failure_keep_both_sticky_diagnostics(self):
-        original = subprocess.Popen
+        original, drain = subprocess.Popen, runner.drain
         def spawn(*args, **kwargs):
             binding.publish_request(self.registry)
-            return original(*args, **kwargs)
+            child = original(*args, **kwargs)
+            # The injected cleanup failure must not itself abandon an actual
+            # subprocess. Keep ownership and reap it after the mock is removed.
+            self.addCleanup(lambda: self.assertTrue(drain(child)))
+            return child
         with patch.object(runner.subprocess, "Popen", side_effect=spawn), \
                 patch.object(runner, "drain", return_value=False):
             result = self.runner.dispatch()

@@ -1524,6 +1524,104 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(result["accepted_through"], 4)
         self.assertEqual(result["acknowledged_through"], 0)
 
+    def test_captured_pty_race_receipt_belongs_only_to_queue_turn(self):
+        captured = json.loads((ROOT / "tests/fixtures/codex-attended-pty.json").read_text())
+        race = captured["qualification"]["race"]
+        self.assertEqual(captured["provider_requests"], [{"path": "/v1/responses", "valid": True}])
+        self.assertEqual(race["busy_status"]["type"], "active")
+        self.assertEqual((race["mail_hook_count"], race["captain_hook_count"]), (1, 1))
+        self.intent(through=1)
+        self.ledger.invoking(self.session, self.nonce)
+        events = copy.deepcopy(race["events"])
+        users = [event for event in events if event["type"] == "user_message"]
+        self.assertEqual(len(users), 1)
+        users[0]["message"] = self.body  # only substitute this test's exact marker/body
+        starts = [event for event in events if event["type"] == "task_started"]
+        self.assertEqual([event["turn_attribution"]["turn_trigger"] for event in starts], ["queue", "user"])
+        self.append(*events)
+        # Reconstruct the reducer, as after a crash; CLI output is not a receipt.
+        self.ledger = receipts.Ledger(self.registry, self.offer_record["home"], "alpha")
+        result = self.reconcile()
+        self.assertEqual(result["evidence"]["receipt"], race["receipt"])
+        self.assertEqual(result["evidence"]["receipt"]["turn_id"], starts[0]["turn_id"])
+        self.assertEqual((result["accepted_through"], result["acknowledged_through"]), (1, 0))
+        self.assertEqual(self.reconcile()["evidence"]["receipt"], race["receipt"])
+
+    def test_captured_pty_submit_first_holds_mail_and_stops_without_receipt(self):
+        captured = json.loads((ROOT / "tests/fixtures/codex-attended-pty.json").read_text())
+        race = captured["qualification"]["submit_first_race"]
+        self.assertEqual((race["captain_hook_count"], race["mail_hook_count"]), (1, 1))
+        self.assertEqual(race["pending_count_before_release"], 1)
+        pending = race["pending"]
+        self.assertEqual(len(pending["data"]), 1)
+        self.assertIsNone(pending["nextCursor"])
+        self.assertEqual(pending["data"][0]["input"], [{"type": "text",
+            "text": "ACT3b mail after captain submission", "text_elements": []}])
+        events = race["events"]
+        self.assertEqual([event["turn_attribution"]["turn_trigger"] for event in events
+                          if event["type"] == "task_started"], ["user", "queue"])
+        self.assertFalse(any(event["type"] == "user_message" for event in events))
+        self.intent(through=1)
+        self.ledger.invoking(self.session, self.nonce)
+        self.append(*events)
+        result = self.reconcile()
+        self.assertEqual(result["state"], "uncertain")
+        self.assertEqual((result["accepted_through"], result["acknowledged_through"]), (0, 0))
+        self.assertNotIn("receipt", result["evidence"])
+
+    def test_captured_pty_draft_and_second_client_are_not_receipts_or_attachment(self):
+        captured = json.loads((ROOT / "tests/fixtures/codex-attended-pty.json").read_text())
+        qualification, hooks = captured["qualification"], captured["hooks"]
+        self.assertEqual(qualification["draft"], {"unsent_during_delivery": True,
+            "submitted_exactly_once_after_explicit_enter": True})
+        prompts = [event.get("prompt") for event in hooks if event["hook_event_name"] == "UserPromptSubmit"]
+        for body in ("ACT3b unsent captain draft", "ACT3b racing captain typed suffix",
+                     "ACT3b captain submit first", "ACT3b mail after captain submission"):
+            self.assertEqual(prompts.count(body), 1)
+        second = qualification["second_client"]
+        self.assertFalse(second["idle_attach_callback"])
+        self.assertFalse(second["first_submission_session_start"])
+        self.assertFalse(second["fenced_at_attach"])
+        self.assertFalse(second["first_submission_fenced"])
+        self.assertEqual(second["binding_state"], "bound")
+        self.assertEqual(second["native_status"], {"type": "idle"})
+        self.assertEqual([event["hook_event_name"] for event in second["first_submission_hooks"]], ["UserPromptSubmit"])
+        self.assertEqual(set(second["first_submission_hooks"][0]), {
+            "session_id", "turn_id", "transcript_path", "cwd", "hook_event_name", "model", "permission_mode", "prompt"})
+        self.assertFalse(captured["live_mail_qualified"])
+
+    def test_captured_pty_reconnect_and_navigation_limits(self):
+        captured = json.loads((ROOT / "tests/fixtures/codex-attended-pty.json").read_text())
+        qualification = captured["qualification"]
+        for key in ("same_daemon_reconnect", "reconnect"):
+            self.assertTrue(qualification[key]["new_generation"])
+            self.assertTrue(qualification[key]["same_uuid"])
+        same = qualification["same_daemon_reconnect"]
+        self.assertTrue(same["same_daemon"])
+        self.assertTrue(same["session_start"])
+        self.assertEqual(same["settings"], {"model": "ship-model", "effort": "high"})
+        self.assertEqual(same["state"], "bound")
+        self.assertFalse(same["delivery_enabled"])
+        restarted = qualification["reconnect"]
+        self.assertTrue(restarted["new_daemon"])
+        self.assertNotEqual(restarted["attach_daemon"], same["attach_daemon"])
+        for launch in (same, restarted):
+            self.assertEqual(launch["settings"], {"model": "ship-model", "effort": "high"})
+            argv = launch["prepare_argv"]
+            self.assertEqual(argv[argv.index("--remote") + 1], "unix://" + launch["attach_daemon"]["socket"])
+            self.assertEqual(argv[argv.index("--model") + 1], "ship-model")
+            self.assertIn('model_reasoning_effort="high"', argv)
+        self.assertTrue(qualification["reconnect"]["dead_old_process_refused"])
+        self.assertFalse(qualification["reconnect"]["replayed"])
+        self.assertEqual(qualification["reconnect"]["accepted_through"], 1)
+        navigation = qualification["navigation"]
+        self.assertFalse(navigation["idle_callback"])
+        self.assertEqual(navigation["binding_before_turn"], "bound")
+        self.assertTrue(navigation["callback_unbound"])
+        self.assertEqual(navigation["custody_poison_reason"], "callback_uuid_changed")
+        self.assertFalse(navigation["instantaneous_ui_continuity"])
+        self.assertTrue(captured["daemon_exited_confirmed"])
+
     def test_unqualified_native_input_shape_pauses_with_clear_reason(self):
         self.intent()
         self.ledger.invoking(self.session, self.nonce)
