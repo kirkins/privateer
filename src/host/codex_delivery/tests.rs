@@ -375,7 +375,10 @@ fn codex_delivery_operator_controls_refuse_agents_and_bad_resolutions() {
         "attended.codex.session",
     ] {
         let error = f.agent(command, json!({"ship": "alpha"})).unwrap_err();
-        assert!(format!("{error:#}").contains("operator"), "{command}: {error:#}");
+        assert!(
+            format!("{error:#}").contains("operator"),
+            "{command}: {error:#}"
+        );
     }
     for (key, value) in [
         ("operation", json!("ack")),

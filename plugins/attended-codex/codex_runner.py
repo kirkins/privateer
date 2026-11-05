@@ -698,6 +698,14 @@ LATE = ("Late native admission of this offer remains possible: resolution neithe
         "a queued item or turn nor acknowledges mail.")
 
 
+def bound_runner(path):
+    """Refuse before any ledger access unless a hosted binding is current."""
+    record = load(Path(path))
+    require(isinstance(record, dict) and record.get("state") == "bound" and record.get("hosted") is True,
+            "no current hosted Codex binding")
+    return Runner(path)
+
+
 def operator_check(runner, request, current):
     """The runtime's operator gate ran in Rust; this checks it is still current.
 
@@ -724,7 +732,7 @@ def reconcile_control(path, request):
     It cannot force acceptance, discard an uncertain offer or replay one; an
     unresolved offer stays paused.
     """
-    runner = Runner(path)
+    runner = bound_runner(path)
     record, session, nonce = operator_check(runner, request, current=True)
     state = runner.ledger.read()["sessions"][session]
     seen = max(state["accepted_through"], state["acknowledged_through"], state.get("suppressed_through", 0))
@@ -748,7 +756,7 @@ def resolve_control(path, request):
     Works for the current session's offer and for an older UUID's outstanding
     one (its pane is gone), always under current custody. Nothing is deleted.
     """
-    runner = Runner(path)
+    runner = bound_runner(path)
     record, session, nonce = operator_check(runner, request, current=False)
     if session == record["session"]:
         evidence = reconcile_control(path, request)

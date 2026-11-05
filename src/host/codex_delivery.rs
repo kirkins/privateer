@@ -111,7 +111,11 @@ fn folder(store: &Store, ship: &str) -> Result<PathBuf> {
         crate::presence::folder_ship(store).as_deref() == Some(ship),
         "run this with {ship}'s own ship folder home (--home)"
     );
-    Ok(store.home().parent().context("ship folder")?.canonicalize()?)
+    Ok(store
+        .home()
+        .parent()
+        .context("ship folder")?
+        .canonicalize()?)
 }
 
 const CONTROL_OUTPUT: u64 = 1 << 16;
@@ -120,7 +124,9 @@ const CONTROL_OUTPUT: u64 = 1 << 16;
 /// stdout, a clean environment, its own process group and the tick's cap.
 fn adapter(folder: &Path, argv: [&str; 2], target: &Path, request: &Value) -> Result<Value> {
     use std::io::{Read, Write};
-    let script = crate::cli::plugins_dir()?.join("attended-codex").join(argv[0]);
+    let script = crate::cli::plugins_dir()?
+        .join("attended-codex")
+        .join(argv[0]);
     let mut command = Command::new(PYTHON);
     command
         .args(["-I", "-B"])
@@ -143,7 +149,9 @@ fn adapter(folder: &Path, argv: [&str; 2], target: &Path, request: &Value) -> Re
     }
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    let mut child = command.spawn().context("start the attended Codex adapter")?;
+    let mut child = command
+        .spawn()
+        .context("start the attended Codex adapter")?;
     let stdout = child.stdout.take().context("adapter stdout")?;
     let reader = std::thread::spawn(move || {
         let mut out = Vec::new();
@@ -250,13 +258,20 @@ fn session(store: &mut Store, args: &Value) -> Result<Value> {
     } else {
         json!("next_launch")
     };
-    Ok(json!({"ship": ship, "session": session, "reservation": reserved, "launch": launch,
-        "settings_gap": "Codex 0.166 keeps neither thread/start model nor effort at `codex resume`: the pane's own --model/config apply at attach"}))
+    Ok(
+        json!({"ship": ship, "session": session, "reservation": reserved, "launch": launch,
+        "settings_gap": "Codex 0.166 keeps neither thread/start model nor effort at `codex resume`: the pane's own --model/config apply at attach"}),
+    )
 }
 
 /// Commit a verified reservation: revoke (poison) a grant naming another
 /// session, set first_mate.codex_session and audit, in one writer transaction.
-fn assign(store: &Store, ship: &str, manifest: &Value, reserved: &Value) -> Result<(String, Value)> {
+fn assign(
+    store: &Store,
+    ship: &str,
+    manifest: &Value,
+    reserved: &Value,
+) -> Result<(String, Value)> {
     ensure!(
         reserved["state"] == "verified",
         "Codex session reservation was not verified"
