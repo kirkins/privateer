@@ -471,6 +471,45 @@ fn intake_busy_gateway_emits_a_recognized_partial_without_downgrading_or_stoppin
 }
 
 #[test]
+fn intake_partial_contact_before_first_capture_still_settles_on_history_gap() {
+    use std::os::fd::AsRawFd;
+    for owner in ["alpha","beta"] {
+        let (_t,a,b) = pair();
+        let (desk,source) = if owner == "alpha" {(&a,&b)} else {(&b,&a)};
+        intake_notice(source,"snapshot-notice");
+        intake_enroll(&a,owner);
+        // #699: make the very first contact partial before the source has
+        // ever captured. A held intake lock on the non-source side produces
+        // the same strict partial frame an exhausted budget does, with no
+        // dependence on runner speed.
+        let busy = if owner == "alpha" {&a} else {&b};
+        let lock = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+            .open(busy.registry().with_extension("desk-intake.lock")).unwrap();
+        assert_eq!(unsafe {libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        let gaps = || -> Vec<String> { intake_db(source).prepare("SELECT state FROM desk_intake_gap").unwrap()
+            .query_map([],|r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap() };
+        a.collect();
+        assert_eq!(gaps(),["backpressure"],"{owner}: the partial must precede any capture");
+        drop(lock);
+        intake_until(&a,desk,"snapshot-notice");
+        intake_notice(source,"delta-notice");
+        intake_until(&a,desk,"delta-notice");
+        for id in ["snapshot-notice","delta-notice"] {
+            assert_eq!(intake_fact_ids(desk).iter().filter(|s| *s == id).count(),1);
+        }
+        // The capture's unproved-membership marker supersedes the transient
+        // partial; the earlier ordering neither hides it nor records loss.
+        assert_eq!(gaps(),["history_gap"],"{owner}");
+        assert_eq!(intake_db(source).query_row("SELECT COUNT(*) FROM desk_intake_loss",[],|r| r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(desk.status()["coverage_complete"],false);
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-intake-budget"),
+    ignore = "needs --features test-intake-budget (frozen intake work clock); CI runs --all-features"
+)]
 fn intake_quiet_push_uses_periodic_empty_barriers_across_gateway_restarts() {
     let (_t,a,b) = pair();
     intake_enroll(&a,"beta");
@@ -481,14 +520,20 @@ fn intake_quiet_push_uses_periodic_empty_barriers_across_gateway_restarts() {
     a.collect(); // restart alone must not issue an empty barrier
     assert_eq!(intake_db(&b).query_row("SELECT barrier FROM desk_intake_checkpoint WHERE source=?1",[intake_external_source(&b)],|r|r.get::<_,String>(0)).unwrap(),first);
     intake_db(&a).execute("UPDATE desk_source_head SET issued_at=0",[]).unwrap();
-    // The reset barrier schedule is due on every following contact, but any
-    // one contact can still stop inside its 75 ms optional-intake budget
-    // before issuing. Drive bounded contacts until the empty barrier is
-    // actually accepted; the issuing contact itself must stay quiet.
+    // The reset barrier schedule is due on every following contact. The
+    // property here is that issuing an empty barrier is itself quiet, not
+    // runner speed: the desk can accept (commit) the barrier and only then
+    // run out of its 75 ms budget, replying partial (#699). Freeze only the
+    // cooperative work clock of these contacts and their real gateways
+    // (test-feature builds only; production deadlines are unchanged), and
+    // still drive bounded contacts until the empty barrier is accepted.
     let checkpoint_barrier = || intake_db(&b).query_row("SELECT barrier FROM desk_intake_checkpoint WHERE source=?1",[intake_external_source(&b)],|r| r.get::<_,String>(0)).unwrap();
     let mut issued = None;
     for _ in 0..20 {
-        let out = a.run(&["machine.collect","--json","{}"]);
+        let out = a.command()
+            .env("PRIVATEER_TEST_DESK_INTAKE_WORK_CLOCK","frozen")
+            .args(["machine.collect","--json","{}"])
+            .output().unwrap();
         assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
         if checkpoint_barrier() != first { issued = Some(out); break; }
     }

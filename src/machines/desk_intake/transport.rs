@@ -338,8 +338,10 @@ fn capture_one(conn: &Connection, c: &Contact, deadline: Instant) -> Result<()> 
     // Membership is deliberately unproved in (a). Do not open the whole
     // census on a mail contact: select just one retained path, including old
     // and retired registrations, and let the SQL VM budget bound the scan.
+    // A transient partial contact before the first capture must not mask the
+    // unproved-membership marker (#699); any other retained state stays.
     if !conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM desk_intake_gap WHERE domain=?1 AND source=?2)",
+        "SELECT EXISTS(SELECT 1 FROM desk_intake_gap WHERE domain=?1 AND source=?2 AND state<>'backpressure')",
         params![c.manifest.domain, c.source],
         |r| r.get::<_, bool>(0),
     )? {

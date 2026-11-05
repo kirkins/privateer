@@ -351,11 +351,17 @@ fn gap(conn: &Connection, m: &Manifest, source: &str, state: &str) -> Result<()>
 
 // A dated obstacle is not evidence of lost custody. Only explicit proof may
 // discharge it; this helper cannot modify the independent sticky loss record.
+// The history diagnosis supersedes only transient backpressure, so the
+// retained state never depends on whether a budget-limited contact happened
+// to precede the first capture (#699); nothing replaces history_gap with
+// backpressure, and every other existing state stays put.
 fn obstacle(conn: &Connection, m: &Manifest, source: &str, state: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO desk_intake_gap(domain,source,state) VALUES(?1,?2,?3)
         ON CONFLICT(domain,source) DO UPDATE SET state=CASE
-          WHEN state='integrity_gap' OR excluded.state='history_gap'
+          WHEN state='integrity_gap'
+            OR (excluded.state='history_gap' AND state<>'backpressure')
+            OR (state='history_gap' AND excluded.state='backpressure')
             OR (state='baseline_too_large' AND excluded.state IN ('backpressure','unsupported'))
           THEN state ELSE excluded.state END",
         params![m.domain, source, state],
