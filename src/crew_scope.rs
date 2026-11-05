@@ -50,6 +50,9 @@ struct Resolved {
     /// `job` is the one a supervisor in the ancestry proved, not only named
     /// by `PRIVATEER_JOB`.
     proven: bool,
+    /// The home whose records proved `job` (and classified `crew`), when
+    /// `proven`: it may not be the home the command targets.
+    home: Option<PathBuf>,
 }
 
 static RESOLVED: OnceLock<Resolved> = OnceLock::new();
@@ -76,6 +79,15 @@ pub(crate) fn proven_job() -> Option<String> {
         .get()
         .filter(|resolved| resolved.proven)
         .and_then(|resolved| resolved.job.clone())
+}
+
+/// The home whose job records proved `proven_job`, and in which the crew
+/// `crew()` names was classified with it.
+pub(crate) fn proven_home() -> Option<PathBuf> {
+    RESOLVED
+        .get()
+        .filter(|resolved| resolved.proven)
+        .and_then(|resolved| resolved.home.clone())
 }
 
 /// The crew this process was resolved to, if any.
@@ -158,6 +170,7 @@ fn resolve_with(
                     job: Some(job),
                     crew: None,
                     proven: true,
+                    home: Some(home),
                 });
                 return Ok(caller);
             };
@@ -204,6 +217,7 @@ fn resolve_with(
                 job: if supervisor { env_job } else { Some(job) },
                 crew,
                 proven: !supervisor,
+                home: (!supervisor).then_some(home),
             });
             return Ok(Caller::Agent { actor });
         }
@@ -224,6 +238,7 @@ fn resolve_with(
         job: env_job,
         crew,
         proven: false,
+        home: None,
     });
     Ok(caller)
 }

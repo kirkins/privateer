@@ -23,27 +23,8 @@ pub(super) struct Found {
 }
 
 /// This process's identity as a requester records it: its pid, start
-/// identity and PID namespace as it sees them itself.
-#[cfg(target_os = "linux")]
-pub(super) fn own() -> Result<Value> {
-    Ok(serde_json::from_str(&crate::jobs::own_identity()?)?)
-}
-
-/// On macOS the start comes from the kernel read the ancestry walk uses,
-/// which a Seatbelt sandbox allows (`ps`, which `jobs::identity` runs, it
-/// denies), in the same `lstart` form.
-#[cfg(target_os = "macos")]
-pub(super) fn own() -> Result<Value> {
-    let pid = std::process::id();
-    let info = crate::crew_scope::ancestry::kinfo(pid)
-        .with_context(|| format!("read this process's identity (sysctl kern.proc.pid.{pid})"))?
-        .context("this process has no kernel identity")?;
-    Ok(
-        serde_json::json!({"pid": pid, "started": info.started, "pid_namespace": null, "zombie": false}),
-    )
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// identity and PID namespace as it sees them itself. On macOS the start
+/// comes from `sysctl kern.proc.pid`, which a Seatbelt sandbox allows.
 pub(super) fn own() -> Result<Value> {
     Ok(serde_json::from_str(&crate::jobs::own_identity()?)?)
 }
@@ -166,6 +147,105 @@ pub(super) fn ensure_still(recorded: &Value, found: &Found) -> Result<()> {
         live(found.pid, recorded_start(recorded)?)?,
         "process {pid} exited while its caller was being resolved"
     );
+    Ok(())
+}
+
+/// Whether a sandboxed requester's ancestry leaves its sandbox: some
+/// ancestor in `chain` (pids as seen here, nearest first) below init is one
+/// `outside` says is outside the requester's sandbox. `None` (gone, or not
+/// knowable) never counts as outside. A requester whose chain does not
+/// leave was not started by anything outside its sandbox (macOS: a process
+/// that double-forked out of its job's tree, which launchd adopted), so the
+/// walk cannot tell which job it runs in (docs/design/codex-sandboxed-launch.md,
+/// (c)).
+pub(super) fn leaves(chain: &[u32], outside: impl Fn(u32) -> Option<bool>) -> bool {
+    chain
+        .iter()
+        .any(|&pid| pid > 1 && outside(pid) == Some(true))
+}
+
+/// The refusal reason for a sandboxed requester whose chain never leaves
+/// its sandbox.
+pub(super) fn never_leaves(pid: u32, sandbox: &str) -> String {
+    format!(
+        "process {pid} runs in {sandbox}, and no ancestor of it below init is outside that sandbox, so nothing outside the sandbox started it and its job cannot be told"
+    )
+}
+
+/// Linux: a requester in another PID namespace than this launcher's must
+/// have an ancestor (below init, as seen here) outside that namespace.
+#[cfg(target_os = "linux")]
+pub(super) fn ensure_leaves_sandbox(found: &Found, _claimed_sandbox: &str) -> Result<()> {
+    let namespace = |pid: u32| {
+        std::fs::read_link(format!("/proc/{pid}/ns/pid"))
+            .ok()
+            .map(|link| link.to_string_lossy().into_owned())
+    };
+    let theirs =
+        namespace(found.pid).with_context(|| format!("process {} has exited", found.pid))?;
+    if Some(theirs.as_str()) == crate::jobs::pid_namespace() {
+        return Ok(());
+    }
+    let chain: Vec<u32> = crate::crew_scope::ancestry::ancestors_of(found.pid)?
+        .iter()
+        .map(|a| a.pid)
+        .collect();
+    ensure!(
+        leaves(&chain, |pid| namespace(pid).map(|ns| ns != theirs)),
+        "{}",
+        never_leaves(found.pid, "its own PID namespace")
+    );
+    Ok(())
+}
+
+/// Whether process `pid` runs in a Seatbelt sandbox, by libsystem_sandbox's
+/// `sandbox_check` with no operation: `None` where it cannot say (the
+/// symbol is absent, or the call fails).
+#[cfg(target_os = "macos")]
+pub(super) fn seatbelt_state(pid: u32) -> Option<bool> {
+    type Check =
+        unsafe extern "C" fn(libc::pid_t, *const libc::c_char, libc::c_int, ...) -> libc::c_int;
+    // SAFETY: a NUL-terminated name; a null result means the symbol is absent.
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"sandbox_check".as_ptr()) };
+    if symbol.is_null() {
+        return None;
+    }
+    // SAFETY: libsystem_sandbox declares `int sandbox_check(pid_t, const char
+    // *operation, enum sandbox_filter_type, ...)`; a null operation with
+    // SANDBOX_FILTER_NONE (0) asks only whether the process is sandboxed.
+    let check: Check = unsafe { std::mem::transmute::<*mut libc::c_void, Check>(symbol) };
+    match unsafe { check(pid as libc::pid_t, std::ptr::null(), 0) } {
+        rc if rc < 0 => None,
+        rc => Some(rc > 0),
+    }
+}
+
+/// macOS: a Seatbelt-sandboxed requester must have an unsandboxed ancestor
+/// below launchd, checked with `sandbox_check` on each ancestor from
+/// outside. A requester the kernel cannot judge counts as sandboxed when its
+/// request says so: the claim may add this check, never skip it.
+#[cfg(target_os = "macos")]
+pub(super) fn ensure_leaves_sandbox(found: &Found, claimed_sandbox: &str) -> Result<()> {
+    match seatbelt_state(found.pid) {
+        Some(true) => {}
+        None if claimed_sandbox == "seatbelt" => {}
+        _ => return Ok(()),
+    }
+    let chain: Vec<u32> = crate::crew_scope::ancestry::ancestors_of(found.pid)?
+        .iter()
+        .map(|a| a.pid)
+        .collect();
+    ensure!(
+        leaves(&chain, |pid| seatbelt_state(pid)
+            .map(|sandboxed| !sandboxed)),
+        "{}",
+        never_leaves(found.pid, "a macOS sandbox")
+    );
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(super) fn ensure_leaves_sandbox(_found: &Found, _claimed_sandbox: &str) -> Result<()> {
     Ok(())
 }
 

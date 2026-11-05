@@ -1750,7 +1750,32 @@ fn other_boot(process: &Process) -> bool {
     // A Linux kernel's process cannot be running on this one.
     process.started.starts_with("linux:")
 }
-#[cfg(not(target_os = "linux"))]
+/// macOS: one `sysctl kern.proc.pid.<pid>` read, which Codex's Seatbelt
+/// profile allows where it denies `ps` (#732). The start is formatted as
+/// `ps -o lstart=` printed it with `TZ=UTC0 LC_ALL=C`, so identities recorded
+/// through `ps` by earlier releases still compare equal.
+#[cfg(target_os = "macos")]
+fn identity(pid: u32) -> Result<Option<Process>> {
+    let entry = crate::crew_scope::ancestry::entry(pid).map_err(|error| {
+        kernel_read_failed("process identity", &format!("kern.proc.pid.{pid}"), &error)
+    })?;
+    Ok(entry.map(|entry| Process {
+        pid,
+        started: entry.started,
+        pid_namespace: None,
+        zombie: entry.zombie,
+    }))
+}
+/// A process-table read the kernel refused. Inside a sandbox such as
+/// Codex's Seatbelt profile this is a limit of the sandbox, and the text says
+/// so: no Privateer permission or grant would lift it.
+#[cfg(target_os = "macos")]
+fn kernel_read_failed(what: &str, read: &str, error: &std::io::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cannot inspect {what}: sysctl {read} failed ({error}). Inside a sandbox such as Codex's this is a limit of the sandbox, not a missing Privateer permission: run the command outside the sandbox"
+    )
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn identity(pid: u32) -> Result<Option<Process>> {
     // lstart is rendered in local time and locale; pin both.
     let output = Command::new("/bin/ps")
@@ -1809,9 +1834,24 @@ pub(crate) fn child_pids(pid: u32) -> Result<Vec<u32>> {
         .collect())
 }
 
+/// The live processes whose parent is `pid`, from one `sysctl kern.proc.all`
+/// read. Zombies are skipped: they have exited and hold their PID only until
+/// reaped. Codex's Seatbelt profile has no rule for `kern.proc.all`, so inside
+/// that sandbox this may fail, as a sandbox limit.
+#[cfg(target_os = "macos")]
+pub(crate) fn child_pids(pid: u32) -> Result<Vec<u32>> {
+    let table = crate::crew_scope::ancestry::all()
+        .map_err(|error| kernel_read_failed("the process tree", "kern.proc.all", &error))?;
+    Ok(table
+        .into_iter()
+        .filter(|entry| entry.ppid == pid && !entry.zombie)
+        .map(|entry| entry.pid)
+        .collect())
+}
+
 /// The live processes whose parent is `pid`, from one process table. Zombies
 /// are skipped: they have exited and hold their PID only until reaped.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn child_pids(pid: u32) -> Result<Vec<u32>> {
     let output = Command::new("/bin/ps")
         .args(["-axo", "pid=,ppid=,stat="])
@@ -1979,7 +2019,25 @@ pub(crate) fn census_payload(record: &Value) -> Result<Option<String>> {
     Ok(Some(serde_json::to_string(&process)?))
 }
 
-fn group_members(group: u32) -> Result<Vec<u32>> {
+/// The live members of process group `group`. macOS reads `sysctl
+/// kern.proc.pgrp.<group>`, which Codex's Seatbelt profile allows.
+#[cfg(target_os = "macos")]
+pub(crate) fn group_members(group: u32) -> Result<Vec<u32>> {
+    let members = crate::crew_scope::ancestry::group(group).map_err(|error| {
+        kernel_read_failed(
+            "a process group",
+            &format!("kern.proc.pgrp.{group}"),
+            &error,
+        )
+    })?;
+    Ok(members
+        .into_iter()
+        .filter(|entry| entry.pgid == group && !entry.zombie)
+        .map(|entry| entry.pid)
+        .collect())
+}
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn group_members(group: u32) -> Result<Vec<u32>> {
     let output = Command::new("ps")
         .args(["-eo", "pid=,pgid=,stat="])
         .output()?;
@@ -2026,7 +2084,28 @@ fn independently_supervised(args: &str) -> bool {
         || words.windows(2).any(|w| w == ["door", "run"])
 }
 /// Live processes as (pid, parent, process group, independently supervised).
-fn process_table() -> Result<Vec<(u32, u32, u32, bool)>> {
+/// macOS reads one `sysctl kern.proc.all` and each process's argv from
+/// `kern.procargs2`, as `ps` does. Codex's Seatbelt profile has no rule for
+/// `kern.proc.all`, so inside that sandbox this may fail, as a sandbox limit.
+/// An argv the kernel does not show (another user's process) is no
+/// supervisor's, as `ps` printing only the command name was.
+#[cfg(target_os = "macos")]
+pub(crate) fn process_table() -> Result<Vec<(u32, u32, u32, bool)>> {
+    let table = crate::crew_scope::ancestry::all()
+        .map_err(|error| kernel_read_failed("the process table", "kern.proc.all", &error))?;
+    Ok(table
+        .into_iter()
+        .filter(|entry| !entry.zombie)
+        .map(|entry| {
+            let independent = crate::crew_scope::ancestry::argv(entry.pid)
+                .is_ok_and(|argv| independently_supervised(&argv.join(" ")));
+            (entry.pid, entry.ppid, entry.pgid, independent)
+        })
+        .collect())
+}
+/// Live processes as (pid, parent, process group, independently supervised).
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn process_table() -> Result<Vec<(u32, u32, u32, bool)>> {
     let output = Command::new("ps")
         .args(["-eo", "pid=,ppid=,pgid=,stat=,args="])
         .output()?;

@@ -96,15 +96,22 @@ Residuals:
 
 A credential would still be needed if a profile denied `kern.proc.pid` too. The refusal above covers that case and says so. The macOS CI probe in this task shows whether Codex's profile allows the walk.
 
-### Out of scope for (a): follow-ups
+### Follow-up: the `jobs` process reads (done, task `privateer-codex-launch-736-followups`)
 
-On macOS, these CLI paths in `src/jobs.rs` still run `ps` and are left unchanged here:
-- `jobs::identity` (and with it `process_identity`, `own_identity`, `is_recorded_supervisor`);
-- `child_pids`;
-- `group_members`;
-- `process_table`.
+On macOS the `src/jobs.rs` reads that ran `ps` now read the kernel, with the `kinfo_proc` layout of `crew_scope::ancestry` (which gains `e_pgid` at offset 564, asserted at compile time):
 
-Inside a sandbox, commands that use them (for example `job.status` checking a running job's liveness) may still fail. Caller identity, which every command needs, is fixed here. Moving `jobs::identity` onto the same kernel read (`crew_scope::ancestry::kinfo` and `lstart`, which the macOS test checks byte for byte against `ps`) is a follow-up in a file another owner is changing.
+| read | macOS source | inside Codex's profile | reached from a sandboxed CLI by |
+|---|---|---|---|
+| `jobs::identity` (and `process_identity`, `own_identity`, `identity_alive`, `is_recorded_supervisor`, every liveness check) | `sysctl kern.proc.pid.<pid>`, the start formatted as `lstart`, exactly as `ps -o lstart=` printed it with `TZ=UTC0 LC_ALL=C`, so identities recorded by earlier releases compare equal | allowed (`kern.proc.pid.` prefix) | `job.status`, `crew.park`, admission's stale-reservation check, the launch request's own identity |
+| `group_members` | `sysctl kern.proc.pgrp.<pgid>` | allowed (`kern.proc.pgrp.` prefix) | payload liveness (`group_alive`) |
+| `child_pids` | `sysctl kern.proc.all` | no rule lists it: may be denied | nothing: host upgrade's pane checks, which the operator runs |
+| `process_table` | `sysctl kern.proc.all`, and each process's argv from `kern.procargs2` (an argv the kernel does not show is no supervisor's, as `ps` printing only the command name was) | no rule lists it: may be denied | nothing: escaped-descendant searches run in the supervisor, in serve's reconciliation, and in `job.cancel` and `workspace.release`, which a sandboxed caller forwards to the dispatcher |
+
+A refused kernel read is an error that names the read and says that inside a sandbox such as Codex's it is a limit of the sandbox, not a missing Privateer permission, and to run the command outside it. It never points at a grant.
+
+Other Unix systems keep `ps`; Linux keeps `/proc` and, for `group_members` and `process_table`, `ps -eo`.
+
+Tests: on every platform, the `kern.proc.all` reply parser (`ancestry::entries`, zombies kept, empty and partial records skipped). macOS CI only: the kernel reads agree with `ps` unsandboxed (start identities byte for byte, children, group members and the table); and the sandbox probe also runs `process_identity`, `own_identity`, `group_members`, `child_pids` and `process_table` under the Codex-like profile. It requires the first three to work there, and accepts either outcome for the two `kern.proc.all` reads, but a failure must be the sandbox-limit text and name `kern.proc.all`.
 
 ## (b) One launch contract for sandboxed callers
 

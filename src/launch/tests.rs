@@ -443,6 +443,145 @@ fn a_proven_job_whose_record_cannot_be_loaded_stays_contained() {
     assert!(text.contains("may be read-only"), "{text}");
 }
 
+/// Review ff34f5bf: a proven job whose record lives in another home (the
+/// walk proved it there, and the command targets this one) is judged from
+/// that home's record, not refused for being absent here.
+#[test]
+fn a_proven_job_in_another_home_is_judged_from_that_home() {
+    let (_dir, store) = home();
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = Store::open(&other_dir.path().join("cove")).unwrap();
+    let job = |store: &Store, id: &str, extra: Value| {
+        let mut record = json!({"id": id, "task_id": "cove-duty", "incarnation": "alpha",
+            "command": ["true"], "cwd": "/ships/cove", "action": "spawn", "heavy": false,
+            "timeout_secs": 60, "ledger": "/ships/ledger", "status": "running",
+            "created_ms": 0, "cancel_requested": false});
+        for (key, value) in extra.as_object().unwrap() {
+            record[key] = value.clone();
+        }
+        store
+            .connection()
+            .execute(
+                "INSERT INTO jobs(id, record) VALUES(?1, ?2)",
+                params![id, record.to_string()],
+            )
+            .unwrap();
+        crate::jobs::record(store, id).unwrap();
+    };
+    job(&other, "cove-writer", json!({}));
+    job(&other, "cove-reader", json!({"codex_read_only_crew": true}));
+    let elsewhere = Some(other.home());
+    let proven = |id: &str| vec![(id.to_owned(), true)];
+    // Absent here, loadable where it was proven: judged there.
+    assert_eq!(
+        containment(&store, elsewhere, &proven("cove-writer")).unwrap(),
+        None
+    );
+    assert_eq!(
+        containment(&store, elsewhere, &proven("cove-reader")).unwrap(),
+        Some(("cove-reader".to_owned(), "read-only"))
+    );
+    // A crew classified with the proven job is judged there too.
+    assert_eq!(
+        containment(
+            &store,
+            elsewhere,
+            &[("cove-writer".into(), true), ("cove-reader".into(), true)]
+        )
+        .unwrap(),
+        Some(("cove-reader".to_owned(), "read-only"))
+    );
+    // Without a proven home the record is looked for here, and missing.
+    assert_eq!(
+        containment(&store, None, &proven("cove-writer")).unwrap(),
+        Some(("cove-writer".to_owned(), UNREADABLE))
+    );
+    // A proven home that is gone, or holds no such job, is unknown.
+    let gone = other_dir.path().join("no-such-home");
+    assert_eq!(
+        containment(&store, Some(&gone), &proven("cove-writer")).unwrap(),
+        Some(("cove-writer".to_owned(), UNREADABLE))
+    );
+    assert_eq!(
+        containment(&store, elsewhere, &proven("cove-missing")).unwrap(),
+        Some(("cove-missing".to_owned(), UNREADABLE))
+    );
+    // A job only PRIVATEER_JOB names is looked for in this home, and a
+    // missing one is tolerated, as before.
+    assert_eq!(
+        containment(&store, elsewhere, &[("cove-reader".into(), false)]).unwrap(),
+        None
+    );
+}
+
+/// The double-fork residual for forwarded launches: a sandboxed requester
+/// must have an ancestor below init outside its sandbox (macOS: one
+/// `sandbox_check` reports unsandboxed; Linux: one in another PID
+/// namespace). Injected chains, as either OS reads them from outside.
+#[test]
+fn a_sandboxed_requester_whose_chain_never_leaves_its_sandbox_is_refused() {
+    use std::collections::HashMap;
+    // macOS: `true` is a sandboxed ancestor, `false` an unsandboxed one.
+    let seatbelt = HashMap::from([(30, true), (20, false), (25, true)]);
+    let outside = |pid: u32| seatbelt.get(&pid).map(|sandboxed| !sandboxed);
+    // Codex's shell (sandboxed) under the app-server (not): it leaves.
+    assert!(identify::leaves(&[30, 20], outside));
+    // Adopted by launchd after a double fork: no ancestor below it.
+    assert!(!identify::leaves(&[], outside));
+    // Only launchd, or only sandboxed ancestors, or ones that are gone.
+    assert!(!identify::leaves(&[1], |_| Some(true)));
+    assert!(!identify::leaves(&[30, 25], outside));
+    assert!(!identify::leaves(&[30, 99], outside));
+    // Linux: the requester's namespace is "inner"; its init's parent, seen
+    // from the dispatcher, is bwrap outside it.
+    let namespaces = HashMap::from([(41, "inner"), (40, "outer"), (39, "outer")]);
+    let outside = |pid: u32| namespaces.get(&pid).map(|ns| *ns != "inner");
+    assert!(identify::leaves(&[41, 40, 39], outside));
+    // Its init reparented to the dispatcher namespace's init: it never
+    // leaves below pid 1.
+    assert!(!identify::leaves(&[41, 1], outside));
+    assert!(!identify::leaves(&[41], outside));
+    // The refusal names a sandbox limit and that nothing started.
+    let text = unconfirmed(
+        "job.start",
+        &identify::never_leaves(4242, "a macOS sandbox"),
+    );
+    assert!(text.contains("job.start was not started"), "{text}");
+    assert!(
+        text.contains("process 4242 runs in a macOS sandbox"),
+        "{text}"
+    );
+    assert!(text.contains("no ancestor of it below init"), "{text}");
+    assert!(
+        text.contains("not a missing Privateer permission"),
+        "{text}"
+    );
+    assert!(!text.contains("permissions.blocked"), "{text}");
+}
+
+/// A requester in this launcher's own PID namespace is not judged by the
+/// chain rule (a forced route, or no sandbox): this process passes.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_requester_in_the_dispatchers_namespace_is_not_judged_by_its_chain() {
+    let found = identify::Found {
+        pid: std::process::id(),
+        env: vec![],
+        cwd: None,
+    };
+    identify::ensure_leaves_sandbox(&found, "forced").unwrap();
+    // One that has gone cannot be judged at all.
+    let gone = identify::Found {
+        pid: 99_999_999,
+        env: vec![],
+        cwd: None,
+    };
+    let error = identify::ensure_leaves_sandbox(&gone, "pid_namespace")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("has exited"), "{error}");
+}
+
 #[test]
 fn a_contained_refusal_names_the_job_and_a_sandbox_limit() {
     // The refusal names the caller's own job and a sandbox limit.

@@ -92,10 +92,20 @@ if kind == "forge":
     live = forge("forged-live")
     _, err = live.communicate(timeout=60)
     (root / "forge-live.txt").write_text("%d\n%s" % (live.returncode, err))
+    gaps = root / "gaps"
+    if sys.platform == "darwin":
+        # Detached and left alone: launchd adopts the sandboxed requester,
+        # whose chain then never leaves its sandbox. The dispatcher refuses
+        # it before resolving its claim.
+        orphan = gaps / "forged-orphan.stderr"
+        forge("forged-orphan", orphan)
+        deadline = time.time() + 60
+        while not (orphan.exists() and orphan.read_text()) and time.time() < deadline:
+            time.sleep(0.05)
+        (root / "forge-orphan.txt").write_text(orphan.read_text() if orphan.exists() else "")
     # The dispatcher holds this one's launcher once it has identified the
     # requester; the requester then exits, as a crew that kills and reaps
     # its own waiter would, and only then is its caller resolved.
-    gaps = root / "gaps"
     stderr = gaps / "forged-gap.stderr"
     gapped = forge("forged-gap", stderr if sys.platform == "darwin" else None)
     identified = gaps / "forged-gap.identified"
@@ -110,7 +120,10 @@ if kind == "forge":
         except subprocess.TimeoutExpired:
             gapped.wait()
     elif waiter is not None:
-        os.kill(waiter, signal.SIGKILL)
+        try:
+            os.kill(waiter, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # already gone: the note below still records it
     note = "never identified"
     if waiter is not None:
         while time.time() < deadline:
@@ -127,15 +140,32 @@ if kind == "forge":
     done()
 marker = root / ("parked-on-" + task)
 if not marker.exists():
+    # "park": the build waits for the gate this harness opens once its park
+    # is recorded, so the crew always parks and is resumed. "settled": the
+    # crew waits for the build to succeed and parks only then, so the park
+    # always finds it settled and the crew reads its outcome at once.
+    settled = kind == "settled"
+    gate = root / ("park-gate-" + task)
+    build = "echo crew-build-ok > %s" % (root / ("crew-build-" + task))
+    if not settled:
+        build = "i=0; while [ ! -e %s ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done; %s" % (gate, build)
     started = call("job.start", {"task_id": task, "heavy": True, "wait_for_capacity": True,
-        "command": ["sh", "-c", "echo crew-build-ok > %s" % (root / ("crew-build-" + task))]})
+        "command": ["sh", "-c", build]})
     marker.write_text(started["id"])
+    if settled:
+        deadline = time.time() + 60
+        while call("job.status", {"id": started["id"]})["status"] != "succeeded":
+            if time.time() > deadline:
+                (root / "harness-error").write_text("the settled build never succeeded")
+                sys.exit(3)
+            time.sleep(0.1)
     parked = run("crew.park", {"job_id": started["id"], "next": "read the build"})
-    if parked.returncode == 0:
+    if parked.returncode == 0 and not settled:
+        gate.write_text("parked")
         done()
     # A build that settled before the park: a real crew reads its outcome now.
-    if "read its outcome instead of parking" not in parked.stderr:
-        (root / "harness-error").write_text("crew.park: %s" % parked.stderr)
+    if parked.returncode == 0 or "read its outcome instead of parking" not in parked.stderr:
+        (root / "harness-error").write_text("crew.park (%s): %d %s" % (kind, parked.returncode, parked.stderr))
         sys.exit(3)
     how = "read at its park"
 else:
@@ -553,14 +583,19 @@ fn a_sandboxed_first_mate_starts_runs_and_cancels_a_heavy_job_a_crew_and_an_erra
         json!({"id": "direct-crew", "task_id": "infra-duty"}),
         Some("infra"),
     );
-    ship.until("the crew's report on its build", || {
+    let reported = |body: &str| {
         let db = rusqlite::Connection::open(ship.fleet.home.join("privateer.sqlite")).unwrap();
         db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM mail WHERE body LIKE '% on infra-repair; build succeeded%')",
-            [],
+            "SELECT EXISTS(SELECT 1 FROM mail WHERE body LIKE '%' || ?1 || '%')",
+            [body],
             |r| r.get::<_, bool>(0),
         )
         .unwrap()
+    };
+    // Its build waits until the park is recorded, so it always parks and
+    // is resumed.
+    ship.until("the crew's report on its build after its resume", || {
+        reported("resumed on infra-repair; build succeeded")
     });
     let crew_record = ship.status_inside("sandboxed-crew");
     let direct_crew_record = ship.wait_status(
@@ -599,6 +634,25 @@ fn a_sandboxed_first_mate_starts_runs_and_cancels_a_heavy_job_a_crew_and_an_erra
     }
     let built = fs::read_to_string(root.join("crew-build-infra-repair")).unwrap_or_default();
     assert_eq!(built.trim(), "crew-build-ok");
+    assert!(!reported("read at its park on infra-repair"));
+
+    // A crew whose build has already succeeded when it parks: the park is
+    // refused with its outcome, which the crew reads and reports at once.
+    ship.fleet.ok(
+        "task.create",
+        json!({"id": "infra-audit", "charter_id": "fleet", "owner": "infra",
+            "title": "infra audit"}),
+        None,
+    );
+    fs::write(root.join("crew-mode"), "settled").unwrap();
+    ship.ok_inside(
+        "agent.start",
+        json!({"id": "settled-crew", "task_id": "infra-audit"}),
+    );
+    ship.until("the settled crew's report on its build", || {
+        reported("read at its park on infra-audit; build succeeded")
+    });
+    assert!(!reported("resumed on infra-audit"));
 
     // A crew cancelled from inside.
     fs::write(root.join("crew-mode"), "sleep").unwrap();
@@ -1004,7 +1058,22 @@ fn a_crew_claiming_the_operator_is_refused_even_if_its_requester_exits_mid_launc
         error.contains("exited while its caller was being resolved"),
         "{error}"
     );
-    for job in ["forged-live", "forged-gap"] {
+    // macOS: a requester launchd adopted, whose chain never leaves its
+    // sandbox, is refused before its operator claim is resolved, where it
+    // would otherwise have stood in for the walk (the double-fork residual).
+    #[cfg(target_os = "macos")]
+    {
+        let orphan = fs::read_to_string(ship.fleet.root.join("forge-orphan.txt")).unwrap();
+        let (state, error) = ship
+            .request_for("forged-orphan")
+            .unwrap_or_else(|| panic!("no forged-orphan request; requester: {orphan}"));
+        let error = error.unwrap_or_default();
+        assert_eq!(state, "refused", "{error}; requester: {orphan}");
+        assert_sandbox_refusal(&error);
+        assert!(error.contains("no ancestor of it below init"), "{error}");
+        assert!(orphan.contains("no ancestor of it below init"), "{orphan}");
+    }
+    for job in ["forged-live", "forged-gap", "forged-orphan"] {
         assert!(
             !ship.fleet.root.join(format!("ran-{job}")).exists(),
             "{job} never ran"
