@@ -2257,11 +2257,16 @@ fn finishing_a_direct_child_resumes_the_registered_parent_wait_once_with_fresh_s
     );
     let prompt = resumed["prompt"].as_str().unwrap();
     assert!(
-        prompt.contains(&facts["child_status"].to_string()),
+        prompt.contains("Direct children of task:infra-repair"),
         "{prompt}"
     );
-    assert!(prompt.contains("\"task_done\":true"), "{prompt}");
+    assert!(prompt.contains("- index [done] "), "{prompt}");
+    assert!(!prompt.contains("\"closing_evidence\""), "{prompt}");
     assert_eq!(facts["child_status"]["children"][0]["status"], "done");
+    assert_eq!(
+        facts["child_status"]["children"][0]["closing_evidence"]["task_done"],
+        true
+    );
     for _ in 0..3 {
         poll(&mut fleet, true);
     }
