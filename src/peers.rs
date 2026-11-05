@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 
 use crate::store::{Caller, Store};
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Peer {
     name: String,
@@ -31,6 +34,9 @@ struct Peer {
     transport: String,
     #[serde(default)]
     host: Option<String>,
+    /// Explicit local OpenSSH config; validated here because ssh -F does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh_config: Option<String>,
     #[serde(default)]
     executable: String,
     #[serde(default)]
@@ -115,8 +121,67 @@ fn absolute_path(value: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_ssh_config(value: &str) -> Result<()> {
+    absolute_path(value, "SSH config")?;
+    ensure!(
+        !value.split('/').any(|part| matches!(part, "." | "..")),
+        "SSH config cannot contain dot components"
+    );
+    let metadata =
+        std::fs::symlink_metadata(value).with_context(|| format!("inspect SSH config {value}"))?;
+    ensure!(
+        metadata.is_file(),
+        "SSH config {value} must be a regular file, not a symlink"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        validate_ssh_config_permissions(value, metadata.uid(), metadata.mode())?;
+    }
+    #[cfg(not(unix))]
+    bail!("SSH config ownership validation is unsupported on this platform");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_ssh_config_permissions(value: &str, uid: u32, mode: u32) -> Result<()> {
+    ensure!(
+        uid == unsafe { libc::getuid() },
+        "SSH config {value} must be owned by the current uid"
+    );
+    ensure!(
+        mode & 0o022 == 0,
+        "SSH config {value} must not be group/other writable"
+    );
+    Ok(())
+}
+
+/// Only the OpenSSH config diagnostic, not authentication or key permission
+/// errors. Do not infer a sandbox with certainty from an SSH exit code alone.
+fn ssh_config_failure(code: Option<i32>, stderr: &str) -> Option<String> {
+    if code != Some(255) {
+        return None;
+    }
+    let path = stderr.lines().find_map(|line| {
+        line.strip_prefix("Bad owner or permissions on ")
+            .filter(|path| !path.is_empty())
+    })?;
+    Some(format!(
+        "OpenSSH rejected config file {path}: bad owner or permissions. \
+         A user-namespace sandbox (including native Codex) can remap root-owned \
+         SSH includes to an unmapped uid even when host permissions are correct. \
+         Set this link's ssh_config (machine add --ssh-config) to an absolute, \
+         current-user-owned config without system Includes; \
+         host-side job.start is the fallback for an authorized handoff."
+    ))
+}
+
 fn validate(peer: &Peer) -> Result<()> {
     token(&peer.name, 64, "peer name")?;
+    if let Some(config) = &peer.ssh_config {
+        ensure!(peer.transport == "ssh", "ssh_config requires SSH transport");
+        validate_ssh_config(config)?;
+    }
     ensure!(
         matches!(peer.transport.as_str(), "ssh" | "local" | "collected"),
         "unsupported peer transport"
@@ -245,8 +310,13 @@ fn call(peer: &Peer, id: &str, command: &str, mut args: Value, caller: &Caller) 
             .map(|token| posix_quote(token))
             .collect::<Vec<_>>()
             .join(" ");
+        if let Some(config) = &peer.ssh_config {
+            cmd.args(["-F", config]);
+        }
         cmd.args([
             "-T",
+            "-o",
+            "StrictHostKeyChecking=yes",
             "-o",
             "BatchMode=yes",
             "-o",
@@ -339,18 +409,26 @@ fn call(peer: &Peer, id: &str, command: &str, mut args: Value, caller: &Caller) 
         }
         thread::sleep(Duration::from_millis(5));
     };
-    write_result.context("peer request writer failed")??;
+    let write_result = write_result.context("peer request writer failed")?;
     let output = output.context("peer response reader failed")??;
     let errors = errors.context("peer diagnostic reader failed")??;
     ensure!(
         !overflow.load(Ordering::Acquire),
         "peer output exceeded configured byte limit"
     );
+    if peer.transport == "ssh" {
+        if let Some(diagnostic) =
+            ssh_config_failure(status.code(), &String::from_utf8_lossy(&errors))
+        {
+            bail!("{diagnostic}");
+        }
+    }
     ensure!(
         status.success(),
         "peer transport exited with {status}: {}",
         String::from_utf8_lossy(&errors).trim()
     );
+    write_result?;
     let lines: Vec<&[u8]> = output
         .split(|c| *c == b'\n')
         .filter(|line| !line.is_empty())
@@ -534,6 +612,7 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
             "name",
             "transport",
             "host",
+            "ssh_config",
             "executable",
             "home",
             "gateway",

@@ -5,6 +5,8 @@
 //! connects back.
 #[path = "machines/absence.rs"]
 mod absence;
+#[path = "machines/ssh_config.rs"]
+mod ssh_config;
 mod support;
 
 use rusqlite::params;

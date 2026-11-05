@@ -1,3 +1,6 @@
+#[cfg(unix)]
+#[path = "peers/ssh_config.rs"]
+mod ssh_config;
 mod support;
 
 use serde_json::{Value, json};
