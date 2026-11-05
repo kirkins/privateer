@@ -656,7 +656,13 @@ class Runner:
                 # (including during thread/read RPCs) can still precede native
                 # admission/promotion undetected; Codex has no atomic
                 # watched-thread admission fence.
-                loaded_thread(daemon, record)
+                # The dispatch connection's single observation deadline may
+                # be spent by the first fence, presence, scans, fsync and Popen.
+                # Give this fence its own deadline, but never accept a new
+                # daemon identity just because reconnecting succeeded.
+                with Daemon(record["codex_home"]) as fence_daemon:
+                    daemon_check(fence_daemon, record, custody)
+                    loaded_thread(fence_daemon, record)
             except (OSError, ValueError, KeyError, TypeError) as error:
                 # Persist before draining. Later receipt/ack evidence may settle
                 # the offer, but neither it, unloading /new, nor restart may

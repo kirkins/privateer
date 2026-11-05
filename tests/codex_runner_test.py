@@ -323,6 +323,7 @@ class RunnerTests(unittest.TestCase):
             # A presented offer with its success wake deliberately withheld
             # remains outstanding to tick; it must not manufacture that wake.
             self.assertEqual(runner.tick(self.registry), {"tick": "mail wake unreported"})
+            self.assertFalse(any(command == "wake.hosted" for command, _ in self.calls))
             self.prepare(1)
             with self.assertRaisesRegex(ValueError, "runner paused"):
                 restarted.dispatch()
@@ -363,6 +364,104 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(result["paused"])
         self.assertFalse(result["report_eligible"])
         self.assertIn("fixture post-spawn disconnect", result["pause_reason"])
+        self.assertEqual(result["possibly_unattended_spent"], 1)
+
+    def test_post_spawn_fence_gets_fresh_deadline_after_dispatch_deadline_expires(self):
+        connections = []
+        fixture = self
+        class ExpiringDaemon(self.daemon_class):
+            def __init__(self, home):
+                with binding.locked(fixture.directory):
+                    pass  # Connecting/initializing must also be outside flock.
+                super().__init__(home)
+                self.deadline = time.monotonic() + 3
+                self.methods = []
+                connections.append(self)
+            def call(self, method, params):
+                if time.monotonic() >= self.deadline:
+                    raise TimeoutError("fixture connection deadline exhausted")
+                self.methods.append(method)
+                return super().call(method, params)
+        original = subprocess.Popen
+        def spawn(*args, **kwargs):
+            self.assertEqual(len(connections), 1)
+            # Inject elapsed observation time without sleeping or changing the
+            # clock used by process cleanup. Identity-only checks still work.
+            connections[0].deadline = 0
+            return original(*args, **kwargs)
+        with patch.object(runner, "Daemon", ExpiringDaemon), patch.object(runner.subprocess, "Popen", side_effect=spawn):
+            result = self.runner.dispatch()
+        self.assertEqual(len(connections), 2)
+        self.assertEqual(connections[1].methods, ["thread/loaded/list", "thread/read"])
+        self.assertTrue((self.root / "invoked.json").exists())
+        self.assertTrue(result["report_eligible"])
+        self.assertNotIn(runner.THREAD_FENCE_LOST, result["diagnostics"])
+        self.assertIsNone(result["pause_reason"])
+        self.assertEqual(result["possibly_unattended_spent"], 1)
+        # Invocation alone is uncertain, but real promotion can still settle
+        # and publish success: the expired first connection caused no pause.
+        self.promoted()
+        result = self.runner.observe()
+        self.assertFalse(result["paused"])
+        self.assertEqual(result["accepted_through"], 1)
+        self.runner.publish(self.record, result)
+        self.assertTrue(any(command == "wake.hosted" and args.get("trigger") == "mail"
+                            for command, args in self.calls))
+
+    def test_post_spawn_fresh_connection_to_different_daemon_fails_safe(self):
+        connections = []
+        fixture = self
+        class ReplacedDaemon(self.daemon_class):
+            def __init__(self, home):
+                with binding.locked(fixture.directory):
+                    pass
+                super().__init__(home)
+                self.methods = []
+                if connections:
+                    self.pid = fixture.supervisor.pid
+                    self.identity = process_identity(self.pid)
+                connections.append(self)
+            def check(self):
+                # Only the fresh connection's check must be outside flock;
+                # the original still has local checks at the spawn boundary.
+                if len(connections) > 1 and self is connections[1]:
+                    with binding.locked(fixture.directory):
+                        pass
+                super().check()
+            def call(self, method, params):
+                self.methods.append(method)
+                return super().call(method, params)
+        with patch.object(runner, "Daemon", ReplacedDaemon):
+            result = self.runner.dispatch()
+        self.assertEqual(len(connections), 2)
+        self.assertEqual(connections[1].methods, [])  # Reject before thread RPCs.
+        self.assertTrue((self.root / "invoked.json").exists())
+        self.assertTrue(result["paused"])
+        self.assertFalse(result["report_eligible"])
+        self.assertIn(runner.THREAD_FENCE_LOST, result["diagnostics"])
+        self.assertIn("daemon custody changed", result["pause_reason"])
+        self.assertEqual(self.runner.ledger.read()["sessions"][self.session]["intent"]["state"], "uncertain")
+        self.assertEqual(result["possibly_unattended_spent"], 1)
+        self.runner.publish(self.record, result)
+        self.assertFalse(any(command == "wake.hosted" for command, _ in self.calls))
+
+    def test_post_spawn_fresh_connection_open_failure_fails_safe(self):
+        connections = []
+        def connect(home):
+            with binding.locked(self.directory):
+                pass
+            if connections:
+                raise ConnectionError("fixture fresh connection refused")
+            daemon = self.daemon_class(home)
+            connections.append(daemon)
+            return daemon
+        with patch.object(runner, "Daemon", side_effect=connect):
+            result = self.runner.dispatch()
+        self.assertTrue((self.root / "invoked.json").exists())
+        self.assertTrue(result["paused"])
+        self.assertFalse(result["report_eligible"])
+        self.assertIn(runner.THREAD_FENCE_LOST, result["diagnostics"])
+        self.assertIn("fixture fresh connection refused", result["pause_reason"])
         self.assertEqual(result["possibly_unattended_spent"], 1)
 
     def test_post_spawn_fence_allows_own_turn_to_be_active(self):
