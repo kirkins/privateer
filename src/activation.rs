@@ -752,6 +752,7 @@ fn wake_text(
     let mut shown = 0;
     for focus in &foci {
         let mut section = format!("## {focus}\n");
+        section.push_str(&crate::context::child_status_text(store, ship, focus)?);
         let note = if resumed {
             None
         } else {

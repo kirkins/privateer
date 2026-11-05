@@ -2225,6 +2225,56 @@ fn woke_by(fleet: &Fleet) -> Value {
     serde_json::from_str::<Value>(&raw).unwrap()["woke_by"].clone()
 }
 
+#[test]
+fn finishing_a_direct_child_resumes_the_registered_parent_wait_once_with_fresh_status() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    call(
+        &mut fleet,
+        "task.create",
+        json!({"id":"index","parent":"infra-repair","owner":"infra","title":"Repair index"}),
+    );
+    let offer = poll(&mut fleet, true)["offer"].clone();
+    call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair","offer_id":offer["id"],
+        "wait":{"kind":"task","ref":"index","reason":"Needs the index repair"}}),
+    );
+    assert!(poll(&mut fleet, true)["offer"].is_null());
+    call(
+        &mut fleet,
+        "task.update",
+        json!({"id":"index","actor":"infra","status":"done"}),
+    );
+    let resumed = poll(&mut fleet, true)["offer"].clone();
+    assert!(resumed["id"].is_string(), "{resumed}");
+    let facts = call(
+        &mut fleet,
+        "note.get",
+        json!({"ship":"infra","focus":"task:infra-repair"}),
+    );
+    let prompt = resumed["prompt"].as_str().unwrap();
+    assert!(
+        prompt.contains(&facts["child_status"].to_string()),
+        "{prompt}"
+    );
+    assert!(prompt.contains("\"task_done\":true"), "{prompt}");
+    assert_eq!(facts["child_status"]["children"][0]["status"], "done");
+    for _ in 0..3 {
+        poll(&mut fleet, true);
+    }
+    let wakes = work_wakes(&mut fleet);
+    assert_eq!(
+        wakes.len(),
+        2,
+        "enqueue plus exactly one completion: {wakes:?}"
+    );
+    assert_eq!(wakes[1]["reason"], "wait");
+    assert_eq!(wakes[1]["causes"][0]["ref"], "index");
+}
+
 /// Each work offer records what made its task ready: the enqueue, its own
 /// timer, the task it waited on, or a retry after a released offer. The cause
 /// is stored with the schedule until its offer takes it.

@@ -276,6 +276,8 @@ impl Store {
             ("events", "time_ms", "INTEGER"),
             // A ship's backlog order: open tasks with a rank start first.
             ("tasks", "rank", "INTEGER"),
+            // Durable status time: audit history can be pruned independently.
+            ("tasks", "status_changed_ms", "INTEGER"),
             // The ships a task is shared with, as JSON: empty (NULL) unless the
             // owner sets it, so nothing becomes visible on upgrade.
             ("tasks", "shared_with", "TEXT"),
@@ -292,6 +294,18 @@ impl Store {
                 migrate.execute_batch(&format!(
                     "ALTER TABLE {table} ADD COLUMN {column} {declaration};"
                 ))?;
+                if table == "tasks" && column == "status_changed_ms" {
+                    // Recover what old records know; do not invent a time for
+                    // tasks whose history has already been pruned.
+                    migrate.execute_batch(
+                        "UPDATE tasks SET status_changed_ms=(
+                           SELECT a.time_ms FROM audit a
+                           WHERE json_extract(a.payload,'$.id')=tasks.id
+                             AND ((a.kind='task.update' AND json_extract(a.payload,'$.status')=tasks.status)
+                               OR (a.kind='task.create' AND tasks.status='open'))
+                           ORDER BY a.seq DESC LIMIT 1);",
+                    )?;
+                }
             }
         }
         // A block card's tap records an approval with source 'block', which
@@ -320,7 +334,21 @@ impl Store {
         // `fleet.snapshot` finds a ship's open tasks by owner and status.
         migrate.execute_batch(
             "CREATE INDEX IF NOT EXISTS event_recipient ON events(json_extract(payload,'$.to'),seq) WHERE kind='message';
-             CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(owner, status);",
+             CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(owner, status);
+             CREATE INDEX IF NOT EXISTS tasks_parent_status_time ON tasks(parent, status_changed_ms DESC, id);
+             -- Status changes also come from scheduling, not just task.update.
+             -- Capture every real edge atomically; same-status writes and
+             -- custody/rank changes must not make a child look newly changed.
+             CREATE TRIGGER IF NOT EXISTS task_status_created AFTER INSERT ON tasks
+             WHEN NEW.status_changed_ms IS NULL BEGIN
+               UPDATE tasks SET status_changed_ms=CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)
+                 WHERE id=NEW.id;
+             END;
+             CREATE TRIGGER IF NOT EXISTS task_status_changed AFTER UPDATE OF status ON tasks
+             WHEN NEW.status<>OLD.status BEGIN
+               UPDATE tasks SET status_changed_ms=CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)
+                 WHERE id=NEW.id;
+             END;",
         )?;
         // Keep receipts on the existing approval row. An extra table (and its
         // primary-key index) increases schema-load work on every fresh SQLite
