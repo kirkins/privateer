@@ -34,7 +34,7 @@ A route the captain has not named in the routes file (a ship's own first-mate pr
 
 ### Releasing the reserve near a reset
 
-A fixed reserve strands the end of an allowance: a route at 83% of its weekly window, ten hours before the reset, refuses work while the last 17% expires unused. The kept share therefore releases as the reset approaches. For the window the furthest-spent reading comes from (Claude's five-hour or weekly window, or a run budget's window), the reserve shrinks in proportion to the time still left:
+A fixed reserve strands the end of an allowance: a route at 83% of its weekly window, ten hours before the reset, refuses work while the last 17% expires unused. The kept share therefore releases as the reset approaches. Each window releases against its own reset, and the reserve that applies is the one from the window furthest past its own effective share: the window a refusal would come from. A weekly window still far from its reset can be inside its share while the five-hour window is the one that refuses. For that window (Claude's five-hour or weekly window, or a run budget's window), the reserve shrinks in proportion to the time still left:
 
 ```
 effective reserve = configured reserve × (time left ÷ window length)
@@ -43,7 +43,7 @@ effective threshold = 1 − effective reserve
 
 At the start of a window the threshold is the configured `crew_headroom_pct` or `first_mate_headroom_pct`; halfway through, half the reserve has been released; in the last minutes the threshold is almost 100%, so the route reaches its limit around the reset rather than forfeiting it. A window with no known reset, or one already past, keeps the configured share. The release is the same for both shares: the first mate's reserve protects interactive use while the window still has a long way to run, not after the reset is about to replace it.
 
-`reserve_release` is per route. The default is `"proportional"`; `"fixed"` keeps today's configured share until the reset for an operator who wants a hard reserve. The curve is a pure function of the configured reserve, `now`, the reset time and the window length, so it needs no provider knowledge and no wall clock in tests. Bearings show the effective reserve, the configured share and whether it is released or fixed; a refusal likewise says why the reserve is at that figure.
+`reserve_release` is per route. The default is `"proportional"`; `"fixed"` keeps today's configured share until the reset for an operator who wants a hard reserve. The curve is a pure function of the configured reserve, `now`, the reset time and the window length, so it needs no provider knowledge and no wall clock in tests. Bearings show the effective reserve on the window that would refuse, the configured share and why it is released or fixed; a refusal likewise says why the reserve is at that figure.
 
 The rule needs a window length as well as a reset. Claude's five-hour and weekly readings have fixed lengths; a run budget's length comes from the route's `allowance` (`daily_utc` is a day, `window_hours` is that many hours). A reading without a known reset or length keeps the fixed share.
 
@@ -68,15 +68,15 @@ A task error is not retried early. The same first mate with the same brief on an
 
 ## Changes by file
 
-- `src/routes.rs`: `Who`; `Spent` (now carrying its window's reset and length) and `spent`; `released` and `reserve_for` (the release curve); `refusal_for`, `held_off` and the headroom refusal; `route_usage` gains `runs` and `runs_window_ends_ms` (migrated under the write lock); `Allowance.runs` counted in `record_job`; Claude windows recorded for every Claude route.
-- `src/crew_routes.rs`: `Limits` (the two shares, the run budget, its window length and the release setting), `Release`, `limits`, `limits_of`; `reserve_release` in route validation; `runs` in the allowance shape and its validation; `choose` refuses at the crew share, and `resume_route` is blocked only by a hold; `first_mate_fallback` and the new `retry_fallback` at the first-mate share; `RouteState.spent` shows the share in bearings and in the fleet snapshot, and bearings add the effective reserve, its configured share and whether it is released or fixed.
+- `src/routes.rs`: `Who`; `Spent` (now carrying its window's reset and length) and `spent`; `reserve` (the release curve and its reason) and `binding` (the window a refusal comes from); `refusal_for`, `held_off` and the headroom refusal; `route_usage` gains `runs` and `runs_window_ends_ms` (migrated under the write lock); `Allowance.runs` counted in `record_job`; Claude windows recorded for every Claude route.
+- `src/crew_routes.rs`: `Limits` (the two shares, the run budget, its window length and the release setting), `Release`, `limits`, `limits_of`; `reserve_release` in route validation; `runs` in the allowance shape and its validation; `choose` refuses at the crew share, and `resume_route` is blocked only by a hold; `first_mate_fallback` and the new `retry_fallback` at the first-mate share; `RouteState.spent` shows the share in bearings and in the fleet snapshot, and bearings add the effective reserve on the binding window, its configured share and why it is released or fixed, using the identity's share for each list (errand and review are selected on the crew share).
 - `src/activation.rs`: `own_route_blocked` reads the first-mate share; `Last`, `Retry` and `retryable`; the wake row records `retry_of`; the retry is taken outside both waits and skips its answered mail; `wake_text` tells the retry what it is retrying.
 - `src/lib.rs`: a launch is judged as the kind it is, so a first mate's own wake is not refused at the crew share.
 - `src/snapshot.rs`: each route row carries `used`, the share spent and the window it is from.
 
 ## Tests
 
-Unit tests: the share is the furthest window and names it, and a closed window or an unstated budget counts for nothing; the reserve release curve at just after a reset, mid window, the final minutes, past a reset and with no reset or window length; the opt-out keeps the configured share; runs count whether the run succeeded or was refused, and the count resets with its window; a Claude reading is kept for a route that declares no allowance; the defaults are 80 and 95 with no budget, and a run budget needs a whole number of runs.
+Unit tests: the share is the furthest window and names it, and a closed window or an unstated budget counts for nothing; the reserve release curve just after a reset, mid window, the final minutes, exactly at and past a reset, beyond a whole window ahead, and with no reset or window length; the binding window is the one furthest past its own share; the opt-out keeps the configured share; runs count whether the run succeeded or was refused, and the count resets with its window; a Claude reading is kept for a route that declares no allowance; the defaults are 80 and 95 with no budget, and a run budget needs a whole number of runs.
 
 Integration, with an isolated routes file and ledger (`PRIVATEER_FLEET`, `PRIVATEER_RESOURCE_HOME`) and fake harnesses:
 

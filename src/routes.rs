@@ -1011,33 +1011,62 @@ pub(crate) fn spent(
         })
 }
 
-/// The kept share at `now` for a window of `window_ms` that resets at
-/// `reset_ms`: the configured reserve shrinks in proportion to the time left,
-/// reaching zero at the reset. With no known reset or window, or one already
-/// past, the configured share stands. This is the whole release curve, a pure
-/// function of its arguments.
-pub(crate) fn released(
-    reserve: f64,
-    now: i64,
-    reset_ms: Option<i64>,
-    window_ms: Option<i64>,
-) -> f64 {
-    let (Some(reset), Some(window)) = (reset_ms, window_ms) else {
-        return reserve;
-    };
-    if reset <= now || window <= 0 {
-        return reserve;
-    }
-    let left = ((reset - now) as f64 / window as f64).clamp(0.0, 1.0);
-    (reserve * left).clamp(0.0, 1.0)
+/// Why a window's kept share is the figure it is. Both a refusal and the
+/// bearings line use this, so their wording never claims a release that did
+/// not happen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReserveReason {
+    /// The reserve shrinks in proportion to the time left before the reset.
+    Released,
+    /// `reserve_release: "fixed"` keeps the configured share until the reset.
+    Fixed,
+    /// No reset or window length is known, so the configured share stands.
+    UnknownReset,
+    /// The reset is at least a whole window ahead, so nothing released yet.
+    BeyondWindow,
+    /// The reset is now or already past, so the configured share stands.
+    ResetNotAhead,
 }
 
-/// The kept share for one reading, honouring a route that opts out.
-pub(crate) fn reserve_for(limits: &Limits, configured: f64, reading: &Spent, now: i64) -> f64 {
-    match limits.release {
-        Release::Fixed => configured,
-        Release::Proportional => released(configured, now, reading.reset_ms, reading.window_ms),
+impl ReserveReason {
+    /// The phrase a refusal and bearings use for this reason.
+    pub(crate) fn why(self) -> &'static str {
+        match self {
+            Self::Released => "released as the reset nears",
+            Self::Fixed => "fixed until the reset",
+            Self::UnknownReset => "configured share kept because the reset is unknown",
+            Self::BeyondWindow => "configured share kept because the reset is beyond the window",
+            Self::ResetNotAhead => "configured share kept because the reset is not ahead",
+        }
     }
+}
+
+/// The kept share at `now` for one reading, and why: the configured reserve
+/// shrinks in proportion to the time left, reaching zero at the reset. With no
+/// known reset or window, one further ahead than the window length, or one
+/// already reached, the configured share stands. A route that opts out keeps
+/// the configured share until the reset. This is the whole release curve, a
+/// pure function of its arguments.
+pub(crate) fn reserve(
+    limits: &Limits,
+    configured: f64,
+    reading: &Spent,
+    now: i64,
+) -> (f64, ReserveReason) {
+    if limits.release == Release::Fixed {
+        return (configured, ReserveReason::Fixed);
+    }
+    let (Some(reset), Some(window)) = (reading.reset_ms, reading.window_ms) else {
+        return (configured, ReserveReason::UnknownReset);
+    };
+    if window <= 0 || reset <= now {
+        return (configured, ReserveReason::ResetNotAhead);
+    }
+    let left = ((reset - now) as f64 / window as f64).clamp(0.0, 1.0);
+    if left >= 1.0 {
+        return (configured, ReserveReason::BeyondWindow);
+    }
+    ((configured * left).clamp(0.0, 1.0), ReserveReason::Released)
 }
 
 /// The share at which this kind of launch is refused a route.
@@ -1046,6 +1075,48 @@ fn threshold(limits: &Limits, who: Who) -> f64 {
         Who::Crew => limits.crew,
         Who::FirstMate | Who::Errand => limits.first_mate,
     }
+}
+
+/// One route's binding window: the one furthest past its own kept share, so
+/// the one a refusal would come from. `over` is how far past that share the
+/// window is; it is negative while every window is still inside its share.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Binding {
+    pub reading: Spent,
+    pub kept: f64,
+    pub reason: ReserveReason,
+    pub over: f64,
+}
+
+/// The window that decides a launch's share, using the same per-window release
+/// and threshold as a refusal. Each window releases on its own reset, so a
+/// weekly window far from its reset can be inside its share while the
+/// five-hour window is the one that would refuse.
+pub(crate) fn binding(
+    usage: &Usage,
+    budget: Option<u64>,
+    run_window_ms: Option<i64>,
+    limits: &Limits,
+    who: Who,
+    now: i64,
+) -> Option<Binding> {
+    let configured = 1.0 - threshold(limits, who);
+    readings(usage, budget, run_window_ms, now)
+        .into_iter()
+        .map(|reading| {
+            let (kept, reason) = reserve(limits, configured, &reading, now);
+            let over = reading.share - (1.0 - kept);
+            Binding {
+                reading,
+                kept,
+                reason,
+                over,
+            }
+        })
+        .fold(None, |worst: Option<Binding>, binding| match worst {
+            Some(worst) if worst.over >= binding.over => Some(worst),
+            _ => Some(binding),
+        })
 }
 
 /// A refusal message for a route whose plan is past the share this launch
@@ -1067,39 +1138,19 @@ fn tight(
         usage = with_account_windows(Some(usage), account_usage.as_ref()).unwrap_or_default();
     }
     let configured = 1.0 - threshold(limits, who);
-    // Each window releases on its own reset, so judge each against its own
-    // kept share and refuse on the one furthest past it.
-    let mut refused: Option<(f64, Spent)> = None;
-    for reading in readings(&usage, limits.runs, limits.runs_window_ms, now) {
-        let kept = reserve_for(limits, configured, &reading, now);
-        let limit = 1.0 - kept;
-        if reading.share < limit {
-            continue;
-        }
-        let over = reading.share - limit;
-        if refused.as_ref().is_none_or(|(worst, _)| over > *worst) {
-            refused = Some((over, reading));
-        }
-    }
-    let Some((_, reading)) = refused else {
+    let Some(binding) = binding(&usage, limits.runs, limits.runs_window_ms, limits, who, now)
+        .filter(|binding| binding.over >= 0.0)
+    else {
         return Ok(None);
     };
-    let kept = reserve_for(limits, configured, &reading, now);
-    let released = limits.release == Release::Proportional
-        && reading.reset_ms.is_some()
-        && reading.window_ms.is_some();
-    let why = match released {
-        false => format!(
-            "{:.0}% reserve of the configured {:.0}%, fixed until the reset",
-            kept * 100.0,
-            configured * 100.0
-        ),
-        true => format!(
-            "{:.0}% reserve of the configured {:.0}%, released as the reset nears",
-            kept * 100.0,
-            configured * 100.0
-        ),
-    };
+    let reading = binding.reading;
+    let kept = binding.kept;
+    let why = format!(
+        "{:.0}% reserve of the configured {:.0}%, {}",
+        kept * 100.0,
+        configured * 100.0,
+        binding.reason.why()
+    );
     let move_on = match who {
         Who::Crew | Who::Errand => "new crew and errands on it take the next route in their list",
         Who::FirstMate => {
@@ -2638,33 +2689,57 @@ mod allowance_tests {
         let now = Store::now_ms();
         let window = 7 * 24 * HOUR;
         let configured = 0.2;
+        let keep = |reset: Option<i64>, window_ms: Option<i64>| {
+            let reading = Spent {
+                share: 0.9,
+                what: "window".into(),
+                reset_ms: reset,
+                window_ms,
+            };
+            reserve(&Limits::default(), configured, &reading, now)
+        };
         // Just after a reset: the whole window is ahead, so the whole reserve.
         assert_eq!(
-            released(configured, now, Some(now + window), Some(window)),
-            configured
+            keep(Some(now + window), Some(window)),
+            (configured, ReserveReason::BeyondWindow)
         );
         // Mid window: half the time left keeps half the reserve.
         assert_eq!(
-            released(configured, now, Some(now + window / 2), Some(window)),
-            configured / 2.0
+            keep(Some(now + window / 2), Some(window)),
+            (configured / 2.0, ReserveReason::Released)
         );
         // The final minutes hold almost nothing back.
-        let final_minutes = released(configured, now, Some(now + 5 * 60_000), Some(window));
+        let (final_minutes, reason) = keep(Some(now + 5 * 60_000), Some(window));
         assert!(final_minutes < configured / 100.0, "{final_minutes}");
-        // Past the reset, and with no reset or no window length, the configured
-        // share stands as it did before this release curve existed.
+        assert_eq!(reason, ReserveReason::Released);
+        // A reset exactly now has nothing left to release, so it keeps the
+        // configured share instead of claiming a release that did not happen.
         assert_eq!(
-            released(configured, now, Some(now - 1), Some(window)),
-            configured
+            keep(Some(now), Some(window)),
+            (configured, ReserveReason::ResetNotAhead)
         );
-        assert_eq!(released(configured, now, None, Some(window)), configured);
+        // Past the reset, with no reset or no window length, and further ahead
+        // than a whole window, the configured share stands as it did before
+        // this release curve existed.
         assert_eq!(
-            released(configured, now, Some(now + window), None),
-            configured
+            keep(Some(now - 1), Some(window)),
+            (configured, ReserveReason::ResetNotAhead)
         );
         assert_eq!(
-            released(configured, now, Some(now + window), Some(0)),
-            configured
+            keep(None, Some(window)),
+            (configured, ReserveReason::UnknownReset)
+        );
+        assert_eq!(
+            keep(Some(now + window), None),
+            (configured, ReserveReason::UnknownReset)
+        );
+        assert_eq!(
+            keep(Some(now + window), Some(0)),
+            (configured, ReserveReason::ResetNotAhead)
+        );
+        assert_eq!(
+            keep(Some(now + 2 * window), Some(window)),
+            (configured, ReserveReason::BeyondWindow)
         );
 
         let reading = Spent {
@@ -2675,11 +2750,14 @@ mod allowance_tests {
         };
         let mut limits = Limits::default();
         assert_eq!(
-            reserve_for(&limits, configured, &reading, now),
-            configured / 2.0
+            reserve(&limits, configured, &reading, now),
+            (configured / 2.0, ReserveReason::Released)
         );
         limits.release = Release::Fixed;
-        assert_eq!(reserve_for(&limits, configured, &reading, now), configured);
+        assert_eq!(
+            reserve(&limits, configured, &reading, now),
+            (configured, ReserveReason::Fixed)
+        );
     }
 
     /// A run that reached the provider counts against the budget, whether it

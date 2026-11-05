@@ -1407,6 +1407,124 @@ fn a_reserve_releases_as_the_weekly_reset_nears() {
     assert_eq!(f.model(&allowed), "sonnet", "{allowed}");
 }
 
+/// Bearings show the share and release setting of the first name for the
+/// route's identity, the same lookup a refusal uses, not the alias's own.
+#[test]
+fn bearings_show_the_identity_share_a_refusal_uses_for_an_alias() {
+    let f = Fleet::new();
+    let mut strict = claude("sonnet");
+    strict["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
+    strict["tier"] = json!(1);
+    strict["crew_headroom_pct"] = json!(50);
+    strict["reserve_release"] = json!("fixed");
+    let mut alias = strict.clone();
+    alias["crew_headroom_pct"] = json!(100);
+    alias["reserve_release"] = json!("proportional");
+    f.routes(json!({
+        "routes": {"a-strict": strict, "z-alias": alias,
+            "other": codex("model-other", "plan")},
+        "crew": ["z-alias", "other"]
+    }));
+    f.tick();
+    let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    let now = privateer::store::Store::now_ms();
+    ledger
+        .execute(
+            "INSERT OR REPLACE INTO route_usage(route, weekly_utilization, weekly_ends_ms, updated_ms)
+             VALUES('claude/-/sonnet', 0.90, ?1, ?2)",
+            rusqlite::params![now + 6 * 24 * 3_600_000, now],
+        )
+        .unwrap();
+
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(text.contains("50% reserve for crew"), "{text}");
+    assert!(text.contains("fixed until the reset"), "{text}");
+}
+
+/// The reserve line comes from the window a refusal would come from, not the
+/// most-spent one: a weekly window at 95% an hour before its reset is inside
+/// its released share while the five-hour window at 82% is the one refusing.
+#[test]
+fn bearings_report_the_window_that_would_refuse_the_reserve() {
+    let f = Fleet::new();
+    let mut shared = claude("sonnet");
+    shared["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
+    shared["tier"] = json!(1);
+    f.routes(json!({
+        "routes": {"shared": shared, "other": codex("model-other", "plan")},
+        "crew": ["shared", "other"]
+    }));
+    f.tick();
+    let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    let now = privateer::store::Store::now_ms();
+    ledger
+        .execute(
+            "INSERT OR REPLACE INTO route_usage(route, window_utilization, window_ends_ms,
+               weekly_utilization, weekly_ends_ms, updated_ms)
+             VALUES('claude/-/sonnet', 0.82, ?1, 0.95, ?2, ?3)",
+            rusqlite::params![now + 4_900 * 3_600, now + 3_600_000, now],
+        )
+        .unwrap();
+
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("78% reserve for crew on its five-hour window"),
+        "{text}"
+    );
+    assert!(!text.contains("0% reserve for crew"), "{text}");
+}
+
+/// Errand and review launches are selected on the crew share, so bearings name
+/// that share for those lists rather than the first mate's larger one.
+#[test]
+fn bearings_use_the_crew_share_for_errand_and_review_lists() {
+    let f = Fleet::new();
+    let mut shared = claude("sonnet");
+    shared["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
+    shared["tier"] = json!(1);
+    shared["uses"] = json!(["review"]);
+    shared["crew_headroom_pct"] = json!(70);
+    shared["first_mate_headroom_pct"] = json!(95);
+    shared["reserve_release"] = json!("fixed");
+    f.routes(json!({
+        "routes": {"shared": shared},
+        "errand": ["shared"],
+        "review": ["shared"]
+    }));
+    f.tick();
+    let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    let now = privateer::store::Store::now_ms();
+    ledger
+        .execute(
+            "INSERT OR REPLACE INTO route_usage(route, weekly_utilization, weekly_ends_ms, updated_ms)
+             VALUES('claude/-/sonnet', 0.90, ?1, ?2)",
+            rusqlite::params![now + 6 * 24 * 3_600_000, now],
+        )
+        .unwrap();
+
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    let errand = text
+        .split("errand: ")
+        .nth(1)
+        .unwrap()
+        .split("review: ")
+        .next()
+        .unwrap();
+    assert!(errand.contains("70% reserve for crew"), "{text}");
+    assert!(!errand.contains("95% reserve for first mate"), "{text}");
+    let review = text
+        .split("review: ")
+        .nth(1)
+        .unwrap()
+        .split('\n')
+        .next()
+        .unwrap();
+    assert!(review.contains("70% reserve for crew"), "{text}");
+}
+
 /// An expired window counts as 0, so crew are not refused once the window's
 /// reset time has passed.
 #[test]

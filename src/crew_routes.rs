@@ -2436,12 +2436,21 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
                     .map(str::to_owned),
             );
             let declared = allowance(route);
+            // A refusal looks up the first name for the route's identity, so
+            // an alias must show that name's share and release setting too.
+            let route_limits = identity(route)
+                .as_deref()
+                .map_or_else(Limits::default, |id| named_limits(&policy, id));
+            // Crew, errand and review launches are all selected on the crew
+            // share (`choose` and `choose_reviewer` use `Who::Crew`), so the
+            // line names that share for those lists. A first mate keeps its
+            // own, larger share.
             let who = match kind {
                 "first_mate" => Who::FirstMate,
-                "errand" => Who::Errand,
                 _ => Who::Crew,
             };
-            let reserve = reserve_note(route, read.and_then(|r| r.spent.as_ref()), who, now);
+            let reserve =
+                reserve_note(&route_limits, read.and_then(|r| r.usage.as_ref()), who, now);
             if let Some(allowance) = declared {
                 shaped = true;
                 let mut about = format!("{}, {}", describe(allowance.shape), strength(route));
@@ -2550,39 +2559,34 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
     Ok(Some(text))
 }
 
-/// The reserve state bearings show for a route with a spent reading: the
-/// share kept now, the configured share it came from, and whether it is fixed
-/// or released toward the window's reset.
+/// The reserve state bearings show for a route with usage readings: the share
+/// kept now for the window a refusal would come from, the configured share it
+/// came from, and why it is released or fixed.
 fn reserve_note(
-    route: &Value,
-    spent: Option<&crate::routes::Spent>,
+    limits: &Limits,
+    usage: Option<&crate::routes::Usage>,
     who: Who,
     now: i64,
 ) -> Option<String> {
-    let spent = spent?;
-    let limits = limits(route);
+    let usage = usage?;
     let configured = 1.0
         - match who {
             Who::Crew => limits.crew,
             Who::FirstMate | Who::Errand => limits.first_mate,
         };
-    let kept = crate::routes::reserve_for(&limits, configured, spent, now);
+    let binding =
+        crate::routes::binding(usage, limits.runs, limits.runs_window_ms, limits, who, now)?;
     let what = match who {
         Who::Crew => "crew",
         Who::FirstMate => "first mate",
         Who::Errand => "errand",
     };
-    let released = limits.release == Release::Proportional
-        && spent.reset_ms.is_some()
-        && spent.window_ms.is_some();
-    let why = match released {
-        true => "released as the reset nears",
-        false => "fixed until the reset",
-    };
     Some(format!(
-        "{:.0}% reserve for {what} (of {:.0}%, {why})",
-        kept * 100.0,
-        configured * 100.0
+        "{:.0}% reserve for {what} on its {} (of {:.0}%, {})",
+        binding.kept * 100.0,
+        binding.reading.what,
+        configured * 100.0,
+        binding.reason.why()
     ))
 }
 
