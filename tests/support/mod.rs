@@ -768,3 +768,138 @@ pub fn end_processes_referring_to(root: &Path) {
         }
     }
 }
+
+/// The argv prefix that runs a command the way a native Codex first mate's
+/// shell runs it (docs/design/codex-sandboxed-launch.md, (f)): on Linux in
+/// its own PID namespace with its own /proc, as Codex's bwrap sandbox does;
+/// on macOS under Seatbelt with Codex's base rules, as `CODEX_LIKE_PROFILE`
+/// in `crew_scope::ancestry` copies them, plus `workspace-write`'s rules for
+/// the writable roots. Only `root` and the temporary directory are writable.
+/// `None` where this machine cannot make one; with
+/// PRIVATEER_SANDBOX_QUALIFICATION=1 (set in CI) that fails the test instead.
+pub fn sandbox_prefix(root: &Path) -> Option<Vec<std::ffi::OsString>> {
+    let required = std::env::var_os("PRIVATEER_SANDBOX_QUALIFICATION").is_some_and(|v| v == "1");
+    let prefix = codex_like_sandbox(root);
+    let works = prefix.as_ref().is_some_and(|prefix| {
+        Command::new(&prefix[0])
+            .args(&prefix[1..])
+            .arg("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success())
+    });
+    if works {
+        return prefix;
+    }
+    assert!(
+        !required,
+        "PRIVATEER_SANDBOX_QUALIFICATION=1 but this machine cannot create a Codex-like sandbox ({prefix:?})"
+    );
+    eprintln!("skipped: this machine cannot create a Codex-like sandbox ({prefix:?})");
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn codex_like_sandbox(root: &Path) -> Option<Vec<std::ffi::OsString>> {
+    let bwrap = ["/usr/bin/bwrap", "/bin/bwrap"]
+        .into_iter()
+        .map(Path::new)
+        .find(|p| p.exists())?;
+    let temp = fs::canonicalize(std::env::temp_dir()).ok()?;
+    let mut prefix: Vec<std::ffi::OsString> = vec![bwrap.into()];
+    for arg in [
+        "--unshare-user",
+        "--unshare-pid",
+        "--new-session",
+        "--die-with-parent",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+    ] {
+        prefix.push(arg.into());
+    }
+    for writable in [root.to_path_buf(), temp] {
+        prefix.push("--bind".into());
+        prefix.push(writable.clone().into());
+        prefix.push(writable.into());
+    }
+    Some(prefix)
+}
+
+#[cfg(target_os = "macos")]
+fn codex_like_sandbox(root: &Path) -> Option<Vec<std::ffi::OsString>> {
+    let temp = fs::canonicalize(std::env::temp_dir()).ok()?;
+    let profile = format!(
+        "{CODEX_BASE_PROFILE}(allow file-write* (subpath {:?}) (subpath {:?}) (subpath \"/private/tmp\") (subpath \"/private/var/folders\"))\n",
+        root.display().to_string(),
+        temp.display().to_string()
+    );
+    Some(vec![
+        "/usr/bin/sandbox-exec".into(),
+        "-p".into(),
+        profile.into(),
+    ])
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn codex_like_sandbox(_root: &Path) -> Option<Vec<std::ffi::OsString>> {
+    None
+}
+
+/// Codex's Seatbelt base rules, as `crew_scope::ancestry`'s macOS probe
+/// copies them from `codex-rs/sandboxing/src/seatbelt_base_policy.sbpl`
+/// (openai/codex 696b4502).
+#[cfg(target_os = "macos")]
+const CODEX_BASE_PROFILE: &str = r#"(version 1)
+(deny default)
+(allow process-exec)
+(allow process-fork)
+(allow signal (target same-sandbox))
+(allow process-info* (target same-sandbox))
+(allow user-preference-read)
+(allow file-read*)
+(allow file-write-data (require-all (path "/dev/null") (vnode-type CHARACTER-DEVICE)))
+(allow sysctl-read
+  (sysctl-name "hw.activecpu") (sysctl-name "hw.busfrequency_compat") (sysctl-name "hw.byteorder")
+  (sysctl-name "hw.cacheconfig") (sysctl-name "hw.cachelinesize_compat") (sysctl-name "hw.cpufamily")
+  (sysctl-name "hw.cpufrequency_compat") (sysctl-name "hw.cputype") (sysctl-name "hw.l1dcachesize_compat")
+  (sysctl-name "hw.l1icachesize_compat") (sysctl-name "hw.l2cachesize_compat") (sysctl-name "hw.l3cachesize_compat")
+  (sysctl-name "hw.logicalcpu_max") (sysctl-name "hw.machine") (sysctl-name "hw.model") (sysctl-name "hw.memsize")
+  (sysctl-name "hw.ncpu") (sysctl-name "hw.nperflevels") (sysctl-name "hw.packages") (sysctl-name "hw.pagesize_compat")
+  (sysctl-name "hw.pagesize") (sysctl-name "hw.physicalcpu") (sysctl-name "hw.physicalcpu_max")
+  (sysctl-name "hw.logicalcpu") (sysctl-name "hw.cpufrequency") (sysctl-name "hw.tbfrequency_compat")
+  (sysctl-name "hw.vectorunit") (sysctl-name "machdep.cpu.brand_string") (sysctl-name "kern.argmax")
+  (sysctl-name "kern.hostname") (sysctl-name "kern.maxfilesperproc") (sysctl-name "kern.maxproc")
+  (sysctl-name "kern.osproductversion") (sysctl-name "kern.osrelease") (sysctl-name "kern.ostype")
+  (sysctl-name "kern.osvariant_status") (sysctl-name "kern.osversion") (sysctl-name "kern.secure_kernel")
+  (sysctl-name "kern.sysv.semmns") (sysctl-name "kern.usrstack64") (sysctl-name "kern.version")
+  (sysctl-name "sysctl.proc_cputype") (sysctl-name "vm.loadavg")
+  (sysctl-name-prefix "hw.optional.arm.") (sysctl-name-prefix "hw.optional.armv8_")
+  (sysctl-name-prefix "hw.perflevel") (sysctl-name-prefix "kern.proc.pgrp.")
+  (sysctl-name-prefix "kern.proc.pid.") (sysctl-name-prefix "net.routetable."))
+(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))
+(allow ipc-posix-sem)
+"#;
+
+/// `command` rebuilt to run inside `prefix`: the same program and
+/// arguments after it, with the same environment changes.
+pub fn inside(prefix: &[std::ffi::OsString], command: &Command) -> Command {
+    let mut wrapped = Command::new(&prefix[0]);
+    wrapped.args(&prefix[1..]).arg(command.get_program());
+    wrapped.args(command.get_args());
+    for (name, value) in command.get_envs() {
+        match value {
+            Some(value) => wrapped.env(name, value),
+            None => wrapped.env_remove(name),
+        };
+    }
+    if let Some(dir) = command.get_current_dir() {
+        wrapped.current_dir(dir);
+    }
+    wrapped
+}

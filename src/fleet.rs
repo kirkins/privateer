@@ -37,6 +37,11 @@ pub fn use_registry(path: PathBuf) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("the fleet registry is already chosen"))
 }
 
+/// The registry `use_registry` chose for this process, if one was.
+pub fn chosen_registry() -> Option<PathBuf> {
+    REGISTRY.get().cloned()
+}
+
 pub fn registry_path() -> Result<PathBuf> {
     if let Some(path) = REGISTRY.get() {
         return Ok(path.clone());

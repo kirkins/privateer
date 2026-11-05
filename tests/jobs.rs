@@ -1235,12 +1235,41 @@ fn work_recorded_in_another_pid_namespace_is_never_settled_or_started() {
             [],
         )
         .unwrap();
+    // The CLI hands it to the home's dispatcher instead
+    // (docs/design/codex-sandboxed-launch.md); with none running it is
+    // refused at once as a sandbox limit, and nothing is recorded.
     let error = fails(
         &home,
         "job.start",
         json!({"task_id":"task","id":"sandboxed","command":["true"]}),
     );
-    assert!(error.contains("outside the PID sandbox"), "{error}");
+    assert!(error.contains("no dispatcher is running"), "{error}");
+    assert!(
+        error.contains("not a missing Privateer permission"),
+        "{error}"
+    );
+    assert!(!error.contains("permissions.blocked"), "{error}");
+    // Below the CLI, the runtime itself still refuses to record it there.
+    let mut direct = Store::open(&home).unwrap();
+    let refused = privateer::dispatch(
+        &mut direct,
+        "job.start",
+        json!({"task_id":"task","id":"sandboxed","command":["true"]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(refused.contains("another PID namespace"), "{refused}");
+    assert!(
+        refused.contains("not a missing Privateer permission"),
+        "{refused}"
+    );
+    assert!(
+        ok(&home, "job.list", json!({}))["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|j| j["id"] != "sandboxed")
+    );
     edit(running["supervisor"]["pid_namespace"].as_str().unwrap());
     fixture.serve(&home);
     ok(&home, "job.cancel", json!({"id":"foreign"}));

@@ -19,7 +19,7 @@
 //! except that one whose `PRIVATEER_JOB` names a running crew is narrowed to
 //! that crew. Under one OS account this is a workflow control, not a security
 //! boundary.
-mod ancestry;
+pub(crate) mod ancestry;
 
 use crate::mail::record_crew;
 use crate::store::{Caller, Store};
@@ -47,11 +47,14 @@ pub struct CrewCaller {
 struct Resolved {
     job: Option<String>,
     crew: Option<CrewCaller>,
+    /// `job` is the one a supervisor in the ancestry proved, not only named
+    /// by `PRIVATEER_JOB`.
+    proven: bool,
 }
 
 static RESOLVED: OnceLock<Resolved> = OnceLock::new();
 
-fn env_job() -> Option<String> {
+pub(crate) fn env_job() -> Option<String> {
     std::env::var("PRIVATEER_JOB")
         .ok()
         .filter(|job| !job.is_empty())
@@ -64,6 +67,15 @@ pub(crate) fn job_id() -> Option<String> {
         Some(resolved) => resolved.job.clone(),
         None => env_job(),
     }
+}
+
+/// The job a supervisor in this process's ancestry proved it runs in: never
+/// one only `PRIVATEER_JOB` names.
+pub(crate) fn proven_job() -> Option<String> {
+    RESOLVED
+        .get()
+        .filter(|resolved| resolved.proven)
+        .and_then(|resolved| resolved.job.clone())
 }
 
 /// The crew this process was resolved to, if any.
@@ -89,9 +101,54 @@ enum World {
 /// another job. `supervisor` says the command is itself a `_job-supervise`,
 /// whose `PRIVATEER_JOB` and role are its starter's: it is never refused.
 pub(crate) fn resolve(target: Option<&Path>, caller: Caller, supervisor: bool) -> Result<Caller> {
-    let env_job = env_job();
-    let proven =
-        supervising_job(target).inspect_err(|error| note_refusal(target, &format!("{error:#}")))?;
+    resolve_with(ancestry::ancestors, target, caller, env_job(), supervisor)
+}
+
+/// `resolve` for another process: the requester of a launch the home's
+/// dispatcher carries out (docs/design/codex-sandboxed-launch.md). The walk
+/// starts at `pid`, seen from outside its sandbox, and `caller` and `env_job`
+/// are what that process took from its own environment. The same rule then
+/// decides, with the same refusals; this process records the result as its
+/// own resolved job and crew.
+pub(crate) fn resolve_from(
+    pid: u32,
+    target: Option<&Path>,
+    caller: Caller,
+    env_job: Option<String>,
+) -> Result<Caller> {
+    resolve_with(
+        || ancestry::ancestors_of(pid),
+        target,
+        caller,
+        env_job,
+        false,
+    )
+}
+
+/// A caller refused because its sandbox hides what resolution needs. No
+/// Privateer permission would lift it; a launch is still handed to the
+/// dispatcher, which resolves the caller from outside the sandbox.
+#[derive(Debug)]
+pub struct SandboxLimit(pub String);
+
+impl std::fmt::Display for SandboxLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SandboxLimit {}
+
+fn resolve_with(
+    chain: impl FnOnce() -> Result<Vec<Ancestor>>,
+    target: Option<&Path>,
+    caller: Caller,
+    env_job: Option<String>,
+    supervisor: bool,
+) -> Result<Caller> {
+    let proven = chain()
+        .and_then(|chain| supervising_job_in(&chain, target))
+        .inspect_err(|error| note_refusal(target, &format!("{error:#}")))?;
     if let Some((home, job, record)) = proven {
         let world = world(&home, target)?;
         if world != World::Outside {
@@ -100,6 +157,7 @@ pub(crate) fn resolve(target: Option<&Path>, caller: Caller, supervisor: bool) -
                 let _ = RESOLVED.set(Resolved {
                     job: Some(job),
                     crew: None,
+                    proven: true,
                 });
                 return Ok(caller);
             };
@@ -145,6 +203,7 @@ pub(crate) fn resolve(target: Option<&Path>, caller: Caller, supervisor: bool) -
             let _ = RESOLVED.set(Resolved {
                 job: if supervisor { env_job } else { Some(job) },
                 crew,
+                proven: !supervisor,
             });
             return Ok(Caller::Agent { actor });
         }
@@ -161,7 +220,11 @@ pub(crate) fn resolve(target: Option<&Path>, caller: Caller, supervisor: bool) -
         },
         None => caller,
     };
-    let _ = RESOLVED.set(Resolved { job: env_job, crew });
+    let _ = RESOLVED.set(Resolved {
+        job: env_job,
+        crew,
+        proven: false,
+    });
     Ok(caller)
 }
 
@@ -302,19 +365,24 @@ type Supervised = (PathBuf, String, Value);
 /// The nearest ancestor that is its job's recorded supervisor
 /// (docs/design/codex-sandboxed-callers.md). Any other `_job-supervise`
 /// process proves nothing and is passed over.
+#[cfg(all(test, target_os = "macos"))]
 fn supervising_job(target: Option<&Path>) -> Result<Option<Supervised>> {
-    let chain = ancestry::ancestors()?;
+    supervising_job_in(&ancestry::ancestors()?, target)
+}
+
+/// The supervising job of the process whose ancestors are `chain`.
+fn supervising_job_in(chain: &[Ancestor], target: Option<&Path>) -> Result<Option<Supervised>> {
     let mut comms = vec!["privateer".to_owned()];
     comms.extend(ancestry::own_comm());
     // Only a hidden Privateer process needs the records: an unsandboxed
     // caller under a root-owned `login`, whose argv is always hidden, opens
     // no registry and queries no home.
-    let homes = if needs_records(&chain, &comms) {
+    let homes = if needs_records(chain, &comms) {
         world_homes(target)
     } else {
         vec![]
     };
-    find_supervisor(&chain, &homes, &comms, Store::now_ms())
+    find_supervisor(chain, &homes, &comms, Store::now_ms())
 }
 
 /// Whether `ancestor`'s argv is hidden and it may be a Privateer process: its
@@ -392,12 +460,13 @@ fn find_supervisor(
             ),
         }
         if !session_process(homes, ancestor, now_ms) {
-            bail!(
+            return Err(SandboxLimit(format!(
                 "this caller's sandbox hides the command line of its ancestor process {} ({}), a Privateer process that no job, hosted pane or attended session in the {} home(s) this caller can name records. It may be this caller's supervisor, so Privateer refuses the command rather than guess its job. This is a limit of the sandbox, not a missing Privateer permission: run the command outside the sandbox, or name the job's home with --home.",
                 ancestor.pid,
                 ancestor.comm.as_deref().unwrap_or("?"),
                 homes.len()
-            );
+            ))
+            .into());
         }
     }
     Ok(None)
@@ -607,6 +676,8 @@ pub(crate) fn check(store: &Store, command: &str, args: &Value) -> Result<()> {
     };
     let refusal = match command {
         "crew.report" | "crew.answer" | "crew.park" => None,
+        // Its own requests only: `launch::status` checks the caller.
+        "launch.status" => None,
         "workspace.status" | "resource.status" | "runtime.needs" | "ship.list" | "ship.show"
         | "charter.show" | "upgrade.status" | "job.list" | "note.list" => None,
         "job.start" => (text("task_id") != Some(crew.task.as_str()))

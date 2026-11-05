@@ -11,6 +11,10 @@ on:
         type: boolean
 permissions:
   contents: read
+# A machine that cannot make the qualification's sandbox fails those tests
+# here, where elsewhere they skip and say why.
+env:
+  PRIVATEER_SANDBOX_QUALIFICATION: '1'
 jobs:
   test:
     name: test (${{ matrix.shard }})
@@ -44,6 +48,21 @@ jobs:
           shared-key: test-${{ inputs.os }}
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 'slow-2' }}
+      # #736 qualification (docs/design/codex-sandboxed-launch.md, (f)):
+      # tests/sandboxed_launch.rs and review_gate run first-mate calls inside
+      # a Codex-like sandbox, bwrap on Linux and sandbox-exec (built in) on
+      # macOS. CI only: nothing at runtime installs or configures either.
+      # Ubuntu 24.04 runners restrict unprivileged user namespaces through
+      # AppArmor, which bwrap --unshare-user needs; lift that on the runner.
+      - name: Install bubblewrap for the sandbox qualification
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-user --unshare-pid --ro-bind / / --dev /dev --proc /proc true
       - run: cargo fmt --check
         if: matrix.shard == 'slow-2'
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings

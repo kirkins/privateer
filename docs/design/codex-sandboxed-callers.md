@@ -1,6 +1,6 @@
 # Design: callers inside a Codex sandbox
 
-Status (2026-11-04): (a) and (c) implemented (`src/crew_scope/ancestry.rs`, `src/crew_scope.rs`, `src/activation.rs`), with the first mate's review conditions; (b) is a sketch. Task `privateer-codex-mac-ancestry-732`, issue #732 (part of #649), with issue #736 sketched only. Read with [the crew role](crew-role.md), which defines a job caller and the ancestry rule this document keeps.
+Status (2026-11-04): (a) and (c) implemented (`src/crew_scope/ancestry.rs`, `src/crew_scope.rs`, `src/activation.rs`), with the first mate's review conditions; (b) is superseded by [sandboxed launches](codex-sandboxed-launch.md) (issue #736). Task `privateer-codex-mac-ancestry-732`, issue #732 (part of #649), with issue #736 sketched only. Read with [the crew role](crew-role.md), which defines a job caller and the ancestry rule this document keeps.
 
 ## Problem
 
@@ -106,27 +106,9 @@ On macOS, these CLI paths in `src/jobs.rs` still run `ps` and are left unchanged
 
 Inside a sandbox, commands that use them (for example `job.status` checking a running job's liveness) may still fail. Caller identity, which every command needs, is fixed here. Moving `jobs::identity` onto the same kernel read (`crew_scope::ancestry::kinfo` and `lstart`, which the macOS test checks byte for byte against `ps`) is a follow-up in a file another owner is changing.
 
-## (b) One launch contract for sandboxed callers (sketch only, issue #736)
+## (b) One launch contract for sandboxed callers
 
-**The problem on both platforms.** A sandboxed caller can record work but cannot start a process outside its sandbox:
-
-- On Linux under bwrap it is in its own PID namespace, so `ensure_dispatcher_namespace` (`src/jobs.rs`) refuses `job.start`, `agent.start`, `errand.start` and `workspace.*`. A record made there could never be inspected or settled from outside.
-- On macOS every child of a Seatbelt-sandboxed CLI inherits the sandbox. So a supervisor the CLI spawns would run its job (a build, or a crew's harness) under the first mate's sandbox. That job would be unable to inspect its own processes, and its children would show their ancestry as hidden.
-
-**Sketch: a durable launch request, carried out by the dispatcher.**
-
-1. **Request.** The sandboxed CLI does everything except spawning. It runs the command's checks (`check_dispatch`, `crew_scope::check`, admission planning), then in one transaction writes a `launch_requests` row: request id, command and args, the resolved caller (actor, job, crew, as found by (a)), and the requesting process (pid, start identity, PID namespace). It does not spawn anything.
-2. **Wake the dispatcher.** The CLI signals through the existing dispatcher wake path (a file or socket the dispatcher already watches), then waits a bounded time for the row's outcome. While it waits it keeps its pid alive, so it can be identified.
-3. **Re-establish identity outside the sandbox.** The dispatcher claims the row in a transaction and finds the requester by its recorded identity:
-   - On macOS, the same pid and start; the dispatcher is outside the sandbox and sees the same pids.
-   - On Linux, the process whose `NSpid` chain ends in the recorded pid inside the recorded namespace, then its outer pid.
-
-   The dispatcher then resolves the requester's caller with the same ancestry rule from (a), run with full argv from outside the sandbox. It also re-runs `crew_scope::check` for that caller. The recorded caller is only a cross-check: a mismatch, or a requester that has gone, refuses the request. A stale request (past its deadline, or whose job is no longer running) is refused and is never launched late.
-4. **Launch and answer.** The dispatcher spawns the supervisor as it does for its own queued work, in its own namespace and outside any sandbox. It records the outcome on the row in the same transaction that records the job, so a restart neither loses the job nor launches it twice. The CLI returns the job record, or `queued` with the request id after its bounded wait.
-
-**How (a) fits.** The identity in (a) is a property of the process tree: the nearest recorded supervisor, proved by pid and start. It can be computed again by the dispatcher from outside, using the requester's pid. A credential would have to be carried in the request, where any process that saw it could replay it. With (a), the request names a process and the dispatcher checks it. The ancestry rule is the same function, given a starting pid instead of `std::process::id()`. The implementation in this task takes that parameter so (b) can reuse it.
-
-Not decided here: the exact table, the wake signal, the wait bound, and how `workspace.*` commands split between recording (in the sandbox) and acting (in the dispatcher).
+Superseded by [sandboxed launches](codex-sandboxed-launch.md) (issue #736). That contract keeps this part's core: the dispatcher, outside the sandbox, carries out a durable request, and it resolves the requester's caller from the requester's PID with the rule in (a). It also settles what this sketch left open: the table, the wake (a resident launcher thread instead of a wake signal), the wait bound, the binding of a row to the process that wrote it, and which commands go through the dispatcher.
 
 ## (c) A wake that could not run any CLI command
 

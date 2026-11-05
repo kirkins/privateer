@@ -171,3 +171,17 @@ slow-2 at 19m28s whole-job (78% of the limit; suites: door 414s, hosted
 5m53s (upgrade_linked 288s on macOS, close to its Linux time, not 2.2x).
 `hosted` and `workspaces` moved from slow-2 to slow-4, projecting macOS
 slow-2 at about 14 minutes and slow-4 at about 11-12 minutes.
+
+## Sandbox qualification
+
+[The sandboxed-launch contract](design/codex-sandboxed-launch.md) is qualified
+by tests that run first-mate CLI calls inside a Codex-like sandbox:
+`tests/sandboxed_launch.rs` and the review-errand case in
+`tests/review_gate.rs`. On Linux they use `bwrap` with its own PID namespace
+and `/proc`; on macOS, `/usr/bin/sandbox-exec` with Codex's base Seatbelt
+rules. The test-shard workflow installs `bubblewrap` on Linux runners and
+lifts Ubuntu's AppArmor restriction on unprivileged user namespaces, which
+`bwrap --unshare-user` needs. Both steps are CI only. It also sets
+`PRIVATEER_SANDBOX_QUALIFICATION=1`, so a runner that cannot make the sandbox
+fails these tests instead of skipping them, as they do on a machine without
+one.

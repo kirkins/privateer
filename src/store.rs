@@ -84,6 +84,14 @@ impl Caller {
         flag_actor: Option<&str>,
         supervisor: bool,
     ) -> Result<Self> {
+        let caller = Self::claimed(flag_role, flag_actor)?;
+        crate::crew_scope::resolve(home, caller, supervisor)
+    }
+
+    /// The caller the environment's role marker (`PRIVATEER_ROLE`,
+    /// `PRIVATEER_ACTOR`) and the flags name, before the process ancestry
+    /// is consulted.
+    pub fn claimed(flag_role: Option<&str>, flag_actor: Option<&str>) -> Result<Self> {
         let env = |name: &str| -> Result<Option<String>> {
             match std::env::var(name) {
                 Ok(value) => Ok(Some(value)),
@@ -91,13 +99,12 @@ impl Caller {
                 Err(std::env::VarError::NotUnicode(_)) => bail!("{name} must be valid UTF-8"),
             }
         };
-        let caller = Self::resolve(
+        Self::resolve(
             env("PRIVATEER_ROLE")?.as_deref(),
             env("PRIVATEER_ACTOR")?.as_deref(),
             flag_role,
             flag_actor,
-        )?;
-        crate::crew_scope::resolve(home, caller, supervisor)
+        )
     }
 
     pub fn require_operator(&self, command: &str) -> Result<()> {

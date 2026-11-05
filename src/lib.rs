@@ -37,6 +37,7 @@ pub mod herdr;
 pub mod host;
 pub mod input;
 pub mod jobs;
+pub mod launch;
 pub mod machines;
 pub mod mail;
 pub mod mcp_broker;
@@ -198,6 +199,7 @@ const ACCEPTED: &[Accepted] = &[
     fleet::ACCEPTED,
     grants::ACCEPTED,
     jobs::ACCEPTED,
+    launch::ACCEPTED,
     machines::ACCEPTED,
     mail::ACCEPTED,
     moves::ACCEPTED,
@@ -391,6 +393,7 @@ fn dispatch_once(store: &mut Store, command: &str, args: Value) -> Result<Value>
             scheduling::dispatch(store, command, args)
         }
         "job" | "resource" => jobs::dispatch(store, command, args),
+        "launch" => launch::dispatch(store, command, args),
         "peer" => peers::dispatch(store, command, args),
         "plugin" => plugins::dispatch(store, command, args),
         "workspace" => workspace::dispatch(store, command, args),
@@ -998,6 +1001,15 @@ pub fn rpc(store: &mut Store, request: Value) -> Value {
             .get("command")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("command is required"))?;
+        // A long-lived server cannot exec into a request's waiter, which is
+        // what binds a launch request to its process.
+        if launch::forwarded(command) {
+            if let Some(sandbox) = launch::sandbox(store.home())? {
+                bail!(
+                    "this caller runs inside a sandbox ({sandbox}), and {command} cannot be carried out from inside it over rpc. This is a limit of the sandbox, not a missing Privateer permission: run it outside the sandbox, or through the privateer CLI, which hands launches to the home's dispatcher."
+                );
+            }
+        }
         dispatch(
             store,
             command,

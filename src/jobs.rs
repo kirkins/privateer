@@ -1850,7 +1850,7 @@ pub(crate) fn identity_alive(recorded: &str) -> Result<bool> {
 
 /// The PID namespace this process sees PID numbers in; constant for its life.
 #[cfg(target_os = "linux")]
-fn pid_namespace() -> Option<&'static str> {
+pub(crate) fn pid_namespace() -> Option<&'static str> {
     static NAMESPACE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     NAMESPACE
         .get_or_init(|| {
@@ -1861,7 +1861,7 @@ fn pid_namespace() -> Option<&'static str> {
         .as_deref()
 }
 #[cfg(not(target_os = "linux"))]
-fn pid_namespace() -> Option<&'static str> {
+pub(crate) fn pid_namespace() -> Option<&'static str> {
     None
 }
 /// Whether a recorded PID can be inspected here. Records without a namespace
@@ -1873,7 +1873,7 @@ fn addressable(process: &Process) -> bool {
 /// settles it: a record made inside a PID sandbox could never be inspected,
 /// settled or cancelled from outside it. Until a dispatcher has run, any
 /// namespace may record.
-fn ensure_dispatcher_namespace(store: &Store) -> Result<()> {
+pub(crate) fn ensure_dispatcher_namespace(store: &Store) -> Result<()> {
     let dispatcher: Option<String> = store
         .connection()
         .query_row(
@@ -1884,7 +1884,7 @@ fn ensure_dispatcher_namespace(store: &Store) -> Result<()> {
         .optional()?;
     ensure!(
         dispatcher.is_none() || dispatcher.as_deref() == pid_namespace(),
-        "this caller is in another PID namespace than the home's dispatcher; run job and workspace commands outside the PID sandbox"
+        "this caller is in another PID namespace than the home's dispatcher (a sandbox such as Codex's), and this work cannot be recorded from inside it: nothing outside could inspect, settle or cancel it. This is a limit of the sandbox, not a missing Privateer permission: run it outside the sandbox. The privateer CLI hands job, crew, errand and workspace starts to the home's dispatcher instead"
     );
     Ok(())
 }
