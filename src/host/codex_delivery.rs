@@ -324,10 +324,18 @@ fn assign(
         ["codex_reserve.py", "assign"],
         &target,
         &json!({"cwd": cwd, "generation": reserved["generation"], "session": session}),
-    )?;
+    )
+    .with_context(|| {
+        format!(
+            "first_mate.codex_session was already committed as {session}; retrying this same \
+             session control continues that exact session"
+        )
+    })?;
     ensure!(
         assignment["assigned"] == true && assignment["session"] == session.as_str(),
-        "the attended Codex adapter did not record the session assignment"
+        "the attended Codex adapter did not record the assignment, but \
+         first_mate.codex_session was already committed as {session}; retrying this same \
+         session control continues that exact session"
     );
     Ok((session, record))
 }

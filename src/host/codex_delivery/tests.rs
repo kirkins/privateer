@@ -516,6 +516,49 @@ fn codex_delivery_assign_sets_the_session_and_poisons_a_grant_for_another() {
     assert_eq!(status["grant"]["session"], fresh.as_str());
 }
 
+// Failure after the writer commit must name the committed session, because the
+// exact-UUID retry is what recovers it.
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_delivery_assign_says_when_the_session_was_already_committed() {
+    let f = Fixture::new();
+    init(f.store.connection()).unwrap();
+    let fresh = nonce();
+    let generation = nonce();
+    let folder = f
+        .dir
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    let target = f.dir.join("reservation.json");
+    fs::write(
+        &target,
+        json!({"version": 1, "state": "verified", "session": fresh,
+            "generation": generation})
+        .to_string(),
+    )
+    .unwrap();
+    // Not private: the writer transaction commits first, then the assign
+    // adapter refuses to read the record.
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+    let reserved = json!({"state": "verified", "session": fresh, "generation": generation});
+    let error = assign(&f.store, "alpha", &folder, &Value::Null, &reserved).unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains(&format!("committed as {fresh}")), "{error}");
+    assert!(error.contains("continues that exact session"), "{error}");
+    let stored: String = f
+        .store
+        .connection()
+        .query_row("SELECT record FROM ships WHERE name='alpha'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let stored: Value = serde_json::from_str(&stored).unwrap();
+    assert_eq!(stored["first_mate"]["codex_session"], fresh.as_str());
+}
+
 // A pass that exits normally still loses whatever it left in its group.
 #[cfg(target_os = "linux")]
 #[test]
