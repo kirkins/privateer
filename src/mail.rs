@@ -1290,8 +1290,12 @@ fn check_answer(decision: &Value, answer: &Value) -> Result<()> {
         );
     }
     if let Some(text) = fields.get("text") {
-        // As long as a Telegram message, so a typed reply to a card always fits.
-        bounded_text(text, "answer.text", 1, 4096)?;
+        // The complete mail/envelope already has a byte bound. A separate
+        // platform-sized character cap rejects legal captain answers after
+        // adapters add safety markers (e.g. Telegram strikethrough). Keep the
+        // words and markers whole; approval interpretation is unchanged.
+        let text = text.as_str().context("answer.text must be a string")?;
+        ensure!(!text.is_empty(), "answer.text must not be empty");
     }
     Ok(())
 }
@@ -4105,6 +4109,19 @@ fn records_desk_placement(mark: &Mark<'_>) -> bool {
 #[cfg(test)]
 mod desk_placement_tests {
     use super::*;
+
+    #[test]
+    fn answer_text_uses_the_envelope_bound_not_a_platform_character_cap() {
+        let decision = json!({"options":[{"id":"hold"},{"id":"go"}]});
+        for size in [4095, 4096, 4097, 8192] {
+            for text in ["x".repeat(size), format!("~{}~", "🚢".repeat(size))] {
+                check_answer(&decision, &json!({"text":text})).unwrap();
+            }
+        }
+        assert!(check_answer(&decision, &json!({"text":""})).is_err());
+        assert!(check_answer(&decision, &json!({"text":42})).is_err());
+        assert!(check_answer(&decision, &json!({"option_id":"missing","text":"yes"})).is_err());
+    }
 
     #[test]
     fn captain_body_policy_covers_every_c0_del_and_c1_character() {

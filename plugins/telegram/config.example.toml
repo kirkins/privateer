@@ -25,6 +25,12 @@ chat_id = "REPLACE_ME"
 # ship answers, threaded under your message here; "notice" just tells it.
 # send_kind = "request"
 
+# Join obvious client-split pastes: the earlier plain-text part must be at
+# least 3500 UTF-16 units and the next must be from the same chat and user
+# within this many seconds. No commands, replies, formatting, edits or media.
+# Range 0..30; 0 disables joining. Exact text is concatenated without a separator.
+# paste_join_seconds = 3
+
 # Render mail bodies as Telegram-flavoured markdown. false sends plain text.
 # markdown = true
 
@@ -35,8 +41,10 @@ chat_id = "REPLACE_ME"
 # Keep a bare "Captain, shipshape." all-clear out of the chat.
 # suppress_noop_ack = false
 
-# Photos and files are saved under the door's state directory and the ship is
-# handed the path. Files older than inbox_days are swept.
+# Photos and files are stored in the receiving ship's home. UTF-8 plain text
+# and Markdown documents are also inlined while the mail envelope fits.
+# Oversized text (including voice transcripts) goes whole through file.put.
+# Files left in the local inbox after a failed handoff are swept after inbox_days.
 # accept_files = true
 # max_file_mb = 20
 # inbox_days = 7

@@ -128,7 +128,7 @@ class FakeTelegram:
             self.updates.append(update)
 
     def message(self, text: str, reply_to: int | None = None, chat: int = CHAT,
-                user: int = CAPTAIN) -> int:
+                user: int = CAPTAIN, entities: list | None = None) -> int:
         with self.lock:
             self.next_message += 1
             ident = self.next_message
@@ -136,6 +136,8 @@ class FakeTelegram:
                    "text": text}
         if reply_to:
             message["reply_to_message"] = {"message_id": reply_to}
+        if entities is not None:
+            message["entities"] = entities
         self.update(message)
         return ident
 
@@ -341,7 +343,8 @@ def check_voice_transcripts() -> None:
     assert got["sent"] == [], got
     short, long = got["typed"]
     assert short["payload"]["answer"]["text"] == "go with b" and short["body"] == '"go with b"', got
-    assert len(long["payload"]["answer"]["text"]) <= 4096 and len(long["body"]) > 4096, long["body"][:80]
+    assert long["payload"]["answer"]["text"] == "word " * 1200, long
+    assert len(long["body"]) > 4096, long["body"][:80]
 
 
 ATTACHMENT_PROBE = """
@@ -423,10 +426,10 @@ def check_attachment_put_and_fallback() -> None:
     got = json.loads(out.stdout)
     fallback = got["fallback"]
     assert "The captain sent a file:" in fallback["body"], fallback
-    assert os.path.basename(fallback["body"].rsplit(": ", 1)[1]) == "kept.bin", fallback
+    assert fallback["body"].splitlines()[0].endswith("kept.bin"), fallback
     assert "files" not in (fallback.get("payload") or {}), fallback
     assert got["kept"], got
-    assert got["quiet"] == [], got["quiet"]
+    assert "File kept as a reference" in got["quiet"][-1], got["quiet"]
     refusal = got["refusal"]
     warned = "⚠️ couldn't hand notes.bin to ops: cannot reach ship macops"
     assert warned in got["warned"][0], got["warned"]
@@ -442,7 +445,7 @@ def check_attachment_put_and_fallback() -> None:
     assert got["deleted"], got
     stored = got["stored"]
     assert stored["payload"] == {"files": [{"file_id": "file7"}]}, stored
-    assert stored["body"] == "The captain sent a file: notes.bin", stored
+    assert stored["body"].startswith("The captain sent a file: notes.bin\n\nFile reference only:"), stored
 
 
 class Fleet:
@@ -966,8 +969,225 @@ for phase, expected in (("crash", 73), ("recover", 0)):
 with sqlite3.connect(crash_state / "fake-mail.sqlite3") as db:
     assert db.execute("SELECT count(*) FROM mail").fetchone()[0] == 1
 assert inbound.Spool().ready() is None
+# Kill the real handler after a joined mail commits, before its receipt. All
+# three parts stay in spool custody; recovery sends the exact frozen group.
+parts = ["漢" * 3498 + "🚢", "e\u0301" * 1750, "尾🚢\n "]
+updates = [update(i) for i in (21, 22, 23)]
+for item, text in zip(updates, parts): item["message"]["text"] = text
+assert inbound.Spool().admit(updates)
+for phase, expected in (("crash", 73), ("recover", 0)):
+    result = subprocess.run([sys.executable, "-c", child, sys.argv[1], str(crash_state), phase], capture_output=True, text=True)
+    assert result.returncode == expected, result.stderr
+    if phase == "crash":
+        with inbound.Spool().db() as db:
+            assert db.execute("SELECT count(*) FROM pending WHERE outcome IS NULL").fetchone()[0] == 3
+with sqlite3.connect(crash_state / "fake-mail.sqlite3") as db:
+    rows = db.execute("SELECT args FROM mail").fetchall()
+    assert len(rows) == 2
+    assert any(json.loads(r[0])["body"] == "".join(parts) for r in rows)
+assert inbound.Spool().ready() is None
 print("durable inbound spool, crash recovery, bounded retries and content-free outcomes passed")
 '''
+
+
+LONG_INPUT_PROBE = r'''
+import json, os, pathlib, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import door, inbound, stt, tg, text_input
+root = pathlib.Path(tempfile.mkdtemp())
+tg.STATE_DIR = str(root)
+logs, notices, stored = [], [], {}
+tg.log = logs.append
+reaction_error = warning_error = False
+reaction_calls = 0
+def api(cfg, method, params, **kwargs):
+    global reaction_calls
+    if method == "setMessageReaction":
+        reaction_calls += 1
+        return (None, "refused") if reaction_error else ({}, "")
+    if method == "sendMessage":
+        notices.append(params["text"])
+        assert text_input.units(params["text"]) <= 4096
+        return (None, "refused") if warning_error else ({"message_id": len(notices) + 500}, "")
+    return {}, ""
+tg.api = api
+class Runtime:
+    def __init__(self): self.mail = {}; self.calls = []; self.refuse = False; self.timeout = False
+    def call(self, command, args=None, **kwargs):
+        self.calls.append((command, args))
+        if command == "file.put":
+            ident = "file" + str(len(stored))
+            stored[ident] = pathlib.Path(args["content_file"]).read_bytes()
+            return {"file_id": ident}
+        assert command == "send", command
+        if self.refuse: raise RuntimeError("runtime refusal " + "x" * 9000)
+        assert len(json.dumps(args, ensure_ascii=False).encode()) < text_input.MAIL_BYTES
+        assert text_input.rejected_control(args["body"]) is None
+        ident = args.get("id") or str(len(self.mail))
+        key = (tg.STATE_DIR, ident)
+        if key in self.mail: assert self.mail[key] == args
+        self.mail[key] = args.copy()
+        if self.timeout: raise RuntimeError("Privateer did not answer send within 30s")
+        return {"ship": "liaison", "mail": {"id": ident}}
+runtime = Runtime()
+cfg = {"chat_id": "42", "allowed_user_ids": [7], "bot_id": 123}
+def adapter(): return door.Door({"door": "phone", "recipient": "liaison"}, cfg, runtime)
+def update(i, text, **extra):
+    return dict(update_id=i, message=dict(message_id=i, chat={"id": 42}, text=text,
+                                          **{"from": {"id": 7}}, **extra))
+def hurry():
+    with inbound.Spool().db() as db:
+        db.execute("UPDATE pending SET next_at=0,admitted_at=0")
+        db.execute("UPDATE notices SET next_at=0")
+def latest(): return list(runtime.mail.values())[-1]
+tg.remember_target(100, {"ship": "ops", "from": "ops", "kind": "decision", "typed": True, "mail": "ask"})
+# Unit boundaries are UTF-16, not Python code points or UTF-8 bytes. Both
+# ordinary mail and typed replies retain every word, including safety marks.
+for size in (4095, 4096, 4097):
+    for motif in ("x", "🚢", "e\u0301", "漢"):
+        text = motif * (size // text_input.units(motif))
+        text += "z" * (size - text_input.units(text))
+        assert text_input.units(text) == size
+        for typed in (False, True):
+            extra = {"reply_to_message": {"message_id": 100}} if typed else {}
+            adapter().on_update(update(1, text, **extra))
+            assert latest()["body"] == text
+            if typed: assert latest()["payload"]["answer"]["text"] == text
+            # Marker expansion is allowed to cross the platform cap.
+            extra["entities"] = [{"type": "strikethrough", "offset": 0, "length": text_input.units(motif)}]
+            adapter().on_update(update(2, text, **extra))
+            expected = "~" + motif + "~" + text[len(motif):]
+            assert latest()["body"] == expected
+            if typed: assert latest()["payload"]["answer"]["text"] == expected
+assert door.struck("🚢yes", [{"type": "strikethrough", "offset": 1, "length": 1}]) == "~🚢yes~"
+# Slash-leading text is mail unless a complete recognized token is present.
+for text in ("/" + "x" * 4095, "/status-not-a-command " + "漢" * 3600,
+             "/unknown < & _", " /status", "/status@other_bot"):
+    adapter().on_update(update(3, text))
+    assert latest()["body"] == text
+commands = []
+d = adapter(); d.command = lambda text, mid: commands.append(text)
+d.on_update(update(4, "/status", entities=[{"type": "bot_command", "offset": 0, "length": 7}]))
+assert commands == ["/status"]
+for layout in ("\v", "\f", "\x85"):
+    for text in (layout + "hello", "hello" + layout, "a" + layout + "b"):
+        adapter().on_update(update(5, text))
+        assert latest()["body"] == text.replace(layout, "\n")
+for text in ("\u2028a\u2029", "< & _ 🚢 e\u0301 漢"):
+    adapter().on_update(update(6, text)); assert latest()["body"] == text
+for text, position in (("\x1bhello", 1), ("hello\x1b", 6), ("a\x1bb", 2)):
+    before = len(runtime.mail)
+    adapter().on_update(update(7, text))
+    assert len(runtime.mail) == before
+    assert "U+001B" in notices[-1] and f"character {position}" in notices[-1]
+    assert "hello" not in notices[-1]
+# Joining is only for near-cap consecutive plain text. A short tail ends the
+# group without a delay; two short instructions are never coalesced.
+for parts in (["a" * 3500, " tail"], ["🚢" * 1750, "漢" * 3500, "e\u0301 "]):
+    d = adapter(); start = len(runtime.mail)
+    d.spool.admit([update(10 + i, t) for i, t in enumerate(parts)])
+    assert d.process_inbound() and not d.process_inbound()
+    assert len(runtime.mail) == start + 1 and latest()["body"] == "".join(parts)
+    # Isolate ids from the next case, like separate bot state directories.
+    tg.STATE_DIR = tempfile.mkdtemp(dir=root)
+    tg.remember_target(100, {"ship":"ops","from":"ops","kind":"decision","typed":True,"mail":"ask"})
+for extra in ({}, {"reply_to_message": {"message_id": 100}}, {"entities": [{"type":"bold","offset":0,"length":1}]}):
+    tg.remember_target(100, {"ship":"ops","from":"ops","kind":"decision","typed":True,"mail":"ask"})
+    d = adapter(); start = len(runtime.mail)
+    first = "short" if not extra else "x" * 3500
+    d.spool.admit([update(20, first), update(21, "next", **extra)])
+    while d.process_inbound(): pass
+    assert len(runtime.mail) == start + 2
+    tg.STATE_DIR = tempfile.mkdtemp(dir=root)
+# A command part and an unknown slash-leading paste are never joined.
+for tail in ("/help", "/unknown paste"):
+    d = adapter(); before = len(runtime.mail)
+    d.spool.admit([update(30, "x" * 3500), update(31, tail)])
+    while d.process_inbound(): pass
+    assert len(runtime.mail) == before + (1 if tail == "/help" else 2)
+    assert list(runtime.mail.values())[before]["body"] == "x" * 3500
+    tg.STATE_DIR = tempfile.mkdtemp(dir=root)
+# A near-cap tail waits only for its configurable window. The exact original
+# text stays in durable custody throughout, including after a new Door starts.
+d = adapter(); d.spool.admit([update(40, "x" * 3500)])
+assert not d.process_inbound() and d.spool.ready()["attempts"] == 0
+hurry(); assert adapter().process_inbound()
+# Oversized transcript goes via file.put, whole, never via a >1 MiB line.
+transcript = "漢🚢 e\u0301 " * 20000
+stt.transcribe = lambda cfg, path: (transcript, "")
+cfg["stt"] = {"api_key": "fictional-key", "echo_transcript": False}
+d = adapter(); d.fetch = lambda *a: "unused.ogg"
+d.handle_voice({"voice": {"file_id":"voice", "duration":30}}, 50, None)
+assert "captain-input.txt" in latest()["body"]
+assert stored[latest()["payload"]["files"][0]["file_id"]].decode() == stt.prompt_for(transcript)
+# Oversized typed answers retain all strike markers in the file and use a
+# non-affirmative inline answer, never a truncated apparent approval.
+text = "~yes~ " * 20000
+d.send({"to":"ops","kind":"reply","correlation":"ask","body":text,
+        "payload":{"answer":{"text":text}}}, 51, "answer")
+assert latest()["payload"]["answer"]["text"].startswith("~See the full answer")
+assert stored[latest()["payload"]["files"][0]["file_id"]].decode() == text
+# Text documents inline while they fit; other files keep a reference and a
+# visible reason, regardless of MIME or extension mislabelling.
+for name, mime, data, inline, reason in (
+    ("notes.txt", "application/octet-stream", "hello 漢🚢".encode(), True, ""),
+    ("notes.md", "text/markdown", b"# heading\n< & _", True, ""),
+    ("notes.data", "text/plain", b"mime text", True, ""),
+    ("binary.bin", "application/octet-stream", b"\x00\xff", False, "not a plain-text"),
+    ("bad.txt", "text/plain", b"\xff", False, "not valid UTF-8"),
+    ("nul.md", "text/markdown", b"a\x00b", False, "control U+0000"),
+    ("huge.md", "text/markdown", b"z" * 70000, False, "too large"),
+):
+    path = root / name; path.write_bytes(data)
+    d = adapter(); d.fetch = lambda *a: str(path)
+    d.handle_attachment({"document":{"file_id":"doc","file_name":name,"mime_type":mime,
+                                      "file_size":len(data)}}, 60, None)
+    assert latest()["payload"]["files"]
+    if inline: assert data.decode() in latest()["body"]
+    else: assert reason in latest()["body"] and reason in notices[-1]
+# Reaction failure is distinct from insertion; fallback warning delivery is
+# checked and retried through the existing durable notice spool.
+tg.STATE_DIR = tempfile.mkdtemp(dir=root)
+d = adapter(); d.spool.admit([update(70, "reaction failure")])
+reaction_error = warning_error = True
+before = len(runtime.mail); d.process_inbound()
+assert len(runtime.mail) == before + 1 and latest()["body"] == "reaction failure"
+assert "telegram outcome=reaction_failed" in logs and "telegram outcome=confirmation_failed" in logs
+warning_error = False; hurry(); adapter().retry_notices()
+assert "telegram outcome=notice_sent" in logs
+# Runtime refusal is a checked, bounded notice, not an insertion.
+d = adapter(); runtime.refuse = True; d.spool.admit([update(71, "refused")])
+before = len(runtime.mail); d.process_inbound(); runtime.refuse = False
+assert len(runtime.mail) == before and "not sent" in notices[-1] and text_input.units(notices[-1]) <= 3000
+# An uncertain send may already have inserted. Replay uses the same id.
+d = adapter(); runtime.timeout = True; d.spool.admit([update(72, "uncertain")])
+before = len(runtime.mail); d.process_inbound()
+assert len(runtime.mail) == before + 1 and d.spool.ready()
+runtime.timeout = False; hurry(); adapter().process_inbound()
+assert len(runtime.mail) == before + 1
+# A state-write error after insertion is a confirmation/recovery failure,
+# never evidence of a failed insertion. Exhaustion reports the durable fact.
+d = adapter(); d.spool.admit([update(73, "state write failure")])
+write = tg.write_state
+def broken_write(name, value):
+    if name == door.OUTGOING: raise OSError("injected state write failure")
+    return write(name, value)
+tg.write_state = broken_write
+before = len(runtime.mail)
+for _ in range(inbound.ATTEMPTS): hurry(); adapter().process_inbound()
+assert len(runtime.mail) == before + 1
+hurry(); adapter().process_inbound()
+assert "mail committed" in notices[-1] and "not confirmed sent" not in notices[-1]
+tg.write_state = write
+assert all("reaction failure" not in line and "state write failure" not in line for line in logs)
+print("long input boundaries, joining, text files and failure outcomes passed")
+'''
+
+
+def check_long_input() -> None:
+    out = subprocess.run([sys.executable, "-c", LONG_INPUT_PROBE, str(ROOT / "plugins/telegram")],
+                         capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
 
 
 def check_inbound_spool() -> None:
@@ -988,7 +1208,7 @@ def check_struck_text() -> None:
     assert got["struck"] == ["~yes~", "\U0001F44D ~yes~ do it", "ok ~yes~ no", "yes", "yes",
                              "~yes do it~", "~go~"], got["struck"]
     [reply] = got["sent"]
-    assert reply["body"] == "~yes~" and reply["payload"]["answer"]["text"] == "~yes~", reply
+    assert reply["body"] == " ~yes~ " and reply["payload"]["answer"]["text"] == " ~yes~ ", reply
     assert got["commands"] == ["/status"], got
     assert got["routed"] == ["~yes~"], got
 
@@ -1064,6 +1284,7 @@ def main() -> int:
     check_struck_text()
     check_edited_replies()
     check_inbound_spool()
+    check_long_input()
     check_voice_transcripts()
     check_attachment_put_and_fallback()
     check_group_chat_guard(telegram)
@@ -1121,6 +1342,37 @@ def main() -> int:
             assert asked["from"] == "captain" and asked["kind"] == "request", asked
             wait_for("a 👍 confirmation", lambda: [
                 r for r in telegram.called("setMessageReaction") if r["message_id"] == str(question)])
+
+            # Actual adapter/protocol/runtime boundaries, not just mocked
+            # insertion: synthetic 4097-unit updates and expanded strikes go
+            # through intact, and both body and typed answer remain whole.
+            for size in (4095, 4096, 4097):
+                text = "🚢" + "漢" * (size - 2)
+                telegram.message(text)
+                wait_for(f"ordinary {size}-unit mail", lambda: [
+                    m for m in fleet.inbox("liaison", "liaison") if m["body"] == text])
+                ask_id = f"boundary-{size}"
+                fleet.call("ops", "mail.send", {
+                    "id": ask_id, "from": "ops", "to": "captain", "kind": "decision",
+                    "body": f"Boundary {size}?", "payload": {"decision": {
+                        "question": f"Boundary {size}?", "options": [
+                            {"id":"go","label":"Go","what_happens":"Continue"},
+                            {"id":"hold","label":"Hold","what_happens":"Wait"}]}}})
+                card = wait_for(f"boundary {size} card", lambda: [
+                    m for m in telegram.sent() if f"Boundary {size}?" in m["text"]])[0]
+                telegram.message(text, reply_to=card["_message_id"], entities=[
+                    {"type":"strikethrough","offset":0,"length":2}])
+                expected = "~🚢~" + text[1:]
+                reply = wait_for(f"typed {size}-unit mail", lambda: [
+                    m for m in fleet.inbox("ops", "ops") if m.get("correlation") == ask_id])[0]
+                assert reply["body"] == expected and reply["payload"]["answer"]["text"] == expected, reply
+            slash = "/not_a_command " + "< & _ 漢🚢" * 400
+            telegram.message(slash)
+            wait_for("literal slash-leading paste", lambda: [
+                m for m in fleet.inbox("liaison", "liaison") if m["body"] == slash])
+            telegram.message("\u000bnormalized\u000cinside\u0085end\u2028\u2029")
+            wait_for("normalized layout controls", lambda: [
+                m for m in fleet.inbox("liaison", "liaison") if m["body"] == "\nnormalized\ninside\nend\u2028\u2029"])
 
             # The liaison's answer threads under the captain's question.
             fleet.call("liaison", "mail.send", {"from": "liaison", "to": "captain", "kind": "reply",
