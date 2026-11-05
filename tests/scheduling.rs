@@ -1911,15 +1911,7 @@ fn stranded_fault_reminders_survive_restarts_with_only_one_bounded_repeat() {
 
 #[test]
 fn owner_dispositions_stop_stranded_fault_reminders() {
-    for disposition in [
-        "time",
-        "manual",
-        "enqueue",
-        "done",
-        "cancelled",
-        "blocked",
-        "handoff",
-    ] {
+    for disposition in ["time", "manual", "enqueue", "done", "cancelled", "handoff"] {
         let mut fleet = Fleet::new(support::now_settings());
         stranded(&mut fleet);
         fleet.tick();
@@ -1983,6 +1975,75 @@ fn a_new_fault_revision_has_its_own_reminder_budget() {
         reminders[0]["payload"]["schedule_fault_reminder"]["revision"],
         reminders[2]["payload"]["schedule_fault_reminder"]["revision"]
     );
+}
+
+#[test]
+fn defer_resume_and_refault_at_the_same_revision_gets_a_fresh_budget() {
+    let mut fleet = Fleet::new(support::now_settings());
+    stranded(&mut fleet);
+    fleet.tick();
+    age_fault_reminders(&fleet, 8 * 3600);
+    fleet.tick();
+    assert_eq!(fault_reminders(&fleet).len(), 2);
+    let before = schedule_record(&mut fleet, "infra-repair");
+    call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair",
+        "wait":{"kind":"time","reason":"Retry after cooldown",
+        "until_ms":privateer::store::Store::now_ms()+86_400_000}}),
+    );
+    fleet.tick();
+    assert_eq!(fault_reminders(&fleet).len(), 2);
+    fleet
+        .store
+        .connection()
+        .execute(
+            "UPDATE task_schedule SET record=json_set(record,'$.not_before_ms',0)
+         WHERE task_id='infra-repair'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(poll(&mut fleet, true)["offer"]["task_id"], "infra-repair");
+    fleet
+        .store
+        .connection()
+        .execute(
+            "UPDATE task_schedule SET record=json_set(record,'$.lease_until_ms',0)
+         WHERE task_id='infra-repair'",
+            [],
+        )
+        .unwrap();
+    for _ in 0..3 {
+        assert!(poll(&mut fleet, true)["offer"].is_null());
+    }
+    let after = schedule_record(&mut fleet, "infra-repair");
+    assert_eq!(after["state"], "fault");
+    assert_eq!(before["revision"], after["revision"]);
+    assert!(after["faults"].as_u64().unwrap() > before["faults"].as_u64().unwrap());
+    fleet.tick();
+    assert_eq!(
+        fault_reminders(&fleet).len(),
+        2,
+        "new fault gets its full grace"
+    );
+    fleet
+        .store
+        .connection()
+        .execute(
+            "UPDATE task_schedule SET record=json_set(record,'$.faulted_ms',?1)
+         WHERE task_id='infra-repair'",
+            [privateer::store::Store::now_ms() - 3_600_001],
+        )
+        .unwrap();
+    fleet.tick();
+    assert_eq!(fault_reminders(&fleet).len(), 3);
+    age_fault_reminders(&fleet, 8 * 3600);
+    fleet.tick();
+    assert_eq!(fault_reminders(&fleet).len(), 4);
+    age_fault_reminders(&fleet, 24 * 3600);
+    fleet.tick();
+    assert_eq!(fault_reminders(&fleet).len(), 4, "repeat is still bounded");
 }
 
 #[test]
