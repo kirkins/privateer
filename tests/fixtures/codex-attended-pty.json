@@ -200,7 +200,7 @@
       },
       "session_start": true,
       "prepare_argv": [
-        "/home/kirkins/.local/share/mise/installs/codex/0.166.0/bin/codex",
+        "/usr/local/bin/codex",
         "resume",
         "--remote",
         "unix:///tmp/codex-daemon-1000/5ace88030347b547e0dbf76a7125fa3e46371bef5bba07838f8aef7fafd3920a",
@@ -241,7 +241,7 @@
       },
       "new_daemon": true,
       "prepare_argv": [
-        "/home/kirkins/.local/share/mise/installs/codex/0.166.0/bin/codex",
+        "/usr/local/bin/codex",
         "resume",
         "--remote",
         "unix:///tmp/codex-daemon-1000/5ace88030347b547e0dbf76a7125fa3e46371bef5bba07838f8aef7fafd3920a",
