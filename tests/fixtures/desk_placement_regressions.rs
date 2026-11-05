@@ -189,40 +189,40 @@ fn add_ships(m: &Machine, prefix: &str, count: usize) {
     }
 }
 
-/// A machine name that is legal but long enough to force the bounded card
-/// text to truncate; identifiers allow up to 160 characters.
+/// A machine name within the link's 64-character peer-name bound, long enough
+/// that six sources force the bounded card text to truncate.
 fn long_machine_name(prefix: &str) -> String {
-    format!("{prefix}{}", "x".repeat(120 - prefix.len()))
+    format!("{prefix}{}", "x".repeat(60 - prefix.len()))
 }
 
 #[test]
 fn a_large_manifest_still_writes_the_decision_card() {
     let t = tempfile::tempdir().unwrap();
-    let a = Machine::new(t.path().join("alpha"), "survey");
-    let b = Machine::new(t.path().join("beta"), "relay");
-    let g = Machine::new(t.path().join("gamma"), "lookout");
-    let (name_a, name_b, name_g) = (
-        long_machine_name("alpha"),
-        long_machine_name("beta"),
-        long_machine_name("gamma"),
-    );
-    a.link(&name_a, &b, &name_b);
-    a.link(&name_a, &g, &name_g);
-    // Three sources of about twenty ships each plus long names make the old
+    let names: Vec<String> = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+        .iter()
+        .map(|prefix| long_machine_name(prefix))
+        .collect();
+    let ships = ["survey", "relay", "lookout", "beacon", "harbor", "watch"];
+    let mut machines = vec![];
+    for ship in ships {
+        machines.push(Machine::new(t.path().join(ship), ship));
+    }
+    for i in 1..machines.len() {
+        machines[0].link(&names[0], &machines[i], &names[i]);
+    }
+    // Six sources of about twenty ships each plus long names make the old
     // unbounded generation-one `why` (the whole source JSON) exceed 500
     // characters by far, and the bounded summary still has to truncate.
-    for (m, prefix) in [(&a, "alpha"), (&b, "beta"), (&g, "gamma")] {
-        add_ships(m, prefix, 20);
+    for (i, m) in machines.iter().enumerate() {
+        add_ships(m, &format!("m{i}"), 20);
     }
-    proposal(
-        &a,
-        &name_a,
-        &[name_a.as_str(), name_b.as_str(), name_g.as_str()],
-    );
+    let a = &machines[0];
+    let sources: Vec<&str> = names.iter().map(String::as_str).collect();
+    proposal(a, &names[0], &sources);
     let p = a.row()["proposal"].clone();
-    let sources = p["manifest"]["sources"].as_array().unwrap();
-    assert_eq!(sources.len(), 3);
-    for source in sources {
+    let manifest_sources = p["manifest"]["sources"].as_array().unwrap();
+    assert_eq!(manifest_sources.len(), 6);
+    for source in manifest_sources {
         assert_eq!(source["ships"].as_array().unwrap().len(), 21, "{source}");
     }
     let card = a.ok("mail.show", json!({"id":p["decision"]}));
@@ -235,11 +235,11 @@ fn a_large_manifest_still_writes_the_decision_card() {
         "truncated why must end on a whole character: {why}"
     );
     assert!(why.contains(p["manifest_hash"].as_str().unwrap()), "{why}");
-    assert!(why.contains("3 sources"), "{why}");
+    assert!(why.contains("6 sources"), "{why}");
     // The full source facts stay readable on the card body and the record.
     let body = card["body"].as_str().unwrap();
     assert!(body.contains(p["manifest_hash"].as_str().unwrap()), "{body}");
-    for name in [&name_a, &name_b, &name_g] {
+    for name in &names {
         assert!(body.contains(name.as_str()), "{body}");
     }
     assert_eq!(a.status()["records"].as_array().unwrap().len(), 1);
