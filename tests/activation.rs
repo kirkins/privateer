@@ -2038,11 +2038,15 @@ fn twenty_children_leave_room_for_mail_in_fresh_and_warm_wakes() {
         );
         fleet.tick();
         fleet.settle();
-        let body = format!("{} MAIL-END-MARKER", "mail ".repeat(1100));
-        fleet.send(
-            json!({"id":"second","from":"apps","to":"infra","kind":"request",
-            "task_id":"infra-repair","body":body}),
-        );
+        // Exercise the total wake budget without crossing the independent
+        // per-message body limit (2000 chars).
+        for n in 1..=4 {
+            let body = format!("{} MAIL-END-MARKER-{n}", "mail ".repeat(300));
+            fleet.send(
+                json!({"id":format!("second-{n}"),"from":"apps","to":"infra","kind":"request",
+                "task_id":"infra-repair","body":body}),
+            );
+        }
         let woke = Fleet::infra(&fleet.tick());
         assert_eq!(
             woke["mode"],
@@ -2052,7 +2056,9 @@ fn twenty_children_leave_room_for_mail_in_fresh_and_warm_wakes() {
         let prompt = fleet.prompts().pop().unwrap();
         let wake = &prompt[prompt.find("Wake wake-").unwrap()..];
         assert!(wake.len() < 16_384, "wake size: {}", wake.len());
-        assert!(wake.contains("MAIL-END-MARKER"), "{wake}");
+        for n in 1..=4 {
+            assert!(wake.contains(&format!("MAIL-END-MARKER-{n}")), "{wake}");
+        }
         assert_eq!(
             wake.matches("Direct children of task:infra-repair").count(),
             1,
