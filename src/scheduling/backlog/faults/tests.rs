@@ -221,18 +221,29 @@ fn fault_batches_are_bounded_without_starving_later_tasks() {
 #[test]
 fn nothing_due_never_scans_jobs_or_takes_the_write_lock() {
     let (_temp, store) = fixture::home();
-    // An ordinary open task, a fresh fault, an exhausted fault, and a typed
-    // wait must all be discarded before inspecting jobs. Invalid JSON is a
-    // timing-independent scan sentinel: JSON extraction would fail if read.
-    store
-        .connection()
-        .execute(
-            "INSERT INTO jobs(id,record) VALUES('scan-sentinel','not json')",
-            [],
-        )
-        .unwrap();
+    // Count SQLite VM steps, not wall time: adding jobs must add no query
+    // work when every root was discarded by the materialized due filters.
+    fn steps(store: &Store) -> (Vec<String>, usize) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = count.clone();
+        store.connection().progress_handler(
+            1,
+            Some(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        );
+        let ids = due_ids(store, "infra", "", Store::now_ms(), 3600).unwrap();
+        store.connection().progress_handler(0, None::<fn() -> bool>);
+        (ids, count.load(Ordering::Relaxed))
+    }
     let writes = || crate::store::WRITE_TRANSACTIONS.with(|n| n.get());
     for state in ["ready", "fresh", "exhausted", "waiting"] {
+        store.connection().execute("DELETE FROM jobs", []).unwrap();
         fixture::schedule(&store, "fault", None);
         store
             .connection()
@@ -261,6 +272,23 @@ fn nothing_due_never_scans_jobs_or_takes_the_write_lock() {
             }
             _ => fixture::schedule(&store, "fault", Some(json!({"kind":"manual"}))),
         }
+        let (ids, empty_steps) = steps(&store);
+        assert!(ids.is_empty());
+        for n in 0..128 {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO jobs(id,record) VALUES(?1,?2)",
+                    params![
+                        format!("scan-sentinel-{n}"),
+                        json!({"task_id":"work-1","status":"succeeded"}).to_string()
+                    ],
+                )
+                .unwrap();
+        }
+        let (ids, populated_steps) = steps(&store);
+        assert!(ids.is_empty());
+        assert_eq!(populated_steps, empty_steps, "no jobs scan for {state}");
         let before = writes();
         assert!(
             consider(&store, "infra", &json!({})).unwrap().is_empty(),
@@ -287,9 +315,17 @@ fn nothing_due_never_scans_jobs_or_takes_the_write_lock() {
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert!(plan.iter().any(|s| s == "MATERIALIZE due"), "{plan:?}");
-    // Prove the scan sentinel is effective once a fault really is due.
+    // A due root must actually inspect jobs: the same VM-step probe now
+    // distinguishes the empty table from the populated one.
     old_fault(&store);
-    assert!(due_ids(&store, "infra", "", Store::now_ms(), 3600).is_err());
+    let (ids, populated_steps) = steps(&store);
+    assert_eq!(ids, vec!["work-1"]);
+    store.connection().execute("DELETE FROM jobs", []).unwrap();
+    let (_, empty_steps) = steps(&store);
+    assert!(
+        populated_steps > empty_steps,
+        "the scan probe must detect live-work inspection"
+    );
 }
 
 #[test]
