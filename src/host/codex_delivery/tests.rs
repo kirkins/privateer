@@ -364,6 +364,8 @@ fn codex_delivery_ticker_runs_the_real_runner_under_isolated_python() {
     assert!(!output.contains("Traceback"), "{output}");
 }
 
+// Hosted Codex delivery is Linux-only: on macOS these controls refuse first.
+#[cfg(target_os = "linux")]
 #[test]
 fn codex_delivery_operator_controls_refuse_agents_and_bad_resolutions() {
     let mut f = Fixture::new();
@@ -416,6 +418,8 @@ fn codex_delivery_reconcile_runs_the_real_runner_and_reports_its_refusal() {
     );
 }
 
+// Hosted Codex delivery is Linux-only: on macOS these controls refuse first.
+#[cfg(target_os = "linux")]
 #[test]
 fn codex_delivery_session_refuses_without_bundled_codex_or_with_effort() {
     let mut f = Fixture::new();
