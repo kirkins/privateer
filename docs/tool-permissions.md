@@ -498,7 +498,13 @@ runtime turns them into one captain **decision** from the task's owner (see
 - A hosted or attended first mate, whose harness result the runtime cannot read,
   reports a denial with `permissions.blocked {"task_id","tool","input"}`. A
   command that ran but whose sandbox blocked network or filesystem access adds
-  `"cause":"sandbox"`.
+  `"cause":"sandbox"`. A `mail.send` that exited 0 is a successful durable
+  submission even when it says delivery was deferred to the dispatcher: a
+  sandbox write error on a send that succeeded is never reported as a denial.
+  When only the direct delivery was refused because the caller may not write
+  the recipient's home (EROFS, EACCES, EPERM), `mail.send` answers with its
+  queue receipt instead (`delivery: "queued; the dispatcher delivers it"`,
+  `queued: true`), keeping the error on the record for `mail.outbox`.
 - Allow rules and standing authorizations reach only Claude's approvals. The
   harness is read from the reporting ship's first-mate manifest (a job's
   denial line is Claude's own), never from the report. A report from any other

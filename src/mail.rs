@@ -2232,9 +2232,59 @@ fn send_with_bound(
         result["delivery"] = json!(delivery);
         result["note"] = json!(note);
     }
+    // A committed send whose only failure was the opportunistic direct
+    // delivery answers with its queue receipt, never with the write error.
+    report_queued_delivery(&mut result);
     // Keep ordinary native post-commit notifications, but expose only the
     // durable, content-free receipt on the linked approval gateway.
     Ok(linked_receipt.unwrap_or(result))
+}
+
+/// What a committed send answers when its direct delivery was deferred. The
+/// message is durable and the dispatcher, which runs outside any sandbox,
+/// delivers it; see `report_queued_delivery`.
+pub(crate) const QUEUED_DELIVERY: &str = "queued; the dispatcher delivers it";
+
+/// Whether a delivery failure is this caller not being allowed to write the
+/// recipient's home, as opposed to the peer answering or being absent. A
+/// harness sandbox keeps a first mate's writable roots to its workspace and
+/// checkout, so the opportunistic direct delivery into another ship's home
+/// fails with EROFS, EACCES or EPERM (SQLite reports the last two as a
+/// read-only or unopenable database).
+fn deferred_write_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "read-only file system",
+        "permission denied",
+        "operation not permitted",
+        "readonly database",
+        "unable to open database file",
+    ]
+    .iter()
+    .any(|refusal| error.contains(refusal))
+}
+
+/// A send that reached the durable queue is a successful submission even when
+/// its direct delivery was deferred. Report it plainly: an error here reads to
+/// a ship as a policy denial, and a false `permissions.blocked` costs the
+/// captain a decision. The record keeps its `delivery_error` for the operator,
+/// who reads it with `mail.outbox`, and the message stays pending for the
+/// dispatcher.
+fn report_queued_delivery(result: &mut Value) {
+    if result["delivery"] != json!("pending") {
+        return;
+    }
+    if !result["delivery_error"]
+        .as_str()
+        .is_some_and(deferred_write_error)
+    {
+        return;
+    }
+    result["delivery"] = json!(QUEUED_DELIVERY);
+    result["queued"] = json!(true);
+    if let Some(message) = result.as_object_mut() {
+        message.remove("delivery_error");
+    }
 }
 
 /// The envelope another home receives. Task ids are local to a home and do
