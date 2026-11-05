@@ -33,6 +33,9 @@ pub(crate) struct Kinfo {
     pub ppid: u32,
     pub started: String,
     pub comm: String,
+    /// Whether it is exiting (`P_WEXIT`): its argv may already be torn down
+    /// though it is not yet a zombie.
+    pub exiting: bool,
 }
 
 /// The refusal for a kernel read the sandbox denies. It names a sandbox
@@ -63,6 +66,8 @@ pub(crate) fn walk(
     let Some(mut info) = read(me)? else {
         return Ok(found);
     };
+    // The process whose parent `info.ppid` is.
+    let mut child = me;
     for _ in 0..DEPTH {
         let pid = info.ppid;
         if pid <= 1 {
@@ -73,12 +78,21 @@ pub(crate) fn walk(
         };
         let args = match argv(pid) {
             Ok(args) => Some(args),
-            // Still there: the argv is hidden, never taken as empty. Gone
-            // since its child named it (or its pid already reused): the
-            // chain ends here, as it does on Linux, and nothing above it
-            // is read as this caller's ancestry.
+            // Still there, not exiting and still its child's parent: the
+            // argv is hidden, never taken as empty. Gone since its child
+            // named it, exiting (the kernel tears an exiting process's argv
+            // down before it is a zombie), its pid already reused, or no
+            // longer the parent of the process below it: the chain ends
+            // here, as it does on Linux, and nothing above it is read as
+            // this caller's ancestry.
             Err(_) => match read(pid)? {
-                Some(again) if again.started == next.started => None,
+                Some(again)
+                    if again.started == next.started
+                        && !again.exiting
+                        && read(child)?.is_some_and(|below| below.ppid == pid) =>
+                {
+                    None
+                }
                 _ => break,
             },
         };
@@ -88,6 +102,7 @@ pub(crate) fn walk(
             comm: Some(next.comm.clone()),
             argv: args,
         });
+        child = pid;
         info = next;
     }
     Ok(found)
@@ -133,7 +148,10 @@ pub(crate) struct KinfoProc {
     /// `kp_proc.p_un.__p_starttime`.
     start_sec: i64,
     start_usec: i32,
-    _a: [u8; 24],
+    _a: [u8; 20],
+    /// `kp_proc.p_flag`, where the kernel reports an exiting process
+    /// (`P_LEXIT`) as `P_WEXIT`.
+    flag: i32,
     /// `kp_proc.p_stat`.
     stat: i8,
     _b: [u8; 3],
@@ -149,6 +167,7 @@ pub(crate) struct KinfoProc {
 }
 const _: () = {
     assert!(std::mem::size_of::<KinfoProc>() == 648);
+    assert!(std::mem::offset_of!(KinfoProc, flag) == 32);
     assert!(std::mem::offset_of!(KinfoProc, stat) == 36);
     assert!(std::mem::offset_of!(KinfoProc, pid) == 40);
     assert!(std::mem::offset_of!(KinfoProc, comm) == 243);
@@ -157,6 +176,8 @@ const _: () = {
 
 /// `p_stat` of a zombie (`SZOMB`).
 const SZOMB: i8 = 5;
+/// `p_flag` of an exiting process (`P_WEXIT`, `<sys/proc.h>`).
+const P_WEXIT: i32 = 0x0000_2000;
 
 impl KinfoProc {
     /// The identity a raw record gives, or `None` for a process that is not
@@ -170,6 +191,7 @@ impl KinfoProc {
             ppid: u32::try_from(self.ppid).ok()?,
             started: lstart(self.start_sec),
             comm: String::from_utf8_lossy(&self.comm[..end]).into_owned(),
+            exiting: self.flag & P_WEXIT != 0,
         })
     }
 }
@@ -394,6 +416,7 @@ mod tests {
             ppid,
             started: started.into(),
             comm: comm.into(),
+            exiting: false,
         }
     }
 
@@ -490,6 +513,76 @@ mod tests {
     }
 
     #[test]
+    fn an_exiting_or_departed_parent_whose_argv_is_gone_ends_the_chain() {
+        // A detached runner's Privateer parent replies and exits while the
+        // runner walks its ancestry (macOS CI, #732): the kernel has torn
+        // its argv down but it is not yet a zombie. It is not a hidden
+        // ancestor, so the runner is not refused as sandboxed.
+        let exiting = HashMap::from([
+            (40, info(30, "s40", "privateer")),
+            (
+                30,
+                Kinfo {
+                    exiting: true,
+                    ..info(20, "s30", "privateer")
+                },
+            ),
+            (20, info(1, "s20", "sh")),
+        ]);
+        let found = walk(
+            40,
+            |pid| Ok(exiting.get(&pid).cloned()),
+            |pid| match pid {
+                30 => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+                _ => Ok(vec![format!("argv-{pid}")]),
+            },
+        )
+        .unwrap();
+        assert!(found.is_empty(), "{found:?}");
+        // The parent's argv read failed and the walker has meanwhile been
+        // reparented: the failed read is not this caller's ancestry either.
+        let table = std::cell::RefCell::new(HashMap::from([
+            (40, info(30, "s40", "privateer")),
+            (30, info(20, "s30", "privateer")),
+            (20, info(1, "s20", "sh")),
+        ]));
+        let found = walk(
+            40,
+            |pid| Ok(table.borrow().get(&pid).cloned()),
+            |pid| {
+                if pid == 30 {
+                    table.borrow_mut().insert(40, info(1, "s40", "privateer"));
+                    return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                }
+                Ok(vec![format!("argv-{pid}")])
+            },
+        )
+        .unwrap();
+        assert!(found.is_empty(), "{found:?}");
+        // A live parent that is still the walker's stays hidden, however far
+        // up the chain it is.
+        let hidden = HashMap::from([
+            (50, info(40, "s50", "sh")),
+            (40, info(30, "s40", "sh")),
+            (30, info(1, "s30", "privateer")),
+        ]);
+        let found = walk(
+            50,
+            |pid| Ok(hidden.get(&pid).cloned()),
+            |pid| match pid {
+                30 => Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+                _ => Ok(vec![format!("argv-{pid}")]),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            found.iter().map(|a| a.pid).collect::<Vec<_>>(),
+            vec![40, 30]
+        );
+        assert_eq!(found[1].argv, None);
+    }
+
+    #[test]
     fn a_denied_kernel_read_is_a_sandbox_refusal_not_a_crash() {
         let table = HashMap::from([(40, info(30, "s40", "sh"))]);
         let error = walk(
@@ -554,6 +647,8 @@ mod tests {
             record.kinfo(),
             Some(info(7, "Tue Feb 29 00:00:00 2000", "privateer"))
         );
+        record.flag = P_WEXIT;
+        assert!(record.kinfo().unwrap().exiting);
         record.stat = SZOMB;
         assert_eq!(record.kinfo(), None);
     }

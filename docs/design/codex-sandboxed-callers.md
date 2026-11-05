@@ -33,7 +33,7 @@ Choose 1, using only `sysctl KERN_PROC_PID` and no subprocess. Recognize a super
 
 The walk (`crew_scope::ancestry::walk`) starts at this process and follows parent links, at most 64, up to pid 1. On macOS it reads, for each ancestor:
 
-- `pid`, its parent, whether it is a zombie, and its kernel command name (`p_comm`), from `kinfo_proc`;
+- `pid`, its parent, whether it is a zombie or exiting (`P_WEXIT`), and its kernel command name (`p_comm`), from `kinfo_proc`;
 - its start identity, formatted from `p_starttime.tv_sec` exactly as `jobs::identity` records it today from `ps -o lstart=` with `TZ=UTC0 LC_ALL=C`, for example `Wed Nov 4 12:00:00 2026`. Seconds resolution, as today;
 - its argv, from `sysctl KERN_PROCARGS2`. If that read fails while the process is still there with the same start, the argv is **hidden**. It is never read as empty. Linux still reads `/proc`, where argv is always visible.
 
@@ -68,7 +68,7 @@ Everything after the match is unchanged: `world`, `classify`, the role-drop and 
 
 The fail-closed refusal says the same and adds "or name the job's home with --home". Naming the home adds it to the homes searched. Neither refusal points at `permissions.blocked` or any grant, because no Privateer permission would lift it.
 
-A pid that has disappeared ends the walk, as `/proc` does on Linux. That includes an ancestor that exits (or whose pid is reused) between its `kinfo_proc` read and its argv read: neither it nor anything above it is reported.
+A pid that has disappeared ends the walk, as `/proc` does on Linux. That includes an ancestor that exits (or whose pid is reused) between its `kinfo_proc` read and its argv read: neither it nor anything above it is reported. So does an ancestor whose argv read fails while it is exiting (the kernel tears down an exiting process's arguments before it becomes a zombie), or once the process below it has been reparented: a detached runner whose Privateer parent replies and exits is not refused as sandboxed. Only a live, non-exiting ancestor that is still its child's parent is read as hidden.
 
 ### What a crew can and cannot forge
 
@@ -148,7 +148,7 @@ Not covered: a first mate that runs one command and then fails every other one. 
 
 - **Every platform** (`crew_scope::ancestry::tests`, `crew_scope::tests`), using an injected process chain:
   - the walk reaches pid 1 and stops at its depth bound;
-  - a hidden argv is never read as empty, and an ancestor gone mid-read ends the walk;
+  - a hidden argv is never read as empty, and an ancestor gone, exiting or no longer the parent mid-read ends the walk;
   - a hidden ancestor that is not a Privateer process reads no records;
   - a refused kernel read is the sandbox-limit refusal, not a crash;
   - the `lstart` formatter matches `date -u` references;
