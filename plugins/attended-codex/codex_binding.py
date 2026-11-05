@@ -443,8 +443,9 @@ def parse_plan(argv, cwd):
                 raise ValueError("missing Codex config override")
             key, separator, value = args[i].partition("=")
             if key == "model_reasoning_effort" and separator:
-                if value.startswith('"'):
-                    value = json.loads(value)
+                # Only a quoted string: bare true/false are TOML booleans,
+                # not the string we would otherwise record as requested.
+                value = json.loads(value)
                 if not effort_word(value) or "effort" in settings:
                     raise ValueError("invalid or duplicate Codex effort override")
                 settings["effort"] = value
