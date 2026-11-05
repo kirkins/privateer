@@ -551,7 +551,10 @@ mod tests {
             assert_eq!(found.first().map(|a| a.pid), Some(own.ppid));
             // Unsandboxed, the parent's argv (cargo's) is visible; an
             // ancestor of another user farther up may not be.
-            assert!(found[0].argv.as_ref().is_some_and(|a| !a.is_empty()), "{found:?}");
+            assert!(
+                found[0].argv.as_ref().is_some_and(|a| !a.is_empty()),
+                "{found:?}"
+            );
         }
 
         #[test]

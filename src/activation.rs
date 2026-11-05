@@ -1986,7 +1986,11 @@ mod tests {
                 params![
                     id,
                     json!({"id": id, "status": status, "incarnation": "inc-1",
-                        "task_id": "survey", "command": ["true"]})
+                        "task_id": "survey", "command": ["true"], "cwd": "/",
+                        "action": "spawn", "heavy": false, "timeout_secs": 60,
+                        "ledger": store.home().join("resources.sqlite"),
+                        "created_ms": 0, "finished_ms": 1, "exit_code": 0,
+                        "cancel_requested": false})
                     .to_string()
                 ],
             )
