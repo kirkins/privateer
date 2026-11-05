@@ -326,6 +326,22 @@ fn codex_network_option_is_opt_in_and_limited_to_workspace_write() {
     assert!(pair < resume, "{argv:?}");
     assert_eq!(argv[resume + 1], id);
 
+    // Interactive resume keeps the bare session id after `codex resume`, with
+    // the -c pair ahead of it.
+    let mut args = f.args(&example("codex"));
+    args["options"] =
+        json!({"sandbox":"workspace-write","network":true,"mode":"interactive","resume":id});
+    let command = plugins::dispatch(&mut f.store, "plugin.command", args).unwrap();
+    let argv = command["argv"].as_array().unwrap();
+    let pair = argv
+        .windows(2)
+        .position(|p| p[0] == "-c" && p[1] == flag)
+        .unwrap();
+    let resume = argv.iter().position(|v| v == "resume").unwrap();
+    let session = argv.iter().position(|v| v == id).unwrap();
+    assert!(resume < pair && pair < session, "{argv:?}");
+    assert!(!argv.iter().any(|v| v == "exec"), "{argv:?}");
+
     // Absent or false changes nothing for an otherwise identical plan.
     let mut plain = f.args(&example("codex"));
     plain["options"] = json!({"sandbox":"workspace-write"});
@@ -354,6 +370,10 @@ fn codex_network_option_is_opt_in_and_limited_to_workspace_write() {
         );
     }
 
+    // The same reviewer request without network is accepted, so the refusal
+    // below is the network one rather than the reviewer role.
+    let accepted = codex_response(&f, json!({"sandbox":"workspace-write"}), "reviewer");
+    assert_eq!(accepted["ok"], true, "{accepted}");
     // The reviewer override forces read-only, so network is refused there too,
     // even when the route asked for workspace-write.
     let response = codex_response(

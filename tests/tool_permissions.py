@@ -44,6 +44,23 @@ class Permissions(unittest.TestCase):
         self.assertNotIn("--sandbox",argv)
         self.assertFalse((self.root/"NEVER").exists())
 
+    def test_fleet_yolo_codex_absorbs_network_but_a_route_yolo_conflict_still_refuses(self):
+        # Fleet yolo runs the bypass, which already has network. A route's
+        # network request is redundant and must not make the launch look like
+        # a yolo-plus-network conflict.
+        _, argv = build("codex", self.request(sandbox="workspace-write", network=True))
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertNotIn("--sandbox", argv)
+        self.assertNotIn("sandbox_workspace_write.network_access=true", argv)
+
+        # A route or profile that sets yolo itself alongside network is still
+        # refused, under standard or fleet yolo policy.
+        for policy_mode in ["standard", "yolo"]:
+            with self.subTest(policy_mode=policy_mode):
+                self.policy = {"mode": policy_mode, "claude_allow": []}
+                with self.assertRaises(ValueError):
+                    build("codex", self.request(sandbox="workspace-write", network=True, yolo=True))
+
     def test_yolo_keeps_gateway_pi_provider_selection(self):
         _, argv=build("pi",self.request(provider="private-gateway",model="selected-glm"))
         self.assertEqual(argv[argv.index("--provider")+1],"private-gateway")
