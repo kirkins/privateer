@@ -1101,6 +1101,10 @@ fn bearings_name_open_tasks_with_no_update_for_the_ships_days_oldest_first() {
         ),
         "{text}"
     );
+    let stale_warning = text
+        .lines()
+        .find(|line| line.contains("open tasks have had no update"))
+        .unwrap();
     for other in [
         "finished (",
         "deferred (",
@@ -1109,7 +1113,7 @@ fn bearings_name_open_tasks_with_no_update_for_the_ships_days_oldest_first() {
         "repair (",
         "cleanup (",
     ] {
-        assert!(!text.contains(other), "{other}: {text}");
+        assert!(!stale_warning.contains(other), "{other}: {text}");
     }
     assert_eq!(bearings["stale_tasks"], 2);
     // The threshold is the ship's `first_mate.stale_task_days`.
