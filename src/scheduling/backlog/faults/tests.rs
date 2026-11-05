@@ -28,6 +28,43 @@ fn child(store: &mut Store) {
     .unwrap();
 }
 
+// A fresh read-only connection loads sqlite_schema on its first read. Keep
+// the reminder state to one schema object: unrelated contact budgets include
+// that bounded startup work, even when their query plans never touch it.
+#[test]
+fn reminder_schema_has_only_one_btree_and_does_not_change_mail_read_plan() {
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    let (_temp, store) = fixture::home();
+    let path = store.home().join("privateer.sqlite");
+    let measure = || {
+        let conn = rusqlite::Connection::open_with_flags(
+            &path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ).unwrap();
+        let steps = Arc::new(AtomicUsize::new(0));
+        let counter = steps.clone();
+        conn.progress_handler(1, Some(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            false
+        }));
+        conn.query_row("SELECT mailbox FROM mail_source_health WHERE only=1", [], |r| r.get::<_, String>(0)).unwrap();
+        let cold = steps.swap(0, Ordering::Relaxed);
+        conn.query_row("SELECT mailbox FROM mail_source_health WHERE only=1", [], |r| r.get::<_, String>(0)).unwrap();
+        let warm = steps.load(Ordering::Relaxed);
+        conn.progress_handler(0, None::<fn() -> bool>);
+        let plan = conn.prepare("EXPLAIN QUERY PLAN SELECT mailbox FROM mail_source_health WHERE only=1").unwrap()
+            .query_map([], |r| r.get::<_, String>(3)).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        (cold, warm, plan)
+    };
+    let with = measure();
+    store.connection().execute_batch("DROP TABLE schedule_fault_reminders").unwrap();
+    let without = measure();
+    eprintln!("mail read with reminder schema: {with:?}; base schema: {without:?}");
+    assert_eq!(with.1, without.1);
+    assert_eq!(with.2, without.2);
+    assert!(with.0 <= without.0 + 7, "extra schema-load VM work: {}", with.0 - without.0);
+}
+
 #[test]
 fn supervised_work_in_the_tree_suppresses_reminders_but_unrelated_work_does_not() {
     for status in [
