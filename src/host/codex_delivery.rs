@@ -249,7 +249,7 @@ fn session(store: &mut Store, args: &Value) -> Result<Value> {
         "model": model, "name": format!("{ship} first mate"), "current": profile["codex_session"]});
     let target = folder.join(".codex/privateer-attended/reservation.json");
     let reserved = adapter(&folder, ["codex_reserve.py", "create"], &target, &request)?;
-    let (session, record) = assign(store, &ship, &profile["manifest"], &reserved)?;
+    let (session, record) = assign(store, &ship, &folder, &profile["manifest"], &reserved)?;
     let launch = if crate::host::hosted(&record["first_mate"]) {
         match crate::host::upgrade::relaunch(store, &ship, false) {
             Ok(report) => report,
@@ -269,6 +269,7 @@ fn session(store: &mut Store, args: &Value) -> Result<Value> {
 fn assign(
     store: &Store,
     ship: &str,
+    folder: &Path,
     manifest: &Value,
     reserved: &Value,
 ) -> Result<(String, Value)> {
@@ -313,6 +314,29 @@ fn assign(
             "settings": reserved["settings"], "grant_revoked": revoked}),
     )?;
     tx.commit()?;
+    // Only after the writer commit is durable, mark the reservation assigned so
+    // claim never adopts this UUID again. A crash before this marker leaves it
+    // verified, and the next same-commit retry continues with that exact UUID.
+    let target = folder.join(".codex/privateer-attended/reservation.json");
+    let cwd = folder.to_str().context("ship folder path")?;
+    let assignment = adapter(
+        folder,
+        ["codex_reserve.py", "assign"],
+        &target,
+        &json!({"cwd": cwd, "generation": reserved["generation"], "session": session}),
+    )
+    .with_context(|| {
+        format!(
+            "first_mate.codex_session was already committed as {session}; retrying this same \
+             session control continues that exact session"
+        )
+    })?;
+    ensure!(
+        assignment["assigned"] == true && assignment["session"] == session.as_str(),
+        "the attended Codex adapter did not record the assignment, but \
+         first_mate.codex_session was already committed as {session}; retrying this same \
+         session control continues that exact session"
+    );
     Ok((session, record))
 }
 

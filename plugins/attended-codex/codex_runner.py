@@ -726,19 +726,28 @@ def operator_check(runner, request, current):
     return record, session, nonce
 
 
-def reconcile_control(path, request):
-    """attended.codex.reconcile: the tick's own evidence reduction, on demand.
+def evidence_control(runner, record, session, nonce, current):
+    """The tick's own evidence reduction for one offer, current or older.
 
-    It cannot force acceptance, discard an uncertain offer or replay one; an
-    unresolved offer stays paused.
+    A current session reads its verified native thread/queue. An older UUID's
+    pane is gone, so its only admissible queue page is empty (which can show an
+    offer present, never absent); its rollout scan and the mailbox ack still
+    run exactly as for the current session. Absence is never a rejection.
     """
-    runner = bound_runner(path)
-    record, session, nonce = operator_check(runner, request, current=True)
     state = runner.ledger.read()["sessions"][session]
     seen = max(state["accepted_through"], state["acknowledged_through"], state.get("suppressed_through", 0))
     pending = codex_mail.snapshot(control(record, "mail.pending", {"address": record["ship"], "after_seq": seen}),
                                   record["ship"])
-    result = runner.observe(acknowledged_through=pending["acknowledged_through"])
+    if current:
+        result = runner.observe(acknowledged_through=pending["acknowledged_through"])
+    else:
+        runner.ledger.reconcile(session, nonce, {"data": [], "nextCursor": None},
+                                pending["acknowledged_through"])
+        value = runner.ledger.read()["sessions"][session]
+        intent = value["intent"]
+        result = {"paused": intent["state"] in ("invoking", "uncertain") or "pause_reason" in intent,
+                  "diagnostic": ("codex-uncertain-" + nonce)
+                  if intent["state"] in ("invoking", "uncertain") else None}
     state = runner.ledger.read()["sessions"][session]
     intent = state["intent"]
     require(intent["nonce"] == nonce, "offer changed during reconcile")
@@ -750,6 +759,17 @@ def reconcile_control(path, request):
                 "scan_caught_up", "pause_reason", "possibly_unattended", "custody_epoch")}}
 
 
+def reconcile_control(path, request):
+    """attended.codex.reconcile: the tick's own evidence reduction, on demand.
+
+    It cannot force acceptance, discard an uncertain offer or replay one; an
+    unresolved offer stays paused.
+    """
+    runner = bound_runner(path)
+    record, session, nonce = operator_check(runner, request, current=True)
+    return evidence_control(runner, record, session, nonce, current=True)
+
+
 def resolve_control(path, request):
     """attended.codex.resolve: evidence first, then the audited operator reducer.
 
@@ -758,10 +778,9 @@ def resolve_control(path, request):
     """
     runner = bound_runner(path)
     record, session, nonce = operator_check(runner, request, current=False)
-    if session == record["session"]:
-        evidence = reconcile_control(path, request)
-        if evidence["outcome"] == "settled":
-            return {"resolved": False, "outcome": "settled", "state": evidence["state"], "evidence": evidence}
+    evidence = evidence_control(runner, record, session, nonce, current=session == record["session"])
+    if evidence["outcome"] == "settled":
+        return {"resolved": False, "outcome": "settled", "state": evidence["state"], "evidence": evidence}
     reason = request.get("reason")
     result = runner.ledger.resolve_operator(session, nonce, request.get("operation"), reason,
                                             time.time_ns() // 1_000_000, caller_role="operator")

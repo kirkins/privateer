@@ -1233,8 +1233,11 @@ UUID and daemon identity before anything else; then `thread/name/set`, and
 idle, and a rollout of session metadata only (device/inode recorded). A dead
 owner without a UUID (a lost create response) is kept as an orphan, never
 found by cwd; one with a committed UUID continues with that exact UUID. Failed,
-assigned and orphaned reservations are kept (64, then operator cleanup); an
-attempt that never reached the daemon is not. A changed daemon refuses. Rust
+assigned and orphaned reservations are kept (64, then the README's documented
+manual cleanup: `kept` is history whose entries no code reads, so every entry
+including `assigned` may be trimmed, and only the top-level current record must
+never be removed or edited); an attempt that never reached the daemon is not. A
+changed daemon refuses. Rust
 then, in one writer transaction, revokes and poisons a grant naming another
 session, sets `first_mate.codex_session` and audits, then relaunches a hosted
 pane (`host::upgrade::relaunch`) onto `codex resume <UUID>`, or leaves it for the

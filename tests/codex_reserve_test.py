@@ -127,8 +127,31 @@ class ReserveTests(unittest.TestCase):
         self.assertEqual(result["adopted"], old["generation"])
         self.assertNotIn("thread/start", self.calls)
 
+    def test_same_commit_retry_continues_with_the_committed_uuid(self):
+        session = str(uuid.uuid4())
+        self.threads[session] = self.codex / f"sessions/rollout-{session}.jsonl"
+        old = self.dead_owner(state="verified", session=session, daemon=self.daemon)
+        result = reserve.create(self.path, {**self.request, "current": session})
+        self.assertEqual(result["session"], session)
+        self.assertEqual(result["adopted"], old["generation"])
+        self.assertNotIn("thread/start", self.calls)
+
+    def test_an_assigned_reservation_is_never_adopted_after_the_session_changes(self):
+        first = reserve.create(self.path, self.request)["session"]
+        generation = self.saved()["generation"]
+        marked = reserve.assign(self.path, {"generation": generation, "session": first})
+        self.assertEqual((marked["assigned"], marked["session"]), (True, first))
+        self.assertEqual(self.saved()["state"], "assigned")
+        self.calls.clear()
+        newer = str(uuid.uuid4())
+        result = reserve.create(self.path, {**self.request, "current": newer})
+        self.assertNotEqual(result["session"], first)
+        self.assertEqual(self.calls[0], "thread/start")
+        kept = self.saved()["kept"][-1]
+        self.assertEqual((kept["state"], kept["session"]), ("assigned", first))
+
     def test_an_assigned_or_failed_reservation_is_kept_and_a_new_one_created(self):
-        for state, current in (("verified", True), ("failed", False)):
+        for state, current in (("assigned", True), ("failed", False)):
             session = str(uuid.uuid4())
             self.dead_owner(state=state, session=session, daemon=self.daemon)
             self.calls.clear()
@@ -183,6 +206,27 @@ class ReserveTests(unittest.TestCase):
             saved = self.saved()
             self.assertEqual(saved["state"], "reserved")
             self.assertIn(saved["session"], self.threads)
+
+    def test_child_assign_marks_only_the_verified_reservation(self):
+        result = reserve.create(self.path, self.request)
+        generation = self.saved()["generation"]
+        env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": str(self.root),
+               "CODEX_HOME": str(self.codex)}
+        script = ROOT / "plugins/attended-codex/codex_reserve.py"
+        run = lambda request: subprocess.run(["/usr/bin/python3", "-I", "-B", str(script), "assign", str(self.path)],
+                                             cwd=self.cwd, env=env, input=json.dumps(request), text=True,
+                                             capture_output=True, timeout=30)
+        bad = run({"cwd": str(self.cwd), "generation": generation, "session": str(uuid.uuid4())})
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("session changed", json.loads(bad.stdout)["error"])
+        self.assertEqual(self.saved()["state"], "verified")
+        good = run({"cwd": str(self.cwd), "generation": generation, "session": result["session"]})
+        self.assertEqual(good.returncode, 0, good.stderr)
+        self.assertEqual(json.loads(good.stdout)["assigned"], True)
+        self.assertEqual(self.saved()["state"], "assigned")
+        again = run({"cwd": str(self.cwd), "generation": generation, "session": result["session"]})
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(json.loads(again.stdout)["assigned"], True)
 
     def test_child_protocol_marks_failures_and_unsent_attempts(self):
         env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": str(self.root),

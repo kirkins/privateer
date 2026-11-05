@@ -620,6 +620,58 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((again["resolved"], again["state"]), (False, "abandoned"))
         self.assertEqual(self.runner.ledger.read()["sessions"][self.session]["intent"]["operator_resolution"], audit)
 
+    def old_uuid_intent(self, body=None, scan=None, session=None):
+        old, old_nonce = session or str(uuid.uuid4()), str(uuid.uuid4())
+        original = copy.deepcopy(self.runner.ledger.read()["sessions"][self.session]["intent"])
+        body = body or original["body"]
+        def change(value):
+            value["sessions"][old] = {"accepted_through": 0, "acknowledged_through": 0, "intent": {
+                **original, "nonce": old_nonce, "state": "uncertain", "body": body,
+                "body_hash": receipts.digest(body.encode())}}
+            if scan is not None:
+                value["sessions"][old]["intent"]["scan"] = scan
+                value["sessions"][old]["intent"].update(
+                    open_turn=scan["open_turn"], open_turn_trigger=scan["open_turn_trigger"])
+        self.mutate(change)
+        return old, old_nonce
+
+    def test_old_uuid_resolve_runs_mailbox_ack_evidence(self):
+        self.runner.dispatch()
+        old, old_nonce = self.old_uuid_intent()
+        self.pending.update(acknowledged_through=1, through_seq=1)
+        result = runner.resolve_control(self.registry, self.control_request(
+            session=old, notification_id=old_nonce, operation="abandon", reason="alpha"))
+        # Evidence wins: the covering ack settles the offer, so it is kept.
+        self.assertFalse(result["resolved"])
+        self.assertEqual((result["outcome"], result["state"]), ("settled", "acked"))
+        state = self.runner.ledger.read()["sessions"][old]
+        self.assertEqual((state["intent"]["state"], state["accepted_through"]), ("acked", 1))
+
+    def test_old_uuid_resolve_runs_the_rollout_scan_on_an_empty_queue_page(self):
+        self.runner.dispatch()
+        old, old_nonce = str(uuid.uuid4()), str(uuid.uuid4())
+        old_rollout = self.root / "old-rollout.jsonl"
+        old_rollout.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": old, "cwd": str(self.root), "history_mode": "legacy"}}) + "\n")
+        info = old_rollout.stat()
+        scan = receipts.anchor({"history_mode": "legacy", "transcript": str(old_rollout), "session": old,
+                                "transcript_identity": {"device": info.st_dev, "inode": info.st_ino}},
+                               str(self.root))
+        old, old_nonce = self.old_uuid_intent(body=self.body, scan=scan, session=old)
+        with old_rollout.open("a") as stream:
+            for event in (
+                    {"type": "task_started", "turn_id": "old-turn", "started_at": 123,
+                     "turn_attribution": {"turn_id": "old-turn", "turn_trigger": "queue"}},
+                    {"type": "user_message", "message": self.body, "client_id": str(uuid.uuid4()),
+                     "images": [], "local_images": [], "audio": [], "local_audio": [], "text_elements": []},
+                    {"type": "task_complete", "turn_id": "old-turn"}):
+                stream.write(json.dumps({"type": "event_msg", "payload": event}) + "\n")
+        result = runner.resolve_control(self.registry, self.control_request(
+            session=old, notification_id=old_nonce, operation="abandon", reason="alpha"))
+        self.assertFalse(result["resolved"])
+        self.assertEqual((result["outcome"], result["state"]), ("settled", "presented"))
+        self.assertEqual(self.runner.ledger.read()["sessions"][old]["accepted_through"], 1)
+
     def test_operator_resolve_prefers_native_evidence_and_reaches_an_old_uuid(self):
         self.runner.dispatch()
         self.promoted()

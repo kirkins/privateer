@@ -18,7 +18,26 @@ verified shared daemon (`codex_reserve.py`: `thread/start`, durable UUID,
 `thread/name/set`, exact verification), sets `first_mate.codex_session` and
 relaunches the hosted pane onto `codex resume <UUID>`. A ship with
 `first_mate.options.effort` is refused: Codex keeps neither model nor effort
-from `thread/start` at attach, and effort needs a daemon-excluding `-c`.
+from `thread/start` at attach, and effort needs a daemon-excluding `-c`. A saved
+`verified`/`reserved` UUID is adopted on a retry regardless of the request's
+current session; the re-run zero-turn verification is what bounds re-adoption.
+
+**Reservation history cleanup.** `reservation.json` keeps the live top-level
+record plus up to 64 earlier reservations in `kept`. No code reads an individual
+`kept` entry (claim only carries the list forward and reports its length), so
+`kept` is history only and every entry in it, `assigned` included, is safe to
+remove. `first_mate.codex_session` is what names the UUID a pane resumes. When a
+control answers `reservation history full; operator cleanup required`, stop the
+ship's hosted pane and no other control may be running, then edit
+`$SHIP_FOLDER/.codex/privateer-attended/reservation.json` (mode 0600) by hand:
+
+- replace the `kept` list with only its newest N entries (the list is oldest
+  first, so keep the last N, N < 64), or simply set `"kept": []`;
+- never remove or rewrite the top-level record, and keep its `pid`,
+  `process_identity`, `generation`, `session`, `daemon`, `rollout` and `start`.
+
+This drops only Privateer's duplicate history, not the native threads. Leave the
+JSON valid and the file private; the next reservation then has room.
 
 Explicit opt-in: set `PRIVATEER_CODEX_ATTENDED=1` for a Privateer attended Codex
 launch **with `codex resume <exact UUID>`**. Fresh launches are refused before
