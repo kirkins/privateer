@@ -10,8 +10,9 @@ use std::{
 };
 use support::{Fleet, now_settings};
 
-// No inference or mailbox acknowledgement: successful wake coverage itself
-// must suppress replay. Each real Python payload waits on its own gate.
+// No inference or mailbox acknowledgement (one inbox read, as any real first
+// mate makes): successful wake coverage itself must suppress replay. Each
+// real Python payload waits on its own gate.
 const GATED_MATE: &str = r#"import json, os, pathlib, sys, time
 prompt, log, resume = sys.argv[3], pathlib.Path(sys.argv[5]), sys.argv[6]
 launches = log.with_name('launches.jsonl')
@@ -20,6 +21,11 @@ with log.open('a') as f:
     f.write(json.dumps(prompt) + '\n')
 with launches.open('a') as f:
     f.write(json.dumps({'pid': os.getpid(), 'resume': resume, 'prompt': prompt, 'custody': os.environ.get('PRIVATEER_DETACHED_PID')}) + '\n')
+# A real first mate reaches the runtime at least once: it reads its inbox
+# (a wake that never does settles failed). It never acknowledges.
+import subprocess
+subprocess.run(json.loads(sys.argv[1]) + ['mail.inbox', '--json', json.dumps({'address': sys.argv[2]})],
+    capture_output=True, check=True)
 print(json.dumps({'type': 'thread.started', 'thread_id': resume or 'session-' + str(os.getpid())}), flush=True)
 while not log.with_name('gate-' + str(n)).exists():
     time.sleep(0.05)

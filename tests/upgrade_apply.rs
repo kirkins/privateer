@@ -33,6 +33,11 @@ launches = log.with_name('launches.jsonl')
 n = len(launches.read_text().splitlines()) + 1 if launches.exists() else 1
 with launches.open('a') as f:
     f.write(json.dumps({'pid': os.getpid(), 'prompt': prompt}) + '\n')
+# A real first mate reaches the runtime at least once: it reads its inbox
+# (a wake that never does settles failed). It never acknowledges.
+import subprocess
+subprocess.run(json.loads(sys.argv[1]) + ['mail.inbox', '--json', json.dumps({'address': sys.argv[2]})],
+    capture_output=True, check=True)
 print(json.dumps({'type': 'thread.started', 'thread_id': resume or 'session-' + str(os.getpid())}), flush=True)
 while not log.with_name('gate-' + str(n)).exists():
     time.sleep(0.05)

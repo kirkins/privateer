@@ -24,9 +24,15 @@ fn release(data: &Path, commit: &str) -> Release {
     let plugins = release.plugins();
     fs::create_dir_all(plugins.join("pi")).unwrap();
     fs::write(plugins.join("native.py"), "# bundle marker\n").unwrap();
+    // The payload names its release last, and like any real first mate
+    // reaches the runtime once (it reads its inbox) before it ends: a wake
+    // that never does settles failed (docs/design/codex-sandboxed-callers.md).
     fs::write(plugins.join("pi/adapter.py"), format!(r#"import json,sys
 r = json.loads(sys.stdin.readline())
-print(json.dumps({{"version": 1, "id": r["id"], "ok": True, "result": {{"argv": ["echo", "{commit}"], "cwd": r["context"]["repo"], "env_names": []}}}}))
+c = r["context"]
+mate = "import json,subprocess,sys; subprocess.run(json.loads(sys.argv[1]) + ['mail.inbox', '--json', json.dumps({{'address': sys.argv[2]}})], stdout=subprocess.DEVNULL, check=True); print(sys.argv[-1])"
+argv = [sys.executable, "-c", mate, json.dumps(c["control"]["cli_argv"]), c.get("owner") or "infra", "{commit}"]
+print(json.dumps({{"version": 1, "id": r["id"], "ok": True, "result": {{"argv": argv, "cwd": c["repo"], "env_names": []}}}}))
 "#)).unwrap();
     fs::write(
         plugins.join("pi/manifest.json"),
@@ -34,6 +40,17 @@ print(json.dumps({{"version": 1, "id": r["id"], "ok": True, "result": {{"argv": 
     )
     .unwrap();
     release
+}
+
+/// The release a planned payload names: its last argument.
+fn released(plan: &Value) -> &str {
+    plan["argv"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .as_str()
+        .unwrap()
 }
 
 fn select(data: &Path, release: &Release) {
@@ -113,17 +130,17 @@ fn running_release_keeps_its_plugins_and_persisted_commands_follow_current() {
     let mut running = Rpc::new(command(&fleet, &stable));
     let args = json!({"task_id":"infra-duty","manifest":"bundled:pi"});
     let before = running.call("plugin.command", args.clone());
-    assert_eq!(before["argv"][1], OLD);
+    assert_eq!(released(&before), OLD);
     select(&data, &new);
     let after = running.call("plugin.command", args.clone());
-    assert_eq!(after["argv"][1], OLD);
+    assert_eq!(released(&after), OLD);
     let brief = running.call("agent.brief", json!({"task_id":"infra-duty"}));
     assert_eq!(brief["context"]["control"]["cli_argv"][0], json!(stable));
     let status = running.call("upgrade.status", json!({}));
     assert_eq!(status["running_commit"], OLD);
     assert_eq!(status["current_commit"], NEW);
     let mut restarted = Rpc::new(command(&fleet, &stable));
-    assert_eq!(restarted.call("plugin.command", args)["argv"][1], NEW);
+    assert_eq!(released(&restarted.call("plugin.command", args)), NEW);
     // A damaged immutable bundle fails closed instead of finding the checkout
     // (or the deliberately wrong PRIVATEER_PLUGINS override).
     fs::remove_file(old.plugins().join("native.py")).unwrap();
