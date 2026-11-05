@@ -73,3 +73,10 @@ fn the_live_voice_probe_suite_passes() {
 fn the_live_voice_door_suite_passes() {
     suite("tests/live_voice_door_test.py");
 }
+
+// The fake app-server's append-only control logs: whole-line appends and a
+// poller that ignores a trailing fragment (#713).
+#[test]
+fn the_live_voice_control_log_suite_passes() {
+    suite("tests/live_voice_control_test.py");
+}

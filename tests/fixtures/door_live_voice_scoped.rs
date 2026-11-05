@@ -347,7 +347,9 @@ sys.stdout.write(p.stdout); sys.exit(p.returncode)
     let state = fleet.root.join("state/doors/fake/state");
     let driver = fleet.root.join("detail-client.py");
     fs::write(&driver, r#"import http.client, json, pathlib, sqlite3, sys, time
-root, state, device, home = map(pathlib.Path, sys.argv[1:])
+root, state, device, home, tests = map(pathlib.Path, sys.argv[1:])
+sys.path.append(str(tests))
+from live_voice_control import read_records
 port = int((state/'url').read_text().strip().rsplit(':',1)[1].rstrip('/'))
 token = ''
 def call(path, body=None):
@@ -379,7 +381,7 @@ def tool(name,args,ok=True):
     while True:
         view=call('/api/state')
         lines=[row['text'] for row in view['transcript'] if row['role']=='door']
-        records=[json.loads(line) for line in (root/'voice-control'/'received.jsonl').read_text().splitlines()]
+        records=read_records(root/'voice-control'/'received.jsonl')
         replies=[r['result'] for r in records if r.get('id')==turn and 'result' in r]
         if len(lines)>=count and replies: break
         assert time.monotonic()<deadline,(view,replies)
@@ -444,7 +446,7 @@ print('linked voice detail checks passed')
         .env("FAKE_VOICE_DIR", &control).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
     fleet.wait("detail voice URL", |_| state.join("url").exists().then_some(()));
     let output = support::command(support::python()).arg(&driver).arg(&fleet.root).arg(&state)
-        .arg(&device).arg(&home).output().unwrap();
+        .arg(&device).arg(&home).arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests")).output().unwrap();
     unsafe { libc::kill(supervisor.id() as i32, libc::SIGTERM) };
     supervisor.wait().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));

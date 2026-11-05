@@ -645,6 +645,10 @@ absent, reads over fake core pipes, and refuses voice while leaving reads usable
 `tests/live_voice_page_test.py` runs the actual scoped page modules in a Node
 browser-boundary harness, covering stale audio callbacks, credential replacement,
 microphone-free reads and unavailable-core responses without losing valid pairing.
+`tests/live_voice_control_test.py` covers how the fixtures write and read the fake
+app-server's append-only control logs: each record is appended as one whole line
+and a poller counts only newline-terminated lines, so a read in flight never
+parses a half-written record (#713).
 `tests/fixtures/door_live_voice_scoped.rs`
 uses the real supervisor, terminal-issued grants and real linked gateway
 subprocesses for exact refs/paging/stale continuations, terminal history, unknown

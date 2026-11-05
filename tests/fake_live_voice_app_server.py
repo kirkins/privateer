@@ -31,6 +31,10 @@ import sys
 import threading
 import time
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import live_voice_control  # noqa: E402
+
 DIR = os.environ["FAKE_VOICE_DIR"]
 ANSWER = ("v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\n"
           "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\n"
@@ -60,8 +64,10 @@ def out(message: dict) -> None:
 
 
 def record(name: str, message: dict) -> None:
-    with lock, open(os.path.join(DIR, name), "a", encoding="utf-8") as f:
-        f.write(json.dumps(message) + "\n")
+    # One whole-line append under the lock: a polling reader in another process
+    # must never see a stdio-split or interleaved record (#713).
+    with lock:
+        live_voice_control.append_record(os.path.join(DIR, name), message)
 
 
 def injector() -> None:
