@@ -40,7 +40,7 @@ use std::{
     fs,
     io::{Read, Write},
     os::unix::fs::OpenOptionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 pub(crate) const KINDS: [&str; 4] = ["crew", "errand", "first_mate", "review"];
@@ -507,12 +507,14 @@ pub(crate) fn for_store(store: &Store) -> Result<Option<Value>> {
 /// for what the runtime cannot refuse: notes still prefixed with a STRENGTH
 /// label, and errand routes with no `review` use. Its `readiness` lists each
 /// tool a route's harness requires that is not installed on this command's
-/// PATH, with the install step; the file is written all the same.
+/// PATH, with the install step; the file is written all the same. `home` is
+/// the ship home this command runs in, when it knows one, so a check made
+/// from inside a sandbox can say what it left to the dispatcher.
 ///
 /// With `until_ms` or `until_reset` the change is temporary: the routes file
 /// as it stands, any temporary change in it included, is kept to come back
 /// then, and the reply's `temporary` says what reverts when.
-pub fn set(caller: &Caller, args: &Value) -> Result<Value> {
+pub fn set(home: Option<&Path>, caller: &Caller, args: &Value) -> Result<Value> {
     caller.require_operator("routes.set")?;
     let mut value = args.clone();
     if let Some(object) = value.as_object_mut() {
@@ -550,7 +552,7 @@ pub fn set(caller: &Caller, args: &Value) -> Result<Value> {
         reply["temporary"] = temporary_view(&written);
     }
     reply["warnings"] = json!(warnings);
-    reply["readiness"] = crate::readiness::harness_report_here(&manifests(&value));
+    reply["readiness"] = crate::readiness::harness_report_here(&manifests(&value), home);
     Ok(reply)
 }
 
@@ -736,17 +738,20 @@ pub(crate) fn expire(store: &Store) -> Result<Option<Value>> {
 }
 
 /// Each route's harness manifest and options, with the route that names it.
-fn manifests(value: &Value) -> Vec<(String, String, Value)> {
+/// No route is hosted: a launch fills an absent sandbox in as
+/// danger-full-access, so readiness reads the same default.
+fn manifests(value: &Value) -> Vec<crate::readiness::Profile> {
     value["routes"]
         .as_object()
         .into_iter()
         .flatten()
         .filter_map(|(name, route)| {
-            Some((
-                format!("route:{name}"),
-                route["manifest"].as_str()?.to_owned(),
-                route["options"].clone(),
-            ))
+            Some(crate::readiness::Profile {
+                who: format!("route:{name}"),
+                manifest: route["manifest"].as_str()?.to_owned(),
+                options: route["options"].clone(),
+                hosted: false,
+            })
         })
         .collect()
 }
@@ -2568,7 +2573,7 @@ fn span(ms: i64) -> String {
     }
 }
 
-pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
+pub fn cli(home: Option<&Path>, args: &[String], caller: &Caller) -> Result<()> {
     let value = match args {
         [] => show(load()?),
         [verb] if verb == "show" => show(load()?),
@@ -2577,7 +2582,7 @@ pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
             ensure!(raw.len() <= 65_536, "routes file too large");
             let value = serde_json::from_slice(&raw)
                 .context("invalid routes JSON (for YAML use routes.set --file)")?;
-            set(caller, &value)?
+            set(home, caller, &value)?
         }
         _ => bail!(
             "usage: privateer routes [show|set FILE.json]; a FILE.json with \"until_ms\" or \
@@ -2612,7 +2617,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
     match command {
         "routes.show" => Ok(show(load()?)),
         "routes.set" => {
-            let value = set(store.caller(), &args)?;
+            let value = set(Some(store.home()), store.caller(), &args)?;
             store.audit(
                 "routes.set",
                 &json!({"routes": value["routes"].as_object().map(|r| r.len()),

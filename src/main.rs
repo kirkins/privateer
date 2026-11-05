@@ -211,7 +211,7 @@ fn run() -> Result<()> {
         return privateer::permissions::cli(&positional, &caller);
     }
     if command.as_deref() == Some("routes") && !json_given && !file_given {
-        return privateer::crew_routes::cli(&positional, &caller);
+        return privateer::crew_routes::cli(home.as_deref(), &positional, &caller);
     }
     // A folder a ship moved away from runs nothing.
     if let Some(home) = &home {

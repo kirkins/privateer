@@ -145,10 +145,11 @@ impl Needs {
     }
 
     /// A harness as a profile or route runs it: what its manifest requires,
-    /// and on Linux the bubblewrap a Codex sandbox needs.
-    fn profile(&mut self, manifest: &str, options: &Value, block: bool, who: &str) {
+    /// and on Linux the bubblewrap a Codex sandbox needs. `hosted` says a
+    /// host keeps the profile, so Codex's own default decides its sandbox.
+    fn profile(&mut self, manifest: &str, options: &Value, hosted: bool, block: bool, who: &str) {
         self.harness(manifest, block, who);
-        if needs_bwrap(manifest, options) {
+        if needs_bwrap(manifest, options, hosted) {
             self.add(Need {
                 tool: "bubblewrap".into(),
                 binary: "bwrap".into(),
@@ -184,22 +185,32 @@ impl Needs {
 }
 
 /// Whether a Codex profile runs under a Linux sandbox that needs bubblewrap.
-/// `danger-full-access` and yolo bypass the sandbox; an absent selector uses
-/// the first mate default (workspace-write) or Codex's own sandboxed default.
+/// `danger-full-access` and yolo bypass the sandbox. An absent selector means
+/// danger-full-access too for crew and headless first mates, which
+/// `lib::codex_crew_sandbox_default` fills in at launch; only a hosted first
+/// mate, which Codex itself starts, keeps Codex's own sandboxed default.
 #[cfg(target_os = "linux")]
-fn needs_bwrap(manifest: &str, options: &Value) -> bool {
-    crate::bundled::harness(manifest).as_deref() == Some("codex")
-        && options["yolo"] != true
-        && !matches!(
-            options["sandbox"].as_str(),
-            Some("danger-full-access") | Some("")
-        )
+fn needs_bwrap(manifest: &str, options: &Value, hosted: bool) -> bool {
+    if crate::bundled::harness(manifest).as_deref() != Some("codex") || options["yolo"] == true {
+        return false;
+    }
+    match options["sandbox"].as_str() {
+        Some("danger-full-access") => false,
+        Some(sandbox) => !sandbox.is_empty(),
+        None => hosted,
+    }
 }
 
 /// macOS and other hosts never run Codex's bubblewrap sandbox.
 #[cfg(not(target_os = "linux"))]
-fn needs_bwrap(_manifest: &str, _options: &Value) -> bool {
+fn needs_bwrap(_manifest: &str, _options: &Value, _hosted: bool) -> bool {
     false
+}
+
+/// Whether a probe is left to the dispatcher because this process, not the
+/// machine, is what a sandbox would make it report on.
+fn skipped(need: &Need, sandbox: Option<&'static str>) -> bool {
+    sandbox.is_some() && need.probe == Probe::Bwrap
 }
 
 /// The executables a harness manifest declares, or None when it declares
@@ -296,10 +307,11 @@ fn needed_from(
         let Some(name) = ship["name"].as_str() else {
             continue;
         };
+        let hosted = crate::host::hosted(&ship["first_mate"]);
         if let Some(manifest) = ship["first_mate"]["manifest"].as_str() {
-            needs.profile(manifest, &ship["first_mate"]["options"], true, name);
+            needs.profile(manifest, &ship["first_mate"]["options"], hosted, true, name);
         }
-        if crate::host::hosted(&ship["first_mate"]) {
+        if hosted {
             needs.add(Need {
                 tool: "herdr".into(),
                 binary: "herdr".into(),
@@ -325,7 +337,15 @@ fn needed_from(
     if let Some(routes) = policy.and_then(|p| p["routes"].as_object()) {
         for (name, route) in routes {
             if let Some(manifest) = route["manifest"].as_str() {
-                needs.profile(manifest, &route["options"], false, &format!("route:{name}"));
+                // No route is hosted: its launches go through agent.start,
+                // which fills an absent sandbox in as danger-full-access.
+                needs.profile(
+                    manifest,
+                    &route["options"],
+                    false,
+                    false,
+                    &format!("route:{name}"),
+                );
             }
         }
     }
@@ -367,8 +387,10 @@ fn resolve_with_python(
 }
 
 /// What changes when a tool might: the PATH, where it resolves, and that
-/// file's size and modification time.
-fn fingerprint(need: &Need, path: &str, resolved: Option<&Path>) -> String {
+/// file's size and modification time. `skipped` says a probe could not be
+/// run from here (a sandbox), so this row never stands in for a check that
+/// can: the dispatcher's own fingerprint does not carry it.
+fn fingerprint(need: &Need, path: &str, resolved: Option<&Path>, skipped: bool) -> String {
     use std::os::unix::fs::MetadataExt;
     let file = resolved
         .and_then(|p| std::fs::metadata(p).ok())
@@ -379,7 +401,8 @@ fn fingerprint(need: &Need, path: &str, resolved: Option<&Path>) -> String {
         need.binary,
         format!("{:?}", need.probe),
         resolved.map(|p| p.to_string_lossy().into_owned()),
-        file
+        file,
+        skipped
     ]))
 }
 
@@ -404,8 +427,16 @@ fn shown((major, minor, patch): (u64, u64, u64)) -> String {
     format!("{major}.{minor}.{patch}")
 }
 
-/// Run the probe for one resolved tool.
-fn probe(need: &Need, program: &Path, path: &str, deadline: Instant) -> Outcome {
+/// Run the probe for one resolved tool. `sandbox` names the sandbox this
+/// process itself runs in, when it does: a probe started there says nothing
+/// certain about the machine, so the one that nests a sandbox is skipped.
+fn probe(
+    need: &Need,
+    program: &Path,
+    path: &str,
+    deadline: Instant,
+    sandbox: Option<&'static str>,
+) -> Outcome {
     let run = |args: &[&str]| {
         let argv: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
         crate::capabilities::run_program_output(program, &argv, path, deadline, true)
@@ -420,19 +451,58 @@ fn probe(need: &Need, program: &Path, path: &str, deadline: Instant) -> Outcome 
     let floor = match need.probe {
         Probe::Presence => return outcome,
         Probe::Bwrap => {
-            if let Err(why) = run(&[
+            if let Some(sandbox) = sandbox {
+                // bwrap under a Codex sandbox's own namespace can fail for
+                // the caller's sandbox, not this machine's: say so instead of
+                // reporting a broken bubblewrap. The dispatcher, outside any
+                // sandbox, runs the check that counts.
+                outcome.why = Some(format!(
+                    "bubblewrap (bwrap) at {} not checked from inside a sandbox ({sandbox}): this check ran under one, so the dispatcher's own check is the one to trust",
+                    program.display()
+                ));
+                return outcome;
+            }
+            let args: Vec<String> = [
                 "--unshare-user",
                 "--unshare-pid",
                 "--ro-bind",
                 "/",
                 "/",
                 "true",
-            ]) {
-                outcome.ok = false;
-                outcome.why = Some(format!(
-                    "bubblewrap (bwrap) at {} is present but cannot create a user namespace (AppArmor restrict_unprivileged_userns?): {why}",
-                    program.display()
-                ));
+            ]
+            .iter()
+            .map(|arg| (*arg).to_owned())
+            .collect();
+            match crate::capabilities::run_program_unmet(program, &args, path, deadline) {
+                Ok(()) => {}
+                Err(crate::capabilities::Unmet::TimedOut) => {
+                    outcome.ok = false;
+                    outcome.why = Some(format!(
+                        "bubblewrap (bwrap) at {} could not be checked: bwrap probe timed out",
+                        program.display()
+                    ));
+                }
+                Err(crate::capabilities::Unmet::NotStarted(why)) => {
+                    outcome.ok = false;
+                    // The runner names the program; say what to do about it.
+                    let why = why
+                        .split_once("could not start: ")
+                        .map(|(_, reason)| reason.to_owned())
+                        .unwrap_or(why);
+                    outcome.why = Some(format!("could not run bwrap: {why}"));
+                }
+                Err(crate::capabilities::Unmet::Failed { why, stderr }) => {
+                    outcome.ok = false;
+                    let printed = if stderr.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {stderr}")
+                    };
+                    outcome.why = Some(format!(
+                        "bubblewrap (bwrap) at {} is present but cannot create a user namespace (AppArmor restrict_unprivileged_userns?): {why}{printed}",
+                        program.display()
+                    ));
+                }
             }
             return outcome;
         }
@@ -550,19 +620,21 @@ fn missing(need: &Need, login: Option<&str>, dispatcher: bool) -> Outcome {
 }
 
 /// Probe each resolved tool in parallel, by `deadline`, and say why each
-/// unresolved one is missing.
+/// unresolved one is missing. `sandbox` names the sandbox this process runs
+/// in, if any; probes that a sandbox would make lie are skipped there.
 fn run_all(
     probes: &[(&Need, Option<&Path>)],
     path: &str,
     login: Option<&str>,
     deadline: Instant,
+    sandbox: Option<&'static str>,
 ) -> Vec<Outcome> {
     std::thread::scope(|scope| {
         let running: Vec<_> = probes
             .iter()
             .map(|(need, resolved)| {
                 scope.spawn(move || match resolved {
-                    Some(program) => probe(need, program, path, deadline),
+                    Some(program) => probe(need, program, path, deadline, sandbox),
                     None => missing(need, login, true),
                 })
             })
@@ -589,6 +661,12 @@ fn check_with(
     login: &dyn Fn() -> String,
 ) -> Result<Value> {
     let now = Store::now_ms();
+    // A probe started inside a sandbox says nothing certain about this
+    // machine, so the bwrap one is skipped and its row marked as skipped.
+    let sandbox = crate::launch::sandbox(store.home())
+        .ok()
+        .flatten()
+        .filter(|_| needs.tools.iter().any(|need| need.probe == Probe::Bwrap));
     let known: BTreeMap<String, (bool, String, i64)> = store
         .connection()
         .prepare("SELECT tool, ok, fingerprint, checked_ms FROM machine_readiness")?
@@ -600,7 +678,7 @@ fn check_with(
     let mut kept = vec![];
     for need in &needs.tools {
         let resolved = resolve(&need.binary, path);
-        let print = fingerprint(need, path, resolved.as_deref());
+        let print = fingerprint(need, path, resolved.as_deref(), skipped(need, sandbox));
         let fresh = known.get(&need.tool).is_some_and(|(ok, old, at)| {
             let ttl = if *ok { PASS_TTL_MS } else { FAIL_TTL_MS };
             *old == print && now - at < ttl
@@ -620,7 +698,13 @@ fn check_with(
         .iter()
         .map(|(need, resolved, _)| (*need, resolved.as_deref()))
         .collect();
-    let outcomes = run_all(&probes, path, login.as_deref(), Instant::now() + BUDGET);
+    let outcomes = run_all(
+        &probes,
+        path,
+        login.as_deref(),
+        Instant::now() + BUDGET,
+        sandbox,
+    );
     let level = |need: &Need| if need.block { "block" } else { "warn" };
     let tx = store.write_transaction()?;
     for ((need, _, print), outcome) in due.iter().zip(&outcomes) {
@@ -936,21 +1020,42 @@ pub(crate) fn missing_for(conn: &Connection, manifest: &str) -> Result<Vec<Missi
         .collect())
 }
 
-/// What the harnesses `manifests` (each with who needs it) require that is
-/// not on `path`, this command's PATH, now, each with why and its install
-/// hint, and which manifests declare nothing to check. Checked live on the
-/// bounded probes, asking the login shell (bounded too) only when something
-/// is missing; the rows are left to the dispatcher, whose PATH may differ
-/// from this one and whose own check follows within a minute.
+/// A harness as a profile or route runs it: who needs it, its manifest and
+/// options, and whether a host keeps it (a hosted first mate runs under
+/// Codex's own sandbox default, not the one agent.start fills in).
+pub(crate) struct Profile {
+    pub who: String,
+    pub manifest: String,
+    pub options: Value,
+    pub hosted: bool,
+}
+
+/// What the harnesses `profiles` require that is not on `path`, this
+/// command's PATH, now, each with why and its install hint, and which
+/// manifests declare nothing to check. Checked live on the bounded probes,
+/// asking the login shell (bounded too) only when something is missing; the
+/// rows are left to the dispatcher, whose PATH may differ from this one and
+/// whose own check follows within a minute. `home` lets a check made from
+/// inside a sandbox skip what a sandbox would make it misreport.
 pub(crate) fn harness_report(
-    profiles: &[(String, String, Value)],
+    profiles: &[Profile],
     path: &str,
     login: &dyn Fn() -> String,
+    home: Option<&Path>,
 ) -> Value {
     let mut needs = Needs::default();
-    for (who, manifest, options) in profiles {
-        needs.profile(manifest, options, false, who);
+    for profile in profiles {
+        needs.profile(
+            &profile.manifest,
+            &profile.options,
+            profile.hosted,
+            false,
+            &profile.who,
+        );
     }
+    let sandbox = home
+        .and_then(|home| crate::launch::sandbox(home).ok().flatten())
+        .filter(|_| needs.tools.iter().any(|need| need.probe == Probe::Bwrap));
     let resolved: Vec<(&Need, Option<PathBuf>)> = needs
         .tools
         .iter()
@@ -961,31 +1066,38 @@ pub(crate) fn harness_report(
         .any(|(_, found)| found.is_none())
         .then(login);
     let deadline = Instant::now() + BUDGET;
-    let missing: Vec<Value> = resolved
-        .iter()
-        .filter_map(|(need, found)| {
-            let outcome = match found {
-                Some(program) => probe(need, program, path, deadline),
-                None => missing(need, login.as_deref(), false),
-            };
-            (!outcome.ok).then(|| {
-                let why = format!(
-                    "{}; the dispatcher's own check follows within a minute",
-                    outcome.why.as_deref().unwrap_or("the check failed")
-                );
-                json!({"tool": need.tool, "why": why, "install": need.install,
-                    "needed_by": need.needed_by})
-            })
-        })
-        .collect();
-    json!({"missing": missing, "unchecked": needs.unchecked})
+    let mut unmet: Vec<Value> = vec![];
+    let mut not_checked: Vec<Value> = vec![];
+    for (need, found) in &resolved {
+        let outcome = match found {
+            Some(program) => probe(need, program, path, deadline, sandbox),
+            None => missing(need, login.as_deref(), false),
+        };
+        if outcome.ok {
+            if let Some(why) = outcome.why {
+                not_checked.push(json!({"tool": need.tool, "why": why,
+                    "needed_by": need.needed_by}));
+            }
+            continue;
+        }
+        let why = format!(
+            "{}; the dispatcher's own check follows within a minute",
+            outcome.why.as_deref().unwrap_or("the check failed")
+        );
+        unmet.push(
+            json!({"tool": need.tool, "why": why, "install": need.install,
+            "needed_by": need.needed_by}),
+        );
+    }
+    json!({"missing": unmet, "not_checked": not_checked, "unchecked": needs.unchecked})
 }
 
 /// `harness_report` on this process's PATH, the one a dispatcher started
 /// from here records, for routes.set and a first-mate profile's ship.put.
-pub(crate) fn harness_report_here(profiles: &[(String, String, Value)]) -> Value {
+/// `home` is the ship home the caller runs in, when it knows one.
+pub(crate) fn harness_report_here(profiles: &[Profile], home: Option<&Path>) -> Value {
     let path = std::env::var("PATH").unwrap_or_default();
-    harness_report(profiles, &path, &crate::service::login_path)
+    harness_report(profiles, &path, &crate::service::login_path, home)
 }
 
 /// Bearings lines for `ship`: each failing tool its own work needs.
@@ -1138,6 +1250,10 @@ fn home_rows(
 ) -> Result<(&'static str, Vec<Row>)> {
     let store = Store::open_readonly(home, crate::store::Caller::Operator)?;
     let needs = needs(&store)?;
+    let sandbox = crate::launch::sandbox(home)
+        .ok()
+        .flatten()
+        .filter(|_| needs.tools.iter().any(|need| need.probe == Probe::Bwrap));
     let conn = store.connection();
     let now = Store::now_ms();
     let known: BTreeMap<String, (bool, i64)> = if available(conn)? {
@@ -1191,7 +1307,7 @@ fn home_rows(
         .map(|((need, found), _)| (*need, found.as_deref()))
         .collect();
     // `path` already holds the login shell's PATH, so it is not asked again.
-    let mut fresh = run_all(&probes, &path, None, deadline).into_iter();
+    let mut fresh = run_all(&probes, &path, None, deadline, sandbox).into_iter();
     let mut outcomes = vec![];
     for ((need, found), cached) in resolved.iter().zip(cached) {
         let outcome = match cached {
@@ -1397,6 +1513,7 @@ mod tests {
             &resolved,
             "/alpha/shims",
             Instant::now() + Duration::from_secs(5),
+            None,
         );
         assert!(outcome.ok, "{outcome:?}");
         assert_eq!(outcome.version.as_deref(), Some("3.12.7"));
@@ -1505,6 +1622,19 @@ mod tests {
                 .execute(
                     "INSERT OR REPLACE INTO ships(name, record) VALUES(?1, ?2)",
                     params![name, record.to_string()],
+                )
+                .unwrap();
+        }
+
+        /// Make this home's check look like one a sandboxed caller runs: its
+        /// dispatcher recorded another PID namespace, as Codex's sandbox has.
+        fn inside_a_sandbox(&self) {
+            let own = crate::jobs::pid_namespace().expect("this PID namespace");
+            self.store
+                .connection()
+                .execute(
+                    "INSERT OR REPLACE INTO metadata(key, value) VALUES('pid_namespace', ?1)",
+                    [format!("{own} (another home's dispatcher)")],
                 )
                 .unwrap();
         }
@@ -1787,6 +1917,30 @@ mod tests {
         assert!(missing_for(conn, &manifest).unwrap().is_empty());
     }
 
+    /// A profile as `harness_report` takes it, for a crew or a headless
+    /// first mate: neither is hosted, so an absent sandbox is
+    /// danger-full-access as agent.start fills it in.
+    fn profile(who: &str, manifest: &str, options: Value) -> Profile {
+        Profile {
+            who: who.to_owned(),
+            manifest: manifest.to_owned(),
+            options,
+            hosted: false,
+        }
+    }
+
+    /// The bubblewrap need, for probing it directly.
+    fn bwrap_need() -> Need {
+        Need {
+            tool: "bubblewrap".into(),
+            binary: "bwrap".into(),
+            probe: Probe::Bwrap,
+            block: false,
+            needed_by: vec![],
+            install: String::new(),
+        }
+    }
+
     #[test]
     fn a_harness_report_checks_live_and_stores_nothing() {
         let m = Machine::new();
@@ -1798,16 +1952,16 @@ mod tests {
         std::fs::write(&file, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
         let manifests = [
-            ("route:cheap".to_owned(), fake.clone(), json!({})),
-            ("alpha".to_owned(), fake, json!({})),
-            ("route:own".to_owned(), custom.clone(), json!({})),
+            profile("route:cheap", &fake, json!({})),
+            profile("alpha", &fake, json!({})),
+            profile("route:own", &custom, json!({})),
         ];
         let asked = std::sync::atomic::AtomicUsize::new(0);
         let login_path = || {
             asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             login.to_string_lossy().into_owned()
         };
-        let report = harness_report(&manifests, &m.path(), &login_path);
+        let report = harness_report(&manifests, &m.path(), &login_path, None);
         assert_eq!(report["unchecked"], json!([custom]), "{report}");
         let missing = report["missing"].as_array().unwrap();
         assert_eq!(missing.len(), 1, "{report}");
@@ -1830,7 +1984,7 @@ mod tests {
         assert!(m.failing_tools().is_empty());
         // Everything on the PATH: nothing missing, and no login shell asked.
         m.tool("fakeharness", "");
-        let report = harness_report(&manifests, &m.path(), &login_path);
+        let report = harness_report(&manifests, &m.path(), &login_path, None);
         assert_eq!(report["missing"], json!([]), "{report}");
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(m.calls("fakeharness"), 0, "a presence check runs nothing");
@@ -1842,9 +1996,9 @@ mod tests {
         let m = Machine::new();
         m.tool("codex", "exit 0");
         let profiles = |sandbox: &str| {
-            vec![(
-                "alpha".to_owned(),
-                "bundled:codex".to_owned(),
+            vec![profile(
+                "alpha",
+                "bundled:codex",
                 json!({"sandbox": sandbox}),
             )]
         };
@@ -1857,7 +2011,7 @@ mod tests {
                 .find(|item| item["tool"] == "bubblewrap")
                 .cloned()
         };
-        let report = harness_report(&profiles("workspace-write"), &m.path(), &login);
+        let report = harness_report(&profiles("workspace-write"), &m.path(), &login, None);
         let item = bwrap(&report).unwrap_or_else(|| panic!("{report}"));
         assert!(
             item["why"]
@@ -1875,21 +2029,56 @@ mod tests {
             "{item}"
         );
 
-        m.tool("bwrap", "exit 1");
-        let report = harness_report(&profiles("read-only"), &m.path(), &login);
+        m.tool(
+            "bwrap",
+            "echo 'bwrap: setting up uid map: Permission denied' >&2; exit 1",
+        );
+        let report = harness_report(&profiles("read-only"), &m.path(), &login, None);
         let item = bwrap(&report).unwrap_or_else(|| panic!("{report}"));
         assert!(
             item["why"].as_str().unwrap().contains(
-                "cannot create a user namespace (AppArmor restrict_unprivileged_userns?)"
+                "cannot create a user namespace (AppArmor restrict_unprivileged_userns?): \
+                 bwrap exited with 1: bwrap: setting up uid map: Permission denied"
             ),
             "{item}"
         );
 
+        // A probe the check stopped is a timeout, not a denial. The probe's
+        // PATH holds only the test's own tools, so spin on the shell itself.
+        m.tool("bwrap", "while :; do :; done");
+        let outcome = probe(
+            &bwrap_need(),
+            &m.bin.join("bwrap"),
+            &m.path(),
+            Instant::now() + Duration::from_millis(200),
+            None,
+        );
+        assert!(!outcome.ok);
+        let why = outcome.why.unwrap();
+        assert!(why.contains("bwrap probe timed out"), "{why}");
+        assert!(!why.contains("AppArmor"), "{why}");
+
+        // A binary that cannot be executed says that, too.
+        std::fs::write(m.bin.join("bwrap"), "not an executable format\n").unwrap();
+        std::fs::set_permissions(m.bin.join("bwrap"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let outcome = probe(
+            &bwrap_need(),
+            &m.bin.join("bwrap"),
+            &m.path(),
+            Instant::now() + Duration::from_secs(5),
+            None,
+        );
+        assert!(!outcome.ok);
+        let why = outcome.why.unwrap();
+        assert!(why.starts_with("could not run bwrap: "), "{why}");
+        assert!(!why.contains("AppArmor"), "{why}");
+
         m.tool("bwrap", "exit 0");
-        let report = harness_report(&profiles("workspace-write"), &m.path(), &login);
+        let report = harness_report(&profiles("workspace-write"), &m.path(), &login, None);
         assert!(bwrap(&report).is_none(), "{report}");
         let calls = m.calls("bwrap");
-        let report = harness_report(&profiles("danger-full-access"), &m.path(), &login);
+        let report = harness_report(&profiles("danger-full-access"), &m.path(), &login, None);
         assert!(bwrap(&report).is_none(), "{report}");
         assert_eq!(m.calls("bwrap"), calls, "danger-full-access never probes");
     }
@@ -1900,12 +2089,12 @@ mod tests {
         let m = Machine::new();
         m.tool("codex", "exit 0");
         m.tool("bwrap", "exit 1");
-        let profiles = [(
-            "alpha".to_owned(),
-            "bundled:codex".to_owned(),
+        let profiles = [profile(
+            "alpha",
+            "bundled:codex",
             json!({"sandbox": "workspace-write"}),
         )];
-        let report = harness_report(&profiles, &m.path(), &|| String::new());
+        let report = harness_report(&profiles, &m.path(), &|| String::new(), None);
         assert!(
             report["missing"]
                 .as_array()
@@ -1965,6 +2154,93 @@ mod tests {
         m.check();
         assert!(m.failing_tools().is_empty());
         assert_eq!(m.calls("bwrap"), calls, "danger-full-access never probes");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_codex_profile_without_a_sandbox_uses_the_launch_default() {
+        let m = Machine::new();
+        m.tool("python3", "exit 0");
+        m.tool("codex", "exit 0");
+        // Crew and headless first mates have an absent sandbox filled in as
+        // danger-full-access at launch, so bwrap is not needed for either.
+        m.ship("alpha", "bundled:codex");
+        let policy = json!({"routes": {"crew": {"manifest": "bundled:codex"}}});
+        m.check_on(&m.path(), false, Some(&policy), "");
+        assert!(m.failing_tools().is_empty(), "{:?}", m.failing_tools());
+        assert_eq!(m.rows_of("bubblewrap"), 0, "nothing asked for a probe");
+
+        // A hosted first mate runs under Codex's own default, which is
+        // sandboxed, so it does need one.
+        m.tool("herdr", "echo 'herdr 1.0.0'");
+        m.hosted("alpha", "bundled:codex");
+        m.check();
+        assert_eq!(m.failing_tools(), ["bubblewrap"]);
+        assert!(
+            m.why("bubblewrap")
+                .contains("bubblewrap (bwrap) is not installed on the dispatcher's PATH"),
+            "{}",
+            m.why("bubblewrap")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_check_from_inside_a_sandbox_leaves_the_bwrap_probe_to_the_dispatcher() {
+        let m = Machine::new();
+        m.tool("python3", "exit 0");
+        m.tool("codex", "exit 0");
+        m.tool("bwrap", "echo 'bwrap: no permissions' >&2; exit 1");
+        m.ship_options(
+            "alpha",
+            "bundled:codex",
+            json!({"sandbox": "workspace-write"}),
+        );
+        m.inside_a_sandbox();
+        m.check();
+        assert!(m.failing_tools().is_empty(), "{:?}", m.failing_tools());
+        assert_eq!(m.calls("bwrap"), 0, "the probe is the dispatcher's");
+        assert!(
+            m.why("bubblewrap")
+                .contains("not checked from inside a sandbox"),
+            "{}",
+            m.why("bubblewrap")
+        );
+
+        // A report made there says what it left unchecked rather than warn.
+        let report = harness_report(
+            &[profile(
+                "alpha",
+                "bundled:codex",
+                json!({"sandbox": "workspace-write"}),
+            )],
+            &m.path(),
+            &|| String::new(),
+            Some(m.store.home()),
+        );
+        assert_eq!(report["missing"], json!([]), "{report}");
+        assert!(
+            report["not_checked"][0]["why"]
+                .as_str()
+                .unwrap()
+                .contains("not checked from inside a sandbox"),
+            "{report}"
+        );
+        assert_eq!(m.calls("bwrap"), 0);
+
+        // Outside the sandbox the dispatcher's own check probes: a skipped
+        // row is no pass a later check can lean on.
+        m.store
+            .connection()
+            .execute("DELETE FROM metadata WHERE key='pid_namespace'", [])
+            .unwrap();
+        m.check();
+        assert_eq!(m.failing_tools(), ["bubblewrap"], "{:?}", m.failing_tools());
+        assert!(
+            m.why("bubblewrap")
+                .contains("bwrap exited with 1: bwrap: no permissions")
+        );
+        assert_eq!(m.calls("bwrap"), 1);
     }
 
     #[test]

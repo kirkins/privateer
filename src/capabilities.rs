@@ -429,19 +429,80 @@ pub(crate) fn run_program_output(
     }
 }
 
+/// Run an already resolved program as `run_program_output` does, keeping the
+/// first `STDERR_LIMIT` bytes it printed on standard error: a probe whose
+/// failure needs explaining can then tell a timeout from a start error from
+/// an exit, and quote what the program said.
+pub(crate) fn run_program_unmet(
+    program: &Path,
+    args: &[String],
+    path: &str,
+    deadline: Instant,
+) -> std::result::Result<(), Unmet> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env_clear()
+        .env("PATH", path)
+        .current_dir("/");
+    if let Some(home) = std::env::var_os("HOME") {
+        command.env("HOME", home);
+    }
+    // Named as the captain wrote it, without the directories.
+    let shown = program
+        .file_name()
+        .unwrap_or(program.as_os_str())
+        .to_string_lossy();
+    // Until `deadline` or the probe's own timeout, whichever is first.
+    let own = Instant::now() + PROBE_TIMEOUT;
+    run_bounded_unmet(command, &shown, deadline.min(own), false, true).map(|_| ())
+}
+
 /// Why `run_bounded` stopped a command: it was still running at its deadline.
 pub(crate) const TIMED_OUT: &str = "timed out";
 
+/// The most of a failed probe's standard error that is kept.
+const STDERR_LIMIT: u64 = 4_096;
+
+/// Why a bounded run did not pass, told apart so a caller can say which it
+/// was and quote what the program printed.
+#[derive(Debug)]
+pub(crate) enum Unmet {
+    /// It could not be started; the text names it and the error.
+    NotStarted(String),
+    /// It was still running at the deadline; its process group was killed.
+    TimedOut,
+    /// It ran and failed: why, and its standard error, trimmed.
+    Failed { why: String, stderr: String },
+}
+
 /// Run `command` as a probe: in its own process group, without input, until
-/// `deadline`, when the whole group is killed and `Err` is `TIMED_OUT`. Keeps
-/// the first 64 KiB of standard output when `capture` is set (empty
+/// `deadline`, when the whole group is killed and `Err` is `Unmet::TimedOut`.
+/// Keeps the first 64 KiB of standard output when `capture` is set (empty
 /// otherwise). Any other `Err` says why it failed, naming it `shown`.
 pub(crate) fn run_bounded(
-    mut command: Command,
+    command: Command,
     shown: &str,
     deadline: Instant,
     capture: bool,
 ) -> std::result::Result<String, String> {
+    match run_bounded_unmet(command, shown, deadline, capture, false) {
+        Ok((stdout, _)) => Ok(stdout),
+        Err(Unmet::NotStarted(why)) => Err(why),
+        Err(Unmet::TimedOut) => Err(TIMED_OUT.to_owned()),
+        Err(Unmet::Failed { why, .. }) => Err(why),
+    }
+}
+
+/// `run_bounded`, keeping what the program printed on standard error when
+/// `stderr` is set, so a failure can be explained rather than guessed at.
+fn run_bounded_unmet(
+    mut command: Command,
+    shown: &str,
+    deadline: Instant,
+    capture: bool,
+    stderr: bool,
+) -> std::result::Result<(String, String), Unmet> {
     command
         .stdin(Stdio::null())
         .stdout(if capture {
@@ -449,32 +510,29 @@ pub(crate) fn run_bounded(
         } else {
             Stdio::null()
         })
-        .stderr(Stdio::null())
+        .stderr(if stderr {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .process_group(0);
     let mut child = command
         .spawn()
-        .map_err(|error| format!("{shown} could not start: {error}"))?;
-    // Read on a thread, so a probe that prints more than a pipe holds still
-    // exits; past the limit the rest is drained and dropped.
-    let output = child.stdout.take().map(|stdout| {
-        let (send, receive) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut stdout = stdout;
-            let mut kept = Vec::new();
-            let _ = (&mut stdout).take(OUTPUT_LIMIT).read_to_end(&mut kept);
-            let _ = std::io::copy(&mut stdout, &mut std::io::sink());
-            let _ = send.send(kept);
-        });
-        receive
-    });
+        .map_err(|error| Unmet::NotStarted(format!("{shown} could not start: {error}")))?;
+    let output = keep(child.stdout.take(), OUTPUT_LIMIT);
+    let kept_stderr = keep(child.stderr.take(), STDERR_LIMIT);
     let pid = child.id();
     let outcome = loop {
         match crate::jobs::exited_unreaped(pid) {
             Ok(Some(_)) => break None,
-            Ok(None) if Instant::now() >= deadline => break Some(TIMED_OUT.to_owned()),
+            Ok(None) if Instant::now() >= deadline => break Some(Unmet::TimedOut),
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(error) => break Some(format!("{error:#}")),
+            Err(error) => {
+                break Some(Unmet::Failed {
+                    why: format!("{error:#}"),
+                    stderr: String::new(),
+                });
+            }
         }
     };
     // Signal before reaping: the unreaped child still holds its group's id, so
@@ -483,23 +541,55 @@ pub(crate) fn run_bounded(
         libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
     }
     let status = child.wait();
-    if let Some(why) = outcome {
-        return Err(why);
+    if let Some(unmet) = outcome {
+        return Err(unmet);
     }
     // The group is gone, so the pipe closes; a writer that left the group
     // is not waited for.
-    let text = output
+    let text = drained(output);
+    let printed = drained(kept_stderr);
+    match status {
+        Ok(status) if status.success() => Ok((text, printed)),
+        Ok(status) => Err(Unmet::Failed {
+            why: match status.code() {
+                Some(code) => format!("{shown} exited with {code}"),
+                None => format!("{shown} was killed by a signal"),
+            },
+            stderr: printed.trim().to_owned(),
+        }),
+        Err(error) => Err(Unmet::Failed {
+            why: format!("{error}"),
+            stderr: printed.trim().to_owned(),
+        }),
+    }
+}
+
+/// Read one of a probe's streams on a thread, so a probe that prints more
+/// than a pipe holds still exits; past `limit` the rest is drained and
+/// dropped.
+fn keep<R: std::io::Read + Send + 'static>(
+    stream: Option<R>,
+    limit: u64,
+) -> Option<std::sync::mpsc::Receiver<Vec<u8>>> {
+    stream.map(|mut stream| {
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut kept = Vec::new();
+            let _ = (&mut stream).take(limit).read_to_end(&mut kept);
+            let _ = std::io::copy(&mut stream, &mut std::io::sink());
+            let _ = send.send(kept);
+        });
+        receive
+    })
+}
+
+/// What a `keep` thread read, empty when it said nothing in time.
+fn drained(stream: Option<std::sync::mpsc::Receiver<Vec<u8>>>) -> String {
+    stream
         .and_then(|receive| receive.recv_timeout(Duration::from_secs(1)).ok())
         .map(|kept| String::from_utf8_lossy(&kept).into_owned())
-        .unwrap_or_default();
-    match status {
-        Ok(status) if status.success() => Ok(text),
-        Ok(status) => Err(match status.code() {
-            Some(code) => format!("{shown} exited with {code}"),
-            None => format!("{shown} was killed by a signal"),
-        }),
-        Err(error) => Err(format!("{error}")),
-    }
+        .unwrap_or_default()
 }
 
 /// What the operator declared or withheld here.

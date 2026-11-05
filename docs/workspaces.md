@@ -47,7 +47,12 @@ dispatcher launches with (the one its user service records):
   the routes file. A custom manifest without `requires` is reported unchecked;
 - bubblewrap (`bwrap`) on Linux when a local ship's first mate, or a route,
   runs Codex with an effective sandbox of `workspace-write` or `read-only`
-  (`danger-full-access` and yolo need none). The check runs
+  (`danger-full-access` and yolo need none). An absent sandbox selector is
+  read as the launch reads it: `agent.start` fills in `danger-full-access`
+  for crew and headless first mates, so only a hosted first mate, which Codex
+  starts with its own sandboxed default, needs one without a selector. The
+  probe is skipped when the check is made from inside a sandbox itself, which
+  would make it lie; the dispatcher's own check is the one that counts. The check runs
   `bwrap --unshare-user --unshare-pid --ro-bind / / true` under the usual
   short timeout. A missing `bwrap` is reported as `bubblewrap (bwrap) is not
   installed`; one that is installed but cannot create a user namespace is
