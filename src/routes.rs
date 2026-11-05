@@ -69,9 +69,13 @@
 //! captain set on a route that reports nothing comparable. `spent` turns
 //! either into the share of the plan used, and `refusal_for` refuses new crew
 //! and errands once it passes the share this route keeps for them, and a first
-//! mate once it passes the higher share it keeps for itself. Running work is
+//! mate once it passes the higher share it keeps for itself. The kept share
+//! releases as the window's reset approaches: by default it shrinks in
+//! proportion to the time left, reaching zero at the reset, so the end of an
+//! allowance is used rather than lost. A route may set `reserve_release` to
+//! `"fixed"` to keep the configured share until the reset. Running work is
 //! never stopped: what is already in flight is what spends the plan.
-use crate::crew_routes::{Allowance, Limits, Shape};
+use crate::crew_routes::{Allowance, Limits, Release, Shape};
 use crate::store::Store;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -910,12 +914,16 @@ impl Who {
     }
 }
 
-/// What a route's plan has left: the share of the window furthest spent, and
-/// which window that was, named for a refusal or a bearings line.
+/// One plan window's reading: the share spent, which window it is, and when
+/// it reopens and how long it runs when those are known.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Spent {
     pub share: f64,
     pub what: String,
+    /// When this window resets, when that is known and still ahead.
+    pub reset_ms: Option<i64>,
+    /// The full length of this window, when it is known.
+    pub window_ms: Option<i64>,
 }
 
 /// A window's name, and when it reopens when that is known and still ahead.
@@ -926,19 +934,17 @@ fn window(name: &str, ends_ms: Option<i64>, now: i64) -> String {
     }
 }
 
-/// The share of a route's plan spent, from the latest reading: the furthest
-/// spent of the windows Claude reported and of the runs counted against the
-/// captain's budget for the window now open. Nothing is reported for a route
-/// with neither, so an unshaped route that reports no usage is never refused on
-/// a share nobody knows.
-pub(crate) fn spent(usage: &Usage, budget: Option<u64>, now: i64) -> Option<Spent> {
-    let mut worst: Option<Spent> = None;
-    let mut consider = |share: f64, what: String| {
-        let share = share.clamp(0.0, 1.0);
-        if worst.as_ref().is_none_or(|worst| share > worst.share) {
-            worst = Some(Spent { share, what });
-        }
-    };
+/// Every window a route's plan reports, with its share spent and its timing.
+/// A window whose reset has passed reads zero. A run budget counts only while
+/// its window is open: a closed one lost its allowance at the plan's own rate,
+/// so nothing is owed against it.
+fn readings(
+    usage: &Usage,
+    budget: Option<u64>,
+    run_window_ms: Option<i64>,
+    now: i64,
+) -> Vec<Spent> {
+    let mut readings = vec![];
     for (name, share, ends_ms, window_ms) in [
         (
             "five-hour window",
@@ -958,26 +964,80 @@ pub(crate) fn spent(usage: &Usage, budget: Option<u64>, now: i64) -> Option<Spen
                 Some(ends) => ends <= now,
                 None => now.saturating_sub(usage.updated_ms) >= window_ms,
             };
-            let share = if expired { 0.0 } else { share };
-            consider(share, window(name, ends_ms, now));
+            let reset_ms = ends_ms.filter(|ends| *ends > now);
+            readings.push(Spent {
+                share: if expired { 0.0 } else { share.clamp(0.0, 1.0) },
+                what: window(name, ends_ms, now),
+                reset_ms,
+                window_ms: Some(window_ms),
+            });
         }
     }
-    // A run budget counts only while its window is open: a closed one lost its
-    // allowance at the plan's own rate, so nothing is owed against it.
     if let Some(budget) = budget.filter(|budget| *budget > 0)
         && let Some(ends) = usage.runs_window_ends_ms.filter(|ends| *ends > now)
     {
         let runs = usage.runs.max(0);
-        consider(
-            f64::from(u32::try_from(runs).unwrap_or(u32::MAX)) / budget as f64,
-            window(
+        readings.push(Spent {
+            share: (f64::from(u32::try_from(runs).unwrap_or(u32::MAX)) / budget as f64)
+                .clamp(0.0, 1.0),
+            what: window(
                 &format!("run budget ({runs} of {budget} runs)"),
                 Some(ends),
                 now,
             ),
-        );
+            reset_ms: Some(ends),
+            window_ms: run_window_ms,
+        });
     }
-    worst
+    readings
+}
+
+/// The share of a route's plan spent, from the latest reading: the furthest
+/// spent of the windows Claude reported and of the runs counted against the
+/// captain's budget for the window now open. Nothing is reported for a route
+/// with neither, so an unshaped route that reports no usage is never refused on
+/// a share nobody knows.
+pub(crate) fn spent(
+    usage: &Usage,
+    budget: Option<u64>,
+    run_window_ms: Option<i64>,
+    now: i64,
+) -> Option<Spent> {
+    readings(usage, budget, run_window_ms, now)
+        .into_iter()
+        .fold(None, |worst: Option<Spent>, reading| match worst {
+            Some(worst) if worst.share >= reading.share => Some(worst),
+            _ => Some(reading),
+        })
+}
+
+/// The kept share at `now` for a window of `window_ms` that resets at
+/// `reset_ms`: the configured reserve shrinks in proportion to the time left,
+/// reaching zero at the reset. With no known reset or window, or one already
+/// past, the configured share stands. This is the whole release curve, a pure
+/// function of its arguments.
+pub(crate) fn released(
+    reserve: f64,
+    now: i64,
+    reset_ms: Option<i64>,
+    window_ms: Option<i64>,
+) -> f64 {
+    let (Some(reset), Some(window)) = (reset_ms, window_ms) else {
+        return reserve;
+    };
+    if reset <= now || window <= 0 {
+        return reserve;
+    }
+    let left = ((reset - now) as f64 / window as f64).clamp(0.0, 1.0);
+    (reserve * left).clamp(0.0, 1.0)
+}
+
+/// The kept share for one reading, honouring a route that opts out.
+pub(crate) fn reserve_for(limits: &Limits, configured: f64, reading: &Spent, now: i64) -> f64 {
+    match limits.release {
+        Release::Fixed => configured,
+        Release::Proportional => released(configured, now, reading.reset_ms, reading.window_ms),
+    }
 }
 
 /// The share at which this kind of launch is refused a route.
@@ -1006,13 +1066,40 @@ fn tight(
         let account_usage = usage_of(conn, &account).ok();
         usage = with_account_windows(Some(usage), account_usage.as_ref()).unwrap_or_default();
     }
-    let Some(spent) = spent(&usage, limits.runs, now) else {
+    let configured = 1.0 - threshold(limits, who);
+    // Each window releases on its own reset, so judge each against its own
+    // kept share and refuse on the one furthest past it.
+    let mut refused: Option<(f64, Spent)> = None;
+    for reading in readings(&usage, limits.runs, limits.runs_window_ms, now) {
+        let kept = reserve_for(limits, configured, &reading, now);
+        let limit = 1.0 - kept;
+        if reading.share < limit {
+            continue;
+        }
+        let over = reading.share - limit;
+        if refused.as_ref().is_none_or(|(worst, _)| over > *worst) {
+            refused = Some((over, reading));
+        }
+    }
+    let Some((_, reading)) = refused else {
         return Ok(None);
     };
-    let limit = threshold(limits, who);
-    if spent.share < limit {
-        return Ok(None);
-    }
+    let kept = reserve_for(limits, configured, &reading, now);
+    let released = limits.release == Release::Proportional
+        && reading.reset_ms.is_some()
+        && reading.window_ms.is_some();
+    let why = match released {
+        false => format!(
+            "{:.0}% reserve of the configured {:.0}%, fixed until the reset",
+            kept * 100.0,
+            configured * 100.0
+        ),
+        true => format!(
+            "{:.0}% reserve of the configured {:.0}%, released as the reset nears",
+            kept * 100.0,
+            configured * 100.0
+        ),
+    };
     let move_on = match who {
         Who::Crew | Who::Errand => "new crew and errands on it take the next route in their list",
         Who::FirstMate => {
@@ -1020,11 +1107,11 @@ fn tight(
         }
     };
     Ok(Some(format!(
-        "model route {route} is at {:.0}% of its {} and this route keeps {:.0}% for {}; \
-         {move_on}. Record the wait (note.pin key waiting) and continue once it clears",
-        spent.share * 100.0,
-        spent.what,
-        limit * 100.0,
+        "model route {route} is at {:.0}% of its {} and this route keeps {:.0}% for {} \
+         ({why}); {move_on}. Record the wait (note.pin key waiting) and continue once it clears",
+        reading.share * 100.0,
+        reading.what,
+        (1.0 - kept) * 100.0,
         who.as_str().replace('_', " ")
     )))
 }
@@ -2500,15 +2587,18 @@ mod allowance_tests {
             runs_window_ends_ms: Some(now + HOUR),
             ..Usage::default()
         };
-        let share = spent(&reading, Some(10), now).unwrap();
+        let share = spent(&reading, Some(10), None, now).unwrap();
         assert_eq!(share.share, 0.83);
         assert!(
             share.what.starts_with("weekly window, clears "),
             "{share:?}"
         );
+        assert_eq!(share.reset_ms, Some(now + 7 * HOUR));
+        assert_eq!(share.window_ms, Some(7 * 24 * HOUR));
         // An expired window counts as 0 once its reset time has passed.
-        let expired = spent(&reading, Some(10), now + 8 * HOUR).unwrap();
+        let expired = spent(&reading, Some(10), None, now + 8 * HOUR).unwrap();
         assert_eq!(expired.share, 0.0);
+        assert_eq!(expired.reset_ms, None, "a past reset is not a deadline");
         // A reading with no reset time goes stale after its window length.
         let no_reset = Usage {
             window_utilization: Some(0.7),
@@ -2516,8 +2606,14 @@ mod allowance_tests {
             updated_ms: now,
             ..Usage::default()
         };
-        assert_eq!(spent(&no_reset, None, now + 4 * HOUR).unwrap().share, 0.7);
-        assert_eq!(spent(&no_reset, None, now + 6 * HOUR).unwrap().share, 0.0);
+        assert_eq!(
+            spent(&no_reset, None, None, now + 4 * HOUR).unwrap().share,
+            0.7
+        );
+        assert_eq!(
+            spent(&no_reset, None, None, now + 6 * HOUR).unwrap().share,
+            0.0
+        );
         // The run budget is measured only while its window is open, and only
         // when the captain states one.
         let budgeted = Usage {
@@ -2525,11 +2621,65 @@ mod allowance_tests {
             runs_window_ends_ms: Some(now + HOUR),
             ..Usage::default()
         };
-        assert_eq!(spent(&budgeted, Some(10), now).unwrap().share, 0.8);
-        assert!(spent(&budgeted, None, now).is_none());
-        assert!(spent(&budgeted, Some(10), now + 2 * HOUR).is_none());
+        let budget = spent(&budgeted, Some(10), Some(5 * HOUR), now).unwrap();
+        assert_eq!(budget.share, 0.8);
+        assert_eq!(budget.window_ms, Some(5 * HOUR));
+        assert!(spent(&budgeted, None, None, now).is_none());
+        assert!(spent(&budgeted, Some(10), Some(5 * HOUR), now + 2 * HOUR).is_none());
         // Nothing reported at all is never refused on a share nobody knows.
-        assert!(spent(&Usage::default(), Some(10), now).is_none());
+        assert!(spent(&Usage::default(), Some(10), None, now).is_none());
+    }
+
+    /// The reserve is kept in proportion to the time left in the window,
+    /// reaching zero at the reset and returning to the configured share once
+    /// the reset has passed or when no reset is known.
+    #[test]
+    fn the_reserve_releases_with_the_time_left_and_comes_back_after_the_reset() {
+        let now = Store::now_ms();
+        let window = 7 * 24 * HOUR;
+        let configured = 0.2;
+        // Just after a reset: the whole window is ahead, so the whole reserve.
+        assert_eq!(
+            released(configured, now, Some(now + window), Some(window)),
+            configured
+        );
+        // Mid window: half the time left keeps half the reserve.
+        assert_eq!(
+            released(configured, now, Some(now + window / 2), Some(window)),
+            configured / 2.0
+        );
+        // The final minutes hold almost nothing back.
+        let final_minutes = released(configured, now, Some(now + 5 * 60_000), Some(window));
+        assert!(final_minutes < configured / 100.0, "{final_minutes}");
+        // Past the reset, and with no reset or no window length, the configured
+        // share stands as it did before this release curve existed.
+        assert_eq!(
+            released(configured, now, Some(now - 1), Some(window)),
+            configured
+        );
+        assert_eq!(released(configured, now, None, Some(window)), configured);
+        assert_eq!(
+            released(configured, now, Some(now + window), None),
+            configured
+        );
+        assert_eq!(
+            released(configured, now, Some(now + window), Some(0)),
+            configured
+        );
+
+        let reading = Spent {
+            share: 0.9,
+            what: "weekly window".into(),
+            reset_ms: Some(now + window / 2),
+            window_ms: Some(window),
+        };
+        let mut limits = Limits::default();
+        assert_eq!(
+            reserve_for(&limits, configured, &reading, now),
+            configured / 2.0
+        );
+        limits.release = Release::Fixed;
+        assert_eq!(reserve_for(&limits, configured, &reading, now), configured);
     }
 
     /// A run that reached the provider counts against the budget, whether it
