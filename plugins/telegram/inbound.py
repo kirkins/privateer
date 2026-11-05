@@ -8,9 +8,12 @@ import contextlib
 import json
 import os
 import sqlite3
+import sys
 import time
 
-import tg
+sys.dont_write_bytecode = True
+
+import tg  # noqa: E402
 
 LIMIT = 1000
 RECEIPTS = 5000
