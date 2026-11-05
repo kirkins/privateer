@@ -43,10 +43,20 @@ def probe(root, codex):
                       "XDG_CONFIG_HOME": "config", "XDG_DATA_HOME": "data", "XDG_STATE_HOME": "state",
                       "PRIVATEER_RESOURCE_HOME": "resources"}.items():
         (root / name).mkdir(mode=0o700, exist_ok=True)
+        assert not (root / name).is_symlink() and (root / name).resolve().is_relative_to(root)
         env[key] = str(root / name)
     env["PRIVATEER_FLEET"] = str(root / "fleet.sqlite")
     home, folder = root / "c", root / "alpha"
     folder.mkdir(exist_ok=True)
+    assert not folder.is_symlink() and not (home / "auth.json").exists()
+    # This zero-turn settings fixture neither executes nor trusts hooks. Clear
+    # only its own throwaway project's declarations, including a prior run's.
+    project = folder / ".codex"
+    project.mkdir(mode=0o700, exist_ok=True)
+    assert not project.is_symlink()
+    hooks = project / "hooks.json"
+    assert not hooks.is_symlink()
+    hooks.write_text('{"hooks": {}}')
     subprocess.run(["git", "init", "-q", str(folder)], check=True, env=env)
     for name in ("app-server-control", "app-server-daemon"):
         (home / name).mkdir(mode=0o700, exist_ok=True)
@@ -183,6 +193,10 @@ trust_level = "trusted"
         # fixture: do NOT submit the hosted bearings prompt or trust any hook.
         assert argv[-2] == "--" and "first mate of alpha" in argv[-1]
         argv = argv[:-2]
+        # prepare installs the real stable declaration; retain it as evidence,
+        # but don't let native hook consent block this no-turn settings probe.
+        (root / "prepared-hooks.json").write_bytes(hooks.read_bytes())
+        hooks.write_text('{"hooks": {}}')
         attached = tui("remote_overrides", argv)
         effective = evidence["remote_overrides"]["read"]
         assert effective["model"] == "ship-model" and effective["reasoningEffort"] == "high"
