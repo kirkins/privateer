@@ -510,6 +510,8 @@ pub(crate) fn run_bounded(
     deadline: Instant,
     capture: bool,
 ) -> std::result::Result<String, String> {
+    // `cut_short` only lets a caller tell the two deadlines apart, and this
+    // path reports every timeout as TIMED_OUT, so its value never matters.
     match run_bounded_unmet(command, shown, deadline, false, capture, false) {
         Ok((stdout, _)) => Ok(stdout),
         Err(Unmet::NotStarted(error)) => Err(format!("{shown} could not start: {error}")),
@@ -1204,19 +1206,18 @@ mod tests {
     /// deadline says which deadline it was.
     #[test]
     fn a_probe_that_cannot_start_or_runs_out_of_time_says_which() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let broken = dir.path().join("broken");
-        std::fs::write(&broken, "not an executable format\n").unwrap();
-        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A path that does not exist is ENOENT on every OS; a file that
+        // cannot be executed is not (macOS retries ENOEXEC through /bin/sh).
+        let missing = dir.path().join("missing");
         let path = "/usr/bin:/bin";
         let far = Instant::now() + CHECK_BUDGET;
-        match run_program_unmet(&broken, &[], path, far) {
+        match run_program_unmet(&missing, &[], path, far) {
             // The OS's own error, not a message built and re-parsed.
             Err(Unmet::NotStarted(error)) => {
-                assert!(error.to_string().contains("Exec format error"), "{error}")
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}")
             }
-            other => panic!("a binary that cannot be executed: {other:?}"),
+            other => panic!("a program that cannot be started: {other:?}"),
         }
         // The check's time is the shorter deadline, so it stops the probe.
         let sleep = which_in("sleep", path).expect("sleep is on the test PATH");
