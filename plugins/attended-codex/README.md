@@ -17,8 +17,8 @@ ACT2 adds captain-only controls, each run from the ship folder's own home:
 verified shared daemon (`codex_reserve.py`: `thread/start`, durable UUID,
 `thread/name/set`, exact verification), sets `first_mate.codex_session` and
 relaunches the hosted pane onto `codex resume <UUID>`. A ship with
-`first_mate.options.effort` is refused: Codex keeps neither model nor effort
-from `thread/start` at attach, and effort needs a daemon-excluding `-c`. A saved
+`first_mate.options.effort` was refused in ACT2; **ACT3a** qualifies the narrow
+hosted exact-resume path below instead. A saved
 `verified`/`reserved` UUID is adopted on a retry regardless of the request's
 current session; the re-run zero-turn verification is what bounds re-adoption.
 
@@ -38,6 +38,45 @@ ship's hosted pane and no other control may be running, then edit
 
 This drops only Privateer's duplicate history, not the native threads. Leave the
 JSON valid and the file private; the next reservation then has room.
+
+**ACT3a: per-ship model and effort at attach.** The hosted launch carries
+`first_mate.options.model` as `--model` and effort as
+`-c model_reasoning_effort="VALUE"` (a 1..32-character lowercase word). For effort,
+prepare connects to the home-derived, peer/process-verified shared app-server and
+inserts its own `--remote unix://<verified socket>` into the exact-UUID resume
+argv. Explicit remote avoids Codex 0.166's *implicit* daemon exclusion for `-c`;
+it does not change the provider, permissions, hook trust or global config.
+Prepare records that daemon/socket identity. The trusted callback must see that
+same daemon and read back every explicitly requested model/effort from the loaded
+UUID's `thread/read` before binding. Missing/mismatched settings leave UNBOUND
+and stop the initial turn, rather than infer with defaults. No model/effort
+mutation occurs in the callback or mail runner. Grants, budgets and custody
+poison are unchanged.
+
+Only this adapter-generated endpoint is allowed: caller-supplied `--remote`,
+provider/config overrides (including `web_search`), non-hosted effort, fresh or
+ambiguous/duplicate selectors still refuse. A missing daemon refuses before exec;
+there is no embedded fallback. Unspecified settings keep native defaults. This
+is settings retention qualification, **not** a live hosted-mail/autonomy pilot.
+
+Reproduce with the installed executable (no package copies):
+
+```sh
+python3 -B scripts/codex-effort-spike.py --codex /absolute/path/to/codex \
+  --root /var/tmp/act3a-probe
+```
+
+The one reusable, private root retains `evidence.json` and PTY/daemon logs. The
+fixture starts the installed app-server directly, verifies its peer, attaches a
+zero-turn exact-UUID TUI, tests idle `thread/settings/update`, then attaches with
+the production prepare-generated model/effort/remote flags and reads both back.
+It deliberately strips the bearings prompt (no turn or hook trust is exercised),
+requires zero loopback provider requests, and always waits for owned process exit.
+On CLI/app-server **0.166.0**, `--model ship-model` plus effort `high` read back
+exactly after changing the loaded thread to `updated-model` / `medium`; provider
+remained the fixture provider. Idle settings/update also worked, but is not used
+as a potentially racy first-turn update. `thread/start` config effort alone is
+not relied on across attach. No credentials, real inference or live pane is used.
 
 Explicit opt-in: set `PRIVATEER_CODEX_ATTENDED=1` for a Privateer attended Codex
 launch **with `codex resume <exact UUID>`**. Fresh launches are refused before
@@ -89,7 +128,7 @@ any prior binding and are refused: relaunch explicitly with the desired UUID.
 Compact callbacks must match both the launch UUID and its previous binding.
 
 Prepare-time refusals (including unsupported argv, missing context, unsafe local
-state and effort/web-search `-c` overrides that exclude the daemon) **refuse the
+state and unqualified `-c` overrides that exclude the daemon) **refuse the
 opted-in launch**, with a diagnostic. They do not merely disable mail while
 letting the TUI launch. Callback-time failures instead leave the running pane
 UNBOUND and mail disabled. Invalidation is persisted before daemon connection,

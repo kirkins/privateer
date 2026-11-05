@@ -43,6 +43,7 @@ class FakeDaemon:
     identity = {"bootId": "alpha", "startTicks": 1}
     target = Path("/alpha/socket")
     rendezvous = Path("/alpha/rendezvous")
+    socket_identity = (7, 9)
 
     def __init__(self, record, event):
         session = event["session_id"]
@@ -156,6 +157,71 @@ class BindingTests(unittest.TestCase):
                 binding.plan(["codex", *args], self.cwd)
         self.assertEqual(binding.plan(["codex", "-c", "features.hooks=true"], self.cwd), (None, False))
         self.assertEqual(binding.plan(["codex", "-c", "tui.fullscreen_transcript=true"], self.cwd), (None, False))
+
+    def test_effort_uses_only_a_verified_daemon_and_reads_both_settings_back(self):
+        self.record["process_identity"]["bootId"] = "stale"
+        binding.atomic(self.registry, self.record)
+        argv = [*self.argv, "--model", "ship-model", "-c", 'model_reasoning_effort="high"']
+        with patch.object(binding, "Daemon", return_value=self.daemon):
+            planned = binding.prepare(argv, self.env)
+        self.assertEqual(planned[1:3], ["resume", self.session])
+        self.assertEqual(planned[3:5], ["--remote", "unix:///alpha/socket"])
+        record = codex_socket.load(self.registry)
+        self.assertEqual(record["requested_settings"], {"model": "ship-model", "effort": "high"})
+        self.assertEqual(record["attach_daemon"], binding.daemon_proof(self.daemon))
+        thread = self.daemon.responses["thread/read"]["thread"]
+        thread.update(model="ship-model", reasoningEffort="high")
+        with patch.object(binding, "Daemon", return_value=self.daemon), \
+                patch.object(binding, "control", side_effect=[
+                    {"attended": True, "lease": {"holder": "host:alpha"}}, {"recorded": True}]):
+            result = binding.bind(self.registry, self.event)
+        self.assertEqual(result["settings"], record["requested_settings"])
+        self.assertEqual(codex_socket.load(self.registry)["state"], "bound")
+        for field, bad in [("model", "wrong-model"), ("reasoningEffort", "low"), ("reasoningEffort", None)]:
+            with self.subTest(field=field, bad=bad):
+                thread.update(model="ship-model", reasoningEffort="high")
+                thread[field] = bad
+                with patch.object(binding, "Daemon", return_value=self.daemon), \
+                        patch.object(binding, "control") as report, \
+                        self.assertRaises(binding.SettingsError):
+                    binding.bind(self.registry, self.event)
+                report.assert_not_called()
+                saved = codex_socket.load(self.registry)
+                self.assertEqual(saved["state"], "unbound")
+                self.assertFalse(saved["delivery_enabled"])
+        thread.update(model="ship-model", reasoningEffort="high")
+        for key, value in [("pid", 99), ("socket_identity", [7, 10])]:
+            changed = copy.deepcopy(record)
+            changed["attach_daemon"][key] = value
+            with self.assertRaisesRegex(binding.SettingsError, "daemon changed"):
+                binding.validate(changed, self.event, self.daemon)
+
+    def test_unproven_effort_paths_refuse_before_prepare_modifies_state(self):
+        argv = [*self.argv, "-c", 'model_reasoning_effort="high"']
+        before = self.registry.read_bytes()
+        with patch.object(binding, "Daemon", side_effect=ValueError("daemon unavailable")), \
+                self.assertRaisesRegex(ValueError, "unavailable"):
+            binding.prepare(argv, self.env)
+        self.assertEqual(self.registry.read_bytes(), before)
+        with self.assertRaisesRegex(ValueError, "hosted exact-UUID"):
+            binding.prepare(argv, {**self.env, "PRIVATEER_HOSTED": "0"})
+        for extra in [["--remote", "unix:///other"], ["-c", 'web_search="disabled"'],
+                      ["-c", 'model_reasoning_effort="low"'], ["-c", 'model_provider="other"']]:
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                binding.plan([*argv, *extra], self.cwd)
+        for value in ['"high low"', '"high"\\nmodel_provider="other"', 'true', '""']:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                binding.plan([*self.argv, "-c", "model_reasoning_effort=" + value], self.cwd)
+
+    def test_settings_mismatch_hook_stops_the_initial_turn(self):
+        with patch.object(binding.sys, "argv", ["hook", "--registry", str(self.registry)]), \
+                patch.object(binding, "bind", side_effect=binding.SettingsError("settings mismatch")), \
+                patch.object(binding.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b"{}"))), \
+                patch.object(binding.sys, "stdout", new_callable=io.StringIO) as output:
+            binding.main()
+        result = json.loads(output.getvalue())
+        self.assertFalse(result["continue"])
+        self.assertIn("settings mismatch", result["stopReason"])
 
     def test_resume_is_exact_and_prompt_is_not_parsed_as_flags(self):
         session = str(uuid.uuid4())

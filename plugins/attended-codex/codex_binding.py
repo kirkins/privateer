@@ -407,7 +407,20 @@ def live(record):
         return False
 
 
-def plan(argv, cwd):
+def effort_word(value):
+    return isinstance(value, str) and 1 <= len(value) <= 32 and all('a' <= c <= 'z' for c in value)
+
+
+class SettingsError(ValueError):
+    """Stop the initial turn rather than run with unverified requested settings."""
+
+
+def daemon_proof(daemon):
+    return {"pid": daemon.pid, "identity": daemon.identity, "socket": str(daemon.target),
+            "rendezvous": str(daemon.rendezvous), "socket_identity": list(daemon.socket_identity)}
+
+
+def parse_plan(argv, cwd):
     """A deliberately narrow attended argv grammar; unknown plans fail closed."""
     value_flags = {"-C", "--cd", "--sandbox", "-s", "--add-dir", "--model", "-m",
                    "--ask-for-approval", "-a", "--enable", "--disable"}
@@ -415,6 +428,7 @@ def plan(argv, cwd):
     args = argv[1:]
     positional = []
     resume = False
+    settings = {}
     i = 0
     while i < len(args):
         arg = args[i]
@@ -427,15 +441,25 @@ def plan(argv, cwd):
             i += 1
             if i >= len(args):
                 raise ValueError("missing Codex config override")
-            key = args[i].split("=", 1)[0]
-            if not (key.startswith("features.") or key == "tui.fullscreen_transcript"):
-                raise ValueError("Codex -c override excludes the shared daemon (including effort/web_search)")
+            key, separator, value = args[i].partition("=")
+            if key == "model_reasoning_effort" and separator:
+                if value.startswith('"'):
+                    value = json.loads(value)
+                if not effort_word(value) or "effort" in settings:
+                    raise ValueError("invalid or duplicate Codex effort override")
+                settings["effort"] = value
+            elif not (key.startswith("features.") or key == "tui.fullscreen_transcript"):
+                raise ValueError("Codex -c override excludes the shared daemon (including web_search)")
         elif arg in value_flags:
             i += 1
             if i >= len(args):
                 raise ValueError("missing Codex option value")
             if arg in ("-C", "--cd") and Path(args[i]).resolve() != cwd:
                 raise ValueError("Codex binding cwd override refused")
+            if arg in ("--model", "-m"):
+                if not args[i] or "model" in settings:
+                    raise ValueError("invalid or duplicate Codex model override")
+                settings["model"] = args[i]
         elif arg in bare_flags:
             pass
         elif arg.startswith("-"):
@@ -450,7 +474,13 @@ def plan(argv, cwd):
         session = str(uuid.UUID(positional.pop(0)))
     if len(positional) > 1:
         raise ValueError("ambiguous Codex positional prompt")
-    return session, bool(positional)
+    if "effort" in settings and session is None:
+        raise ValueError("Codex effort requires hosted exact-UUID resume over a verified remote daemon")
+    return session, bool(positional), settings
+
+
+def plan(argv, cwd):
+    return parse_plan(argv, cwd)[:2]
 
 
 def prepare(argv, env):
@@ -461,7 +491,9 @@ def prepare(argv, env):
     if env.get("PRIVATEER_ROLE") != "agent":
         raise ValueError("Codex binding requires the first-mate launch context")
     cwd = Path.cwd().resolve()
-    session, prompt = plan(argv, cwd)
+    session, prompt, settings = parse_plan(argv, cwd)
+    if "effort" in settings and env.get("PRIVATEER_HOSTED") != "1":
+        raise ValueError("Codex effort requires hosted exact-UUID resume over a verified remote daemon")
     if session is None:
         raise ValueError("Codex attended binding requires explicit codex resume <UUID>; fresh pane identity is unproven")
     for key in ("PRIVATEER_HOME", "PRIVATEER_CONTROL_CLI", "PRIVATEER_ACTOR", "PRIVATEER_PRESENCE_HOLDER"):
@@ -472,6 +504,14 @@ def prepare(argv, env):
     if not control.is_absolute():
         raise ValueError("Codex binding control CLI must be absolute")
     codex_home = Path(env.get("CODEX_HOME", str(Path(env["HOME"]) / ".codex"))).resolve(strict=True)
+    # Only our own peer-verified endpoint may bypass Codex's implicit-daemon
+    # -c exclusion. Caller-supplied --remote/config/provider flags still refuse.
+    attach_daemon = None
+    planned = list(argv)
+    if "effort" in settings:
+        with Daemon(codex_home) as daemon:
+            attach_daemon = daemon_proof(daemon)
+        planned[3:3] = ["--remote", "unix://" + attach_daemon["socket"]]
     check_system_python()
     project = cwd / ".codex"
     project.mkdir(mode=0o700, exist_ok=True)
@@ -490,7 +530,6 @@ def prepare(argv, env):
         if not any(h.get("command") == command for group in groups for h in group["hooks"]):
             groups.append({"hooks": [{"type": "command", "command": command, "timeout": 10}]})
         atomic(hook_path, hooks)
-        planned = list(argv)
         if env.get("PRIVATEER_HOSTED") == "1" and not prompt:
             if "--" not in planned:
                 planned.append("--")
@@ -504,6 +543,7 @@ def prepare(argv, env):
                   "control": str(control), "hosted": env.get("PRIVATEER_HOSTED") == "1",
                   "path_env": {key: env[key] for key in PATH_ENV if key in env},
                   "argv": planned, "hook_command": command,
+                  "requested_settings": settings, "attach_daemon": attach_daemon,
                   "handler": str(Path(__file__).resolve()), "state": "unbound",
                   "experimental": True, "delivery_enabled": False}
         # Fence stale in-memory snapshots even if registry replacement fails.
@@ -573,6 +613,8 @@ def validate(record, event, daemon):
         raise ValueError("Codex resume UUID does not match launch")
     if event["source"] == "compact" and session != record.get("binding", record.get("last_binding", {})).get("session"):
         raise ValueError("Codex compact callback has no matching binding")
+    if record.get("attach_daemon") is not None and record["attach_daemon"] != daemon_proof(daemon):
+        raise SettingsError("Codex attach daemon changed; requested settings are unverified")
     loaded = daemon.call("thread/loaded/list", {"limit": 32})
     if (not isinstance(loaded.get("data"), list) or "nextCursor" not in loaded
             or session not in loaded["data"] or loaded["nextCursor"] or len(loaded["data"]) > 32):
@@ -586,6 +628,10 @@ def validate(record, event, daemon):
             or thread["cwd"] != record["cwd"] or thread.get("ephemeral")
             or thread.get("path") != event.get("transcript_path")):
         raise ValueError("Codex native session metadata mismatch")
+    settings = record.get("requested_settings", {})
+    for key, field in (("model", "model"), ("effort", "reasoningEffort")):
+        if key in settings and thread.get(field) != settings[key]:
+            raise SettingsError("Codex attached " + key + " does not match the requested setting")
     transcript = Path(event["transcript_path"])
     if not transcript.is_relative_to(Path(record["codex_home"]) / "sessions") or transcript.resolve() != transcript:
         raise ValueError("Codex transcript provenance mismatch")
@@ -613,7 +659,9 @@ def validate(record, event, daemon):
     return {"session": session, "transcript": str(transcript), "history_mode": thread.get("historyMode"),
             "daemon_pid": daemon.pid, "daemon_identity": daemon.identity, "socket": str(daemon.target),
             "rendezvous": str(daemon.rendezvous), "metadata_source": "daemon_thread_read",
-            "transcript_identity": transcript_identity}
+            "transcript_identity": transcript_identity,
+            "settings": {key: thread.get(field) for key, field in
+                         (("model", "model"), ("effort", "reasoningEffort")) if key in settings}}
 
 
 def bind(registry, event, context=None):
@@ -667,8 +715,11 @@ def main():
         print("{}")
     except Exception as error:
         # Only our local validation diagnostics, never daemon/provider values.
-        reason = str(error)[:200] if type(error) in (ValueError, TimeoutError) else type(error).__name__
-        print(json.dumps({"systemMessage": "Privateer Codex binding UNBOUND (" + reason + "): inspect the launch, trusted project hook, presence and shared daemon; automatic mail remains disabled."}))
+        reason = str(error)[:200] if isinstance(error, (ValueError, TimeoutError)) else type(error).__name__
+        result = {"systemMessage": "Privateer Codex binding UNBOUND (" + reason + "): inspect the launch, trusted project hook, presence and shared daemon; automatic mail remains disabled."}
+        if isinstance(error, SettingsError):
+            result.update({"continue": False, "stopReason": reason})
+        print(json.dumps(result))
 
 
 if __name__ == "__main__":

@@ -1875,9 +1875,6 @@ fn launch_plan(
         && hosted
         && profile["first_mate"]["codex_session"].is_string()
         && let Some(effort) = crate::host::codex_delivery::effort(options)?
-        && !passthrough
-            .iter()
-            .any(|a| a.starts_with("model_reasoning_effort="))
     {
         route.extend([
             "-c".to_owned(),
@@ -2616,6 +2613,37 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_hosted_exact_resume_carries_model_and_effort() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&temp.path().join(".privateer")).unwrap();
+        let profile = json!({"first_mate": {"manifest": "bundled:codex",
+            "codex_session": "0b5c3b1e-7f6a-4d43-9a57-8e0d1b2c3d4e",
+            "options": {"model": "ship-model", "effort": "high"}}});
+        let launch = launch_plan(&store, &profile, None, &[], true).unwrap();
+        assert_eq!(
+            launch.route,
+            [
+                "--model",
+                "ship-model",
+                "-c",
+                "model_reasoning_effort=\"high\""
+            ]
+        );
+        // Not a general Codex -c override: only hosted exact-session launches.
+        let manual = launch_plan(&store, &profile, None, &[], false).unwrap();
+        assert_eq!(manual.route, ["--model", "ship-model"]);
+        let mut fresh = profile.clone();
+        fresh["first_mate"]["codex_session"] = Value::Null;
+        assert_eq!(
+            launch_plan(&store, &fresh, None, &[], true).unwrap().route,
+            manual.route
+        );
+        let mut invalid = profile;
+        invalid["first_mate"]["options"]["effort"] = json!("high\"\nmodel_provider=\"other");
+        assert!(launch_plan(&store, &invalid, None, &[], true).is_err());
+    }
 
     /// A `plugins/` above the checkout is never taken, whether or not the
     /// checkout has its own; a package's own `plugins` and a prefix's
