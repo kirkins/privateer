@@ -475,21 +475,18 @@ fn probe(
             .collect();
             match crate::capabilities::run_program_unmet(program, &args, path, deadline) {
                 Ok(()) => {}
-                Err(crate::capabilities::Unmet::TimedOut) => {
+                Err(crate::capabilities::Unmet::TimedOut { cut_short }) => {
                     outcome.ok = false;
+                    // Say whether the check's own time or the probe's ran out.
                     outcome.why = Some(format!(
-                        "bubblewrap (bwrap) at {} could not be checked: bwrap probe timed out",
-                        program.display()
+                        "bubblewrap (bwrap) at {} could not be checked: {}",
+                        program.display(),
+                        crate::capabilities::timeout_reason(cut_short)
                     ));
                 }
-                Err(crate::capabilities::Unmet::NotStarted(why)) => {
+                Err(crate::capabilities::Unmet::NotStarted(error)) => {
                     outcome.ok = false;
-                    // The runner names the program; say what to do about it.
-                    let why = why
-                        .split_once("could not start: ")
-                        .map(|(_, reason)| reason.to_owned())
-                        .unwrap_or(why);
-                    outcome.why = Some(format!("could not run bwrap: {why}"));
+                    outcome.why = Some(format!("could not run bwrap: {error}"));
                 }
                 Err(crate::capabilities::Unmet::Failed { why, stderr }) => {
                     outcome.ok = false;
@@ -2045,8 +2042,9 @@ mod tests {
             "{item}"
         );
 
-        // A probe the check stopped is a timeout, not a denial. The probe's
-        // PATH holds only the test's own tools, so spin on the shell itself.
+        // A probe the check's own time stopped is cut short, not timed out:
+        // with its full time it may pass. The probe's PATH holds only the
+        // test's own tools, so spin on the shell itself.
         m.tool("bwrap", "while :; do :; done");
         let outcome = probe(
             &bwrap_need(),
@@ -2057,7 +2055,35 @@ mod tests {
         );
         assert!(!outcome.ok);
         let why = outcome.why.unwrap();
-        assert!(why.contains("bwrap probe timed out"), "{why}");
+        assert!(
+            why.contains("could not be checked: probe not finished within the check's time"),
+            "{why}"
+        );
+        assert!(!why.contains("timed out"), "{why}");
+        assert!(!why.contains("AppArmor"), "{why}");
+
+        // A probe that outlives its own five seconds says that instead, with
+        // its deadline far enough off that only its own timeout can stop it.
+        // `exec` by absolute path: the probe's PATH holds only the test's
+        // tools.
+        m.tool("bwrap", "exec /bin/sleep 30");
+        let outcome = probe(
+            &bwrap_need(),
+            &m.bin.join("bwrap"),
+            &m.path(),
+            Instant::now() + Duration::from_secs(30),
+            None,
+        );
+        assert!(!outcome.ok);
+        let why = outcome.why.unwrap();
+        assert!(
+            why.contains("could not be checked: probe timed out"),
+            "{why}"
+        );
+        assert!(
+            !why.contains("the check's time"),
+            "the probe's own timeout, not the check's: {why}"
+        );
         assert!(!why.contains("AppArmor"), "{why}");
 
         // A binary that cannot be executed says that, too.
@@ -2074,6 +2100,7 @@ mod tests {
         assert!(!outcome.ok);
         let why = outcome.why.unwrap();
         assert!(why.starts_with("could not run bwrap: "), "{why}");
+        assert!(why.contains("Exec format error"), "{why}");
         assert!(!why.contains("AppArmor"), "{why}");
 
         m.tool("bwrap", "exit 0");
