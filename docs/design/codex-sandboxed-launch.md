@@ -1,6 +1,6 @@
 # Design: sandboxed callers launch through the dispatcher
 
-Status (2026-11-05): contract only, for review. Task `privateer-codex-sandbox-launch-736`, issue #736 (part of #649). This replaces the sketch in part (b) of [sandboxed callers](codex-sandboxed-callers.md) and builds on its part (a), caller identity from kernel ancestry. Read it with [the crew role](crew-role.md).
+Status (2026-11-05): approved by the first mate with conditions A to C below, and implemented (`src/launch.rs`, `src/launch/identify.rs`). Task `privateer-codex-sandbox-launch-736`, issue #736 (part of #649). This replaces the sketch in part (b) of [sandboxed callers](codex-sandboxed-callers.md) and builds on its part (a), caller identity from kernel ancestry. Read it with [the crew role](crew-role.md).
 
 ## Problem
 
@@ -57,8 +57,9 @@ CREATE TABLE IF NOT EXISTS launch_requests(
   id TEXT PRIMARY KEY,          -- a fresh UUID
   command TEXT NOT NULL,
   args TEXT NOT NULL,           -- JSON, with ids filled in (below)
-  requester TEXT NOT NULL,      -- JSON {pid, started, pid_namespace, uid}, as the requester sees itself
-  claimed TEXT NOT NULL,        -- JSON {role, actor, env_job, sandbox:"pid_namespace"|"seatbelt"|"forced"}
+  requester TEXT NOT NULL,      -- JSON {pid, started, pid_namespace}, as the requester sees itself
+  claimed TEXT NOT NULL,        -- JSON {role, actor, env_job, fleet, sandbox:"pid_namespace"|"seatbelt"|"forced"}
+  cwd TEXT,                     -- the requester's working directory
   state TEXT NOT NULL,          -- recorded|pending|claimed|done|failed|refused|expired
   created_ms INTEGER NOT NULL,
   deadline_ms INTEGER NOT NULL, -- created_ms + the claim window
@@ -66,10 +67,12 @@ CREATE TABLE IF NOT EXISTS launch_requests(
   resolved TEXT,                -- JSON {actor|operator, job, crew}: what the launcher proved
   outcome TEXT,                 -- the command's answer, verbatim (done)
   error TEXT,                   -- the command's error or the refusal text (failed|refused|expired)
-  claimed_ms INTEGER, finished_ms INTEGER);
+  claimed_ms INTEGER, heartbeat_ms INTEGER, finished_ms INTEGER);
 ```
 
-- `requester.started` is the format `jobs::identity` records: `linux:BOOT:TICKS` on Linux. On macOS it is the `lstart` string the kernel walk formats. The probe for this contract (Arch Linux, bwrap `--unshare-user --unshare-pid --proc /proc`) showed that the start ticks and the boot id read inside the sandbox equal those read from outside for the same process.
+- The table is created by the first request or the dispatcher's launcher thread, not by every store open, so homes that never forward pay nothing for it.
+- **No environment is stored.** The launcher reads the requester's environment from the kernel at the claim (`/proc/P/environ`; on macOS the environment strings `kern.procargs2` returns after argv), so no secret in it is written to disk.
+- `requester.started` is the format `jobs::identity` records: `linux:BOOT:TICKS` on Linux. On macOS it is the `lstart` string the kernel walk formats, read with `sysctl kern.proc.pid` because `ps` is denied in the sandbox. The probe for this contract (Arch Linux, bwrap `--unshare-user --unshare-pid --proc /proc`) showed that the start ticks and the boot id read inside the sandbox equal those read from outside for the same process.
 - `claimed` is what a direct call would have taken from the environment and flags (`PRIVATEER_ROLE`, `PRIVATEER_ACTOR`, `PRIVATEER_JOB`). It is input to the same resolution rule, never a result.
 - **Ids are filled in before the row is written.** `job.start` and `agent.start` get an `id`, and `job.retry` gets a `new_id`, when the caller gave none. A direct call would draw the same kind of UUID. The ids then exist before the launch, so an outcome the waiter could not read (below) can still be found with `job.status`. A repeated id replays the existing job, as it does today.
 - **Bounds.** At most 16 rows per home in `recorded`, `pending` or `claimed`. A further request is refused ("too many launch requests are in flight"). The dispatcher deletes finished rows older than 7 days, and keeps at most 1,000.
@@ -88,19 +91,22 @@ CREATE TABLE IF NOT EXISTS launch_requests(
       - macOS: the same PID. The launcher is outside the sandbox and sees the same PIDs.
    4. **Check that it is the process that wrote this row.**
       - Its start identity equals `requester.started` and it is not a zombie or exiting.
-      - Its real uid is the launcher's.
+      - Its real uid is the launcher's (`/proc/P/status`; on macOS `proc_pidinfo(PROC_PIDTBSDINFO)`).
       - Its argv after `argv[0]` is exactly `--home H _launch-wait ID` for this home and this row. On Linux this comes from `/proc/P/cmdline`. On macOS it comes from `kern.procargs2`, which an unsandboxed process can read for any process of its own user. Another user's argv is hidden, so the check fails and the uid rule holds there too.
+      - The start identity is checked again after these reads.
       - Any mismatch, or a requester that has gone, marks the row `refused` with the reason. Nothing is started.
-   5. **Resolve the caller from outside** with the code a direct call uses: `crew_scope::resolve_from(pid, Some(H), claimed_caller, claimed_env_job)`. This is today's `resolve`, starting its walk at the requester's PID instead of `std::process::id()`:
+   5. **Take on the requester's world.** The launcher replaces its own environment with the requester's, less `CODEX_SANDBOX`, `CODEX_SANDBOX_NETWORK_DISABLED` and `PRIVATEER_LAUNCH_VIA`, which describe the requester's sandbox and not the work's. It moves to the requester's working directory and, if the requester named one with `--fleet`, its registry. The command then sees what a direct call from the requester would see: `HOME`, `PATH`, `PRIVATEER_FLEET`, `PRIVATEER_RESOURCE_HOME` and the rest. The supervisor it spawns, and so the job, inherits that environment as a direct start's would (condition B).
+   6. **Resolve the caller from outside** with the code a direct call uses: `crew_scope::resolve_from(pid, Some(H), claimed_caller, claimed_env_job)`. This is today's `resolve`, starting its walk at the requester's PID instead of `std::process::id()`:
       - The Linux `/proc` walk gains a starting PID.
       - The macOS `ancestry::walk` already takes one, and from outside every same-user argv is visible.
       - The walk now crosses the sandbox boundary. On Linux it reaches bwrap, Codex and then the wake's or crew's `_job-supervise`, which the sandboxed CLI could never see.
 
       The result is the same as a direct call would get: crew, first mate or captain's job, with the same role-drop and borrowed-job refusals. The refusals are audited and noticed as today. The launcher sets the process's resolved job and crew (`RESOLVED`) from this. So `started_by`, `crew_scope::job_id()`, `Store::crew()`, `crew::may_park` and `activation::mark_contact` see the requester, not the dispatcher. `_launch-run` never resolves its own ancestry: it is under the dispatcher, which is the operator.
-   6. **Refuse what a sandbox must keep contained.** If the proven job is a review errand (`review::is_review_errand`) or a read-only launch (`codex_read_only_crew`, or launch options `sandbox: "read-only"`), the row is `refused`. Those jobs keep their containment. A Codex read-only sandbox cannot write the home at all, so it cannot even write the row; this check is defence in depth.
-   7. **Run.** Open the store as the resolved caller and run `crate::dispatch(store, command, args)`. That repeats `check_dispatch` and `crew_scope::check` as the authority. It then runs charter authorization, admission (capacity, `heavy`, `wait_for_capacity`, `max_wait_secs`, the disk floor, routes) and the transactional start in `admit_and_launch`, unchanged. The supervisor is spawned from the launcher: in the dispatcher's namespace, outside any sandbox, detached with `setsid` as today. Audit `launch.forwarded` with the row id, command, requester and resolved caller.
-   8. **Record the result.** On success, `outcome` is the answer and the state is `done`. On error, the state is `failed` and `error` is the command's `{error:#}`. This is a second write after the command's own transactions commit. It is not in the same transaction as the job. The pre-filled ids cover the gap.
-6. **Answer (sandbox).** Once the row is claimed, the waiter waits for its outcome with no deadline of its own. The command's own bounds (`max_wait_secs`, admission) apply, as they do to a direct call that blocks. It prints `outcome` verbatim, or prints `error` the way `main` prints an error and exits nonzero. So `job.start` returns the same job record, `park` hint included. `errand.start` and `review.start` return their usual shapes, and a refusal reads as it does directly. Each poll also checks that the launcher's recorded identity is still alive. A launcher gone without a result ends the wait with an error naming the request and the pre-filled ids: "the dispatcher's launcher stopped before recording the outcome of request ID. Job J may have started: read it with job.status."
+   7. **Refuse what a sandbox must keep contained.** This judges the **caller**, never the work it asks for. If the requester's own proven job (or its crew's spawn job) is itself a review errand (`review::is_review_errand`) or a read-only launch (`codex_read_only_crew`, or launch options `sandbox: "read-only"`), the row is `refused`: those jobs keep their containment. A first mate that **starts** a review errand (`errand.start` with `review`, or `review.start`) is forwarded and carried out like any other errand. That is the case #736 began with, a required review a sandboxed first mate could not start. A Codex read-only sandbox cannot write the home at all, so it cannot even write the row; this check is defence in depth.
+   8. **Run.** Open the store as the resolved caller and run `crate::dispatch(store, command, args)`. That repeats `check_dispatch` and `crew_scope::check` as the authority. It then runs charter authorization, admission (capacity, `heavy`, `wait_for_capacity`, `max_wait_secs`, the disk floor, routes) and the transactional start in `admit_and_launch`, unchanged. The supervisor is spawned from the launcher: in the dispatcher's namespace, outside any sandbox, detached with `setsid` as today. Audit `launch.forwarded` with the row id, command, requester and resolved caller.
+   9. While the command runs, a thread marks `heartbeat_ms` every 2 s.
+   10. **Record the result.** On success, `outcome` is the answer and the state is `done`. On error, the state is `failed` and `error` is the command's error as `main` prints it. This is a second write after the command's own transactions commit. It is not in the same transaction as the job. The pre-filled ids cover the gap.
+6. **Answer (sandbox).** Once the row is claimed, the waiter waits for its outcome with no deadline of its own. The command's own bounds (`max_wait_secs`, admission) apply, as they do to a direct call that blocks. It prints `outcome` verbatim, or prints `error` the way `main` prints an error and exits nonzero. So `job.start` returns the same job record, `park` hint included. `errand.start` and `review.start` return their usual shapes, and a refusal reads as it does directly. A waiter in another PID namespace cannot check the launcher's pid, so it reads the heartbeat instead. No mark for 15 s ends the wait with an error naming the request and the pre-filled ids. It leaves the row alone: the dispatcher, which can see the launcher, marks the row `failed` once the launcher is gone. The error reads: "the dispatcher's launcher for request ID stopped before recording the outcome of job.start. job J may have started: read it with job.status. Check before retrying."
 
 The waiter is not needed after the claim. If Codex kills it (a tool timeout), the launch goes on and the row keeps the result. `launch.status {"id"}` returns a row's state, `outcome` and `error`. It is open to the requester's resolved caller, and to a crew for its own requests. The crew allowlist in `crew_scope::check` gains it.
 
@@ -109,6 +115,7 @@ The waiter is not needed after the claim. If Codex kills it (a tool timeout), th
 - **Stale.** A row is claimable only in `pending` and before `deadline_ms`. Past the deadline the dispatcher or the waiter moves it to `expired`. It is never launched late.
 - **Requester gone.** The requester's liveness, start and argv are part of the proof, checked at the claim. A gone requester gives `refused`. That is why a bounded wait ends in a refusal and not in "queued; the dispatcher starts it": a request whose requester has left can no longer be proved, so promising to launch it later would be false.
 - **No dispatcher.** If the serve lock is not held, the refusal is immediate. If the dispatcher is running but does not claim within 30 s, the refusal comes at the end of the window. In both cases nothing was started, and the text says so (see (e)).
+- **A launcher that cannot start.** If launchers started for a `pending` row keep ending without claiming it, the dispatcher fails the row after 3 attempts. It does not keep starting launchers until the window ends.
 - **Dispatcher restart.** Launchers are detached, so a restart neither kills nor repeats them. The new dispatcher claims `pending` rows that are still within their window. A `claimed` row whose launcher is gone and that has no result is marked `failed` with the "stopped before recording" text above. It is never run again. A job it may have started is found by its pre-filled id, and its own supervisor and the reconciliation settle it as usual.
 - **Idempotency.** The claim compare and set makes each row run at most once. A caller that retries the CLI call makes a new request. With the same explicit `id`, that request replays the existing job (`prepare_start`'s `Replay`, `agent_replay`). Without one it is a second launch, exactly as a repeated direct call is.
 
@@ -134,10 +141,10 @@ The waiter is not needed after the claim. If Codex kills it (a tool timeout), th
 | A crew runs `_launch-wait` on another process's request | its identity is not the requester's: the waiter refuses and changes nothing |
 | PID reuse, or a requester that exits and is replaced | the start identity differs: `refused` |
 | Replaying a finished row | only `pending` rows are claimed |
-| A read-only crew or a reviewer tries to escape its sandbox through a launch | it cannot write the row. If it could, step 5.6 refuses it |
+| A read-only crew or a reviewer tries to escape its sandbox through a launch | it cannot write the row. If it could, step 5.7 refuses it |
 | A crew double-forks out of its tree, then makes a request | as today on both platforms, a residual of [the crew role](crew-role.md). This path does not make it easier |
 
-**Deliberate consequence.** Work a sandboxed first mate starts runs outside its sandbox. That is the purpose of #736: Privateer's charter, not Codex's shell sandbox, is the authority for supervised work. An unsandboxed first mate gets the same today. The model's own shell commands stay sandboxed, and only charter-authorized `job.start` commands and launches leave it. Read-only sandboxes stay contained (step 5.6). Production deployment is never forwarded.
+**Deliberate consequence.** Work a sandboxed first mate starts runs outside its sandbox. Work a `workspace-write` first mate starts runs outside its sandbox under the normal crew rules, as it did before Codex, and the charter stays the authority. That is the purpose of #736: Privateer's charter, not Codex's shell sandbox, is the authority for supervised work. An unsandboxed first mate gets the same today. The model's own shell commands stay sandboxed, and only charter-authorized `job.start` commands and launches leave it. Read-only sandboxes stay contained (step 5.7). Production deployment is never forwarded.
 
 Under one OS account this remains a workflow control, not a security boundary, as the crew role states.
 
@@ -156,12 +163,12 @@ The park's resume, a crew's relaunch and the dispatcher's own launches already r
 
 ## (e) Refusal text
 
-Every refusal this path adds names a sandbox limit. None says "permission" as a Privateer grant, and none points at `permissions.blocked` or any grant, because no Privateer permission would lift it. A tested assertion checks this. Refusals that come from the command itself (charter, crew scope, admission) pass through word for word, as a direct call gives them.
+Every refusal this path adds names a sandbox limit. A refusal that started nothing says so, and says that retrying the same command is safe. None says "permission" as a Privateer grant, and none points at `permissions.blocked` or any grant, because no Privateer permission would lift it. A tested assertion checks this. Refusals that come from the command itself (charter, crew scope, admission) pass through word for word, as a direct call gives them.
 
-- No dispatcher: "job.start was not started: this caller runs inside a sandbox (another PID namespace than the home's dispatcher), so the home's dispatcher starts its work, and no dispatcher is running for H. Nothing was started. This is a limit of the sandbox, not a missing Privateer permission: start the dispatcher (`privateer service start`) or run the command outside the sandbox." On macOS the parenthesis reads "a macOS sandbox".
+- No dispatcher: "job.start was not started: this caller runs inside a sandbox (another PID namespace than the home's dispatcher), so the home's dispatcher starts its work, and no dispatcher is running for H. No work was started, so retrying the same command is safe. This is a limit of the sandbox, not a missing Privateer permission: start the dispatcher (privateer service start) or run the command outside the sandbox." On macOS the sandbox reads "a macOS sandbox".
 - Not claimed in time: the same, with "no dispatcher took the request within 30 s" in place of "no dispatcher is running".
-- Requester not proved: "the dispatcher could not confirm the requesting process from outside its sandbox (REASON). Nothing was started. This is a limit of the sandbox, not a missing Privateer permission: run the command outside the sandbox."
-- Contained sandbox: "job J runs read-only (a review errand | a read-only crew), and its sandbox stays closed: Privateer does not start work outside it. This is a limit of that job's sandbox, not a missing Privateer permission."
+- Requester not proved: "job.start was not started: the dispatcher could not confirm the requesting process from outside its sandbox (REASON). No work was started, so retrying the same command is safe. This is a limit of the sandbox, not a missing Privateer permission: run the command outside the sandbox."
+- Contained sandbox: "job.start was not started: job J runs read-only (or: as a read-only review errand), and its sandbox stays closed: Privateer does not start work outside it. This is a limit of that job's sandbox, not a missing Privateer permission."
 - Over `rpc`, and the commands that stay refused in a PID sandbox (`ensure_dispatcher_namespace`'s new text): "this caller is in another PID namespace than the home's dispatcher (a sandbox such as Codex's), and COMMAND cannot be carried out from inside it. This is a limit of the sandbox, not a missing Privateer permission: run it outside the sandbox." For `rpc` this adds "or through the privateer CLI, which hands launches to the dispatcher."
 
 ## (f) Qualification
@@ -175,22 +182,24 @@ The captain's requirement, as a test that runs on CI on each OS (`tests/sandboxe
 - A resident `serve` for the home, started outside the sandbox. At teardown it is stopped by identity, never by killing a wrapper.
 
 The first mate's commands run inside the sandbox wrapper, as agent `harbor`, through a script that mimics a native Codex first mate's shell:
-- **Linux:** `bwrap --unshare-user --unshare-pid --new-session --die-with-parent --ro-bind / / --dev /dev --proc /proc`, with the home, the ledger directory and a scratch directory bound writable. This reproduces the property #736 is about: a separate PID namespace with its own `/proc`. The implementation pins the exact Codex bwrap flag set it copies, with the openai/codex revision it was read from. CI installs `bubblewrap`. On Ubuntu runners it may also need `kernel.apparmor_restrict_unprivileged_userns=0`, a CI-only step. With `PRIVATEER_SANDBOX_QUALIFICATION=1` (set in CI) a sandbox that cannot be created fails the test. Elsewhere the test skips and prints why.
+- **Linux:** `bwrap --unshare-user --unshare-pid --new-session --die-with-parent --ro-bind / / --dev /dev --proc /proc`, with the fixture root (home, ledger, scratch) and the temporary directory bound writable (`tests/support/mod.rs`, `sandbox_prefix`). This reproduces the property #736 is about: a separate PID namespace with its own `/proc`. The exact flags Codex passes were not read for this task, so the qualification relies on the property above rather than on Codex's flag set. CI installs `bubblewrap` and lifts Ubuntu's AppArmor restriction on unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=0`). Both steps are commented and live only in `.github/workflows/test-shards.yml` (condition C). Nothing at runtime installs or configures a sandbox. With `PRIVATEER_SANDBOX_QUALIFICATION=1` (set in CI) a sandbox that cannot be created fails the test. Elsewhere the test skips and prints why.
 - **macOS:** `/usr/bin/sandbox-exec -p PROFILE`, where PROFILE is the base profile PR 737's probe copied (`CODEX_LIKE_PROFILE`) plus `workspace-write`'s `file-write*` rules for the home, the ledger and the scratch directory.
 
 **Must pass, on each OS:**
 1. **Heavy job.** `job.start {"heavy":true,"wait_for_capacity":true}` from inside returns a job record with the same keys as a direct `job.start` made outside. The payload proves it runs outside the sandbox: on Linux its `/proc/self/ns/pid` is the dispatcher's, and on macOS `/bin/ps -ax` succeeds. `job.status` from inside reaches `succeeded` with exit code 0. A second, sleeping heavy job is cancelled with `job.cancel` from inside. It ends `cancelled`, and from outside its payload's recorded identity is gone (the payload's, not just the supervisor's).
 2. **Crew.** `agent.start` from inside launches the fixture crew, which runs. The crew's harness itself runs its CLI calls inside the same sandbox wrapper. It starts a heavy `job.start`, `crew.park`s on it, is resumed by the outcome, and reports with `crew.report`, which the first mate reads from inside. A second crew is cancelled from inside with `job.cancel` and its payload is gone.
 3. **Errand.** `errand.start` from inside runs the fixture errand to its settled outcome, which `errand.list` shows from inside. A second errand is cancelled from inside and its payload is gone.
+4. **Review errand (condition A).** In `tests/review_gate.rs`, a sandboxed first mate starts a review errand (`errand.start` with `review`) for an open PR. The request is carried out by the dispatcher, and the review runs and records its verdict at the PR's head.
+5. **A direct call's record (condition B).** The forwarded heavy job's record equals a direct `job.start`'s with the same arguments in everything but its identity, timing and status: task, working directory and its source, workspace lease, action, heavy, estimate, admission, timeout, actor, `started_by` and route fields. The payload's environment equals the direct payload's, less the variables that name the job. The forwarded crew runs the same harness command (all but the brief, which names the task) in the same directory, with the same action, actor, route and launch fields as a crew launched directly.
 
 **Must refuse, on each OS:**
-4. **No dispatcher.**
+6. **No dispatcher.**
    - With no dispatcher running, `job.start` from inside is refused at once with the (e) text. The text contains neither `permissions.blocked` nor "permission denied".
    - With a lock holder that never claims, the call is refused after the window. A test-only `PRIVATEER_LAUNCH_CLAIM_MS` shortens the window for the requester's own wait and can never lengthen it. A real dispatcher started afterwards launches nothing for that row.
-5. **Forgery.** A row naming another live waiting requester is `refused`, and no job exists.
-6. **Role drop.** A crew call from inside with `PRIVATEER_ROLE` unset is refused as a role drop, and the refusal is audited.
-7. **Requester gone.** A requester killed before the claim gives `refused`.
-8. **Restart.** A dispatcher restarted after a claim does not run the row again. The job started under the pre-filled id settles normally.
+7. **Forgery.** A row naming another live waiting requester is `refused`, and no job exists.
+8. **Role drop.** A crew call from inside with `PRIVATEER_ROLE` unset is refused as a role drop, and the refusal is audited.
+9. **Requester gone.** A requester killed before the claim gives `refused`.
+10. **Restart.** A claimed row whose launcher is gone is failed by the dispatcher and never run again (a unit test of the launcher pass; the integration suite does not kill a dispatcher mid-claim).
 
 Unit tests, on every platform:
 - the row's state machine and its compare-and-set races;
@@ -204,13 +213,15 @@ Unit tests, on every platform:
 ## Where the change goes
 
 - New `src/launch.rs`, with `src/launch/identify.rs` for the per-OS requester checks: the table, the request, the waiter, the launcher and `launch.status`.
+- `src/crew_scope.rs`: a typed `SandboxLimit` error for the two refusals that mean "the sandbox hid the ancestry", so the CLI can still forward in that case.
 - `src/lib.rs`: the forwarding decision at the top of `dispatch`, after `mark_contact`.
 - `src/main.rs`: the internal `_launch-wait` and `_launch-run` commands. Neither resolves its own ancestry.
 - `src/store.rs`: the schema.
 - `src/activation.rs`: the resident launcher thread in `serve`.
 - `src/crew_scope.rs`: `resolve_from(pid, …)`, and `launch.status` in `check`.
-- `src/crew_scope/ancestry.rs`: a starting PID for the Linux walk.
-- `src/jobs.rs`: only `ensure_dispatcher_namespace`'s refusal text, and `pub(crate)` access to `pid_namespace` and `identity` for the launcher. None of the resume paths.
+- `src/crew_scope/ancestry.rs`: a starting PID for every walk, and the environment from `kern.procargs2`.
+- `src/fleet.rs`, `src/store.rs`: read back a `--fleet` choice, and the claimed caller before resolution.
+- `src/jobs.rs`: only `ensure_dispatcher_namespace`'s refusal text, and `pub(crate)` access to it and to `pid_namespace` for the launcher. None of the resume paths.
 - Tests: `tests/sandboxed_launch.rs` and CI setup in `.github/workflows/ci.yml`.
 
 None of the files reserved for another owner (`src/crew.rs`, the `src/jobs.rs` resume paths, `src/workspace/process.rs`, `src/door/reader.rs`, `src/machines/delegated.rs`) needs a change. `crew.park` and the resume claims in `src/crew.rs` already work once the launcher has set the resolved caller.

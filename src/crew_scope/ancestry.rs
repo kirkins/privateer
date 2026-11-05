@@ -8,7 +8,7 @@
 //! not see its ancestors' command lines; `crew_scope` handles both.
 // The kernel walk runs on macOS; elsewhere only its tests use it.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 /// Parent links followed from a caller to its supervisor.
 pub(super) const DEPTH: usize = 64;
@@ -59,7 +59,7 @@ pub(crate) fn walk(
     let read = |pid: u32| -> Result<Option<Kinfo>> {
         match kinfo(pid) {
             Ok(info) => Ok(info),
-            Err(error) => bail!("{}", hidden_ancestry(pid, &error)),
+            Err(error) => Err(super::SandboxLimit(hidden_ancestry(pid, &error)).into()),
         }
     };
     let mut found = vec![];
@@ -220,9 +220,32 @@ pub(crate) fn procargs(buffer: &[u8]) -> Option<Vec<String>> {
     Some(args)
 }
 
+/// argv and the environment from a `kern.procargs2` reply: the environment
+/// is the NUL-terminated `NAME=value` strings after the arguments, up to the
+/// first empty one. A string without `=` there is not environment and ends
+/// the list.
+pub(crate) fn procargs_env(buffer: &[u8]) -> Option<(Vec<String>, Vec<(Vec<u8>, Vec<u8>)>)> {
+    let argv = procargs(buffer)?;
+    let argc = usize::try_from(i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?)).ok()?;
+    let rest = &buffer[4..];
+    let mut at = rest.iter().position(|b| *b == 0)?;
+    while rest.get(at) == Some(&0) {
+        at += 1;
+    }
+    let mut strings = rest[at..].split(|b| *b == 0).skip(argc);
+    let mut env = vec![];
+    for entry in strings.by_ref() {
+        let Some(eq) = entry.iter().position(|b| *b == b'=') else {
+            break;
+        };
+        env.push((entry[..eq].to_vec(), entry[eq + 1..].to_vec()));
+    }
+    Some((argv, env))
+}
+
 #[cfg(target_os = "macos")]
 mod kernel {
-    use super::{Kinfo, KinfoProc, procargs};
+    use super::{Kinfo, KinfoProc, procargs, procargs_env};
 
     /// One `sysctl kern.proc.pid.<pid>` read.
     pub(crate) fn kinfo(pid: u32) -> std::io::Result<Option<Kinfo>> {
@@ -257,6 +280,17 @@ mod kernel {
 
     /// One `sysctl kern.procargs2.<pid>` read.
     pub(crate) fn argv(pid: u32) -> std::io::Result<Vec<String>> {
+        let buffer = procargs2(pid)?;
+        procargs(&buffer).ok_or_else(|| std::io::Error::other("malformed kern.procargs2 reply"))
+    }
+
+    /// argv and the environment of `pid`, from one `kern.procargs2` read.
+    pub(crate) fn argv_env(pid: u32) -> std::io::Result<(Vec<String>, Vec<(Vec<u8>, Vec<u8>)>)> {
+        let buffer = procargs2(pid)?;
+        procargs_env(&buffer).ok_or_else(|| std::io::Error::other("malformed kern.procargs2 reply"))
+    }
+
+    fn procargs2(pid: u32) -> std::io::Result<Vec<u8>> {
         let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
         let mut size = 0usize;
         // SAFETY: a null buffer asks only for the size.
@@ -289,16 +323,21 @@ mod kernel {
             return Err(std::io::Error::last_os_error());
         }
         buffer.truncate(size);
-        procargs(&buffer).ok_or_else(|| std::io::Error::other("malformed kern.procargs2 reply"))
+        Ok(buffer)
     }
 }
 #[cfg(target_os = "macos")]
-pub(crate) use kernel::{argv, kinfo};
+pub(crate) use kernel::{argv, argv_env, kinfo};
 
 /// This process's ancestors, nearest first.
-#[cfg(target_os = "macos")]
 pub(crate) fn ancestors() -> Result<Vec<Ancestor>> {
-    walk(std::process::id(), kinfo, argv)
+    ancestors_of(std::process::id())
+}
+
+/// The ancestors of process `pid`, nearest first.
+#[cfg(target_os = "macos")]
+pub(crate) fn ancestors_of(pid: u32) -> Result<Vec<Ancestor>> {
+    walk(pid, kinfo, argv)
 }
 
 /// This process's kernel command name.
@@ -314,9 +353,9 @@ pub(crate) fn own_comm() -> Option<String> {
     None
 }
 
-/// This process's ancestors, nearest first, with their argv.
+/// The ancestors of process `pid`, nearest first, with their argv.
 #[cfg(target_os = "linux")]
-pub(crate) fn ancestors() -> Result<Vec<Ancestor>> {
+pub(crate) fn ancestors_of(start: u32) -> Result<Vec<Ancestor>> {
     use anyhow::Context;
     let parent = |pid: u32| -> Option<u32> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -330,7 +369,7 @@ pub(crate) fn ancestors() -> Result<Vec<Ancestor>> {
             .ok()
     };
     let mut found = vec![];
-    let mut pid = std::process::id();
+    let mut pid = start;
     for _ in 0..DEPTH {
         match parent(pid) {
             Some(next) if next > 1 => pid = next,
@@ -366,7 +405,7 @@ pub(crate) fn ancestors() -> Result<Vec<Ancestor>> {
 /// Other Unix systems: one process table from ps, as before. ps joins argv
 /// with spaces, so a home path with a space is not recognised.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn ancestors() -> Result<Vec<Ancestor>> {
+pub(crate) fn ancestors_of(start: u32) -> Result<Vec<Ancestor>> {
     use anyhow::{Context, ensure};
     let output = std::process::Command::new("/bin/ps")
         .args(["-axww", "-o", "pid=,ppid=,args="])
@@ -389,7 +428,7 @@ pub(crate) fn ancestors() -> Result<Vec<Ancestor>> {
         table.insert(pid, (parent, fields.map(str::to_owned).collect::<Vec<_>>()));
     }
     let mut found = vec![];
-    let mut pid = std::process::id();
+    let mut pid = start;
     for _ in 0..DEPTH {
         match table.get(&pid) {
             Some((next, _)) if *next > 1 => pid = *next,
@@ -632,6 +671,24 @@ mod tests {
             Some(vec!["privateer".to_owned(), "--home /a b".to_owned()])
         );
         assert_eq!(procargs(b"\x01"), None);
+    }
+
+    #[test]
+    fn procargs_env_reads_the_environment_after_the_arguments() {
+        let mut reply = 2i32.to_ne_bytes().to_vec();
+        reply.extend_from_slice(
+            b"/opt/bin/privateer\0\0\0\0privateer\0_launch-wait\0HOME=/Users/harbor\0A=x=y\0\0\0ptr_munge=\0",
+        );
+        let (argv, env) = procargs_env(&reply).unwrap();
+        assert_eq!(argv, ["privateer", "_launch-wait"]);
+        assert_eq!(
+            env,
+            [
+                (b"HOME".to_vec(), b"/Users/harbor".to_vec()),
+                (b"A".to_vec(), b"x=y".to_vec())
+            ]
+        );
+        assert_eq!(procargs_env(b"\x01"), None);
     }
 
     #[test]

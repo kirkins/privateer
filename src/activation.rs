@@ -1732,6 +1732,9 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
         )?;
         tx.commit()?;
         release = Some(record);
+        // Sandboxed callers' launches, claimed every 250 ms whatever the
+        // tick is doing (docs/design/codex-sandboxed-launch.md).
+        crate::launch::start_launcher(store.home().to_owned());
     }
     loop {
         let report =

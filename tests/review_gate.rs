@@ -1557,3 +1557,81 @@ fn forgejo_refuses_missing_commands_red_checks_and_a_head_changed_at_merge() {
         json!([])
     );
 }
+
+/// #736's first case: a native first mate inside its sandbox starts the
+/// required review errand. It goes through the home's dispatcher, which
+/// carries it out as the first mate, and the review runs and reports. Only
+/// a caller that is itself a review errand or a read-only launch is kept in
+/// its sandbox (docs/design/codex-sandboxed-launch.md).
+#[test]
+fn a_sandboxed_first_mate_starts_a_review_errand_that_runs_and_reports() {
+    let f = Fleet::new();
+    let Some(wrap) = support::sandbox_prefix(&f.root) else {
+        return;
+    };
+    f.routes(opus_errands());
+    let head = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 21 }\n")],
+        "Fix",
+    );
+    f.pr(21, &head, "feature");
+    fs::write(f.root.join("reply.txt"), APPROVE).unwrap();
+    let mut dispatcher = support::Resident::spawn(
+        f.command(None, &["serve", "--json", r#"{"interval_secs":1}"#]),
+        &f.root,
+    );
+    let database = f.home().join("privateer.sqlite");
+    let until = Instant::now() + Duration::from_secs(60);
+    while !rusqlite::Connection::open(&database)
+        .ok()
+        .and_then(|db| {
+            db.query_row(
+                "SELECT value FROM metadata WHERE key='dispatcher_release'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        })
+        .is_some_and(|raw| raw.contains("passed_ms"))
+    {
+        assert!(Instant::now() < until, "the dispatcher never passed");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let args = json!({"focus": "task:fix", "brief": "Review the widget fix.", "route": "opus",
+        "review": {"pr": 21, "head_sha": head}});
+    let output = support::inside(
+        &wrap,
+        &f.command(
+            Some("engineering"),
+            &["errand.start", "--json", &args.to_string()],
+        ),
+    )
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "errand.start inside the sandbox: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let started: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(started["review"].is_string(), "{started}");
+    let db = rusqlite::Connection::open(&database).unwrap();
+    let (command, state): (String, String) = db
+        .query_row(
+            "SELECT command, state FROM launch_requests ORDER BY created_ms DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (command.as_str(), state.as_str()),
+        ("errand.start", "done"),
+        "the dispatcher carried it out"
+    );
+    dispatcher.stop();
+    let row = f.finish(&started);
+    assert_eq!(row["kind"], "errand", "{row}");
+    assert_eq!(row["verdict"], "approve", "{row}");
+    assert_eq!(row["head_sha"], head.as_str());
+}

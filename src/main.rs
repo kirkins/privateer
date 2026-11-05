@@ -74,8 +74,10 @@ fn run() -> Result<()> {
                 return Ok(());
             }
             _ if command.is_none() => command = Some(token),
-            _ if matches!(command.as_deref(), Some("_job-supervise" | "_verify-run"))
-                && internal_job.is_none() =>
+            _ if matches!(
+                command.as_deref(),
+                Some("_job-supervise" | "_verify-run" | "_launch-wait" | "_launch-run")
+            ) && internal_job.is_none() =>
             {
                 internal_job = Some(token)
             }
@@ -97,7 +99,14 @@ fn run() -> Result<()> {
         !file_given
             || !matches!(
                 command.as_deref(),
-                Some("rpc" | "hook" | "_job-supervise" | "_verify-run")
+                Some(
+                    "rpc"
+                        | "hook"
+                        | "_job-supervise"
+                        | "_verify-run"
+                        | "_launch-wait"
+                        | "_launch-run"
+                )
             ),
         "--file supplies command arguments; RPC, hooks and internal supervisors use their own input"
     );
@@ -106,6 +115,21 @@ fn run() -> Result<()> {
     let home = home
         .or_else(|| std::env::var_os("PRIVATEER_HOME").map(PathBuf::from))
         .or_else(privateer::cli::discover_home);
+    // A sandboxed caller's launch request (docs/design/codex-sandboxed-launch.md):
+    // its waiter and its launcher never resolve their own ancestry. The
+    // waiter is the requester, which already did; the launcher runs under
+    // the dispatcher and resolves the requester instead.
+    if matches!(command.as_deref(), Some("_launch-wait" | "_launch-run")) {
+        let home = home.context("--home is required")?;
+        let id = internal_job.context("launch request ID is required")?;
+        if command.as_deref() == Some("_launch-wait") {
+            let outcome = privateer::launch::wait(&home, &id)?;
+            println!("{}", serde_json::to_string(&outcome)?);
+            return Ok(());
+        }
+        Caller::claimed(role.as_deref(), actor.as_deref())?.require_operator("_launch-run")?;
+        return privateer::launch::run(&home, &id);
+    }
     let supervisor = command.as_deref() == Some("_job-supervise");
     let caller = Caller::from_env_at(
         home.as_deref(),
@@ -123,6 +147,39 @@ fn run() -> Result<()> {
             _ => bail!("usage: privateer hook claude|cursor EVENT"),
         };
         std::process::exit(code);
+    }
+    // Inside a sandbox, work is started by the home's dispatcher: the
+    // command is recorded and this process execs into its waiter. A caller
+    // whose sandbox hid its ancestry is resolved by the dispatcher instead.
+    if let (Some(name), Some(at)) = (command.as_deref(), home.as_deref()) {
+        if positional.is_empty() && privateer::launch::forwarded(name) {
+            if let Some(sandbox) = privateer::launch::sandbox(at)? {
+                privateer::moves::refuse_moved(at)?;
+                let claimed = Caller::claimed(role.as_deref(), actor.as_deref())?;
+                let precheck = match &caller {
+                    Ok(resolved) => Some(resolved.clone()),
+                    Err(error)
+                        if error
+                            .downcast_ref::<privateer::crew_scope::SandboxLimit>()
+                            .is_some() =>
+                    {
+                        Some(claimed.clone())
+                    }
+                    Err(_) => None,
+                };
+                if let Some(precheck) = precheck {
+                    let claimed = privateer::launch::Claimed {
+                        caller: claimed,
+                        env_job: std::env::var("PRIVATEER_JOB")
+                            .ok()
+                            .filter(|job| !job.is_empty()),
+                        fleet: privateer::fleet::chosen_registry(),
+                        sandbox: sandbox.to_owned(),
+                    };
+                    match privateer::launch::forward(at, name, args, precheck, claimed)? {}
+                }
+            }
+        }
     }
     let caller = caller?;
     // A dispatcher's detached placement runner belongs to the machine, not to
