@@ -1512,6 +1512,18 @@ fn a_send_that_cannot_write_the_recipient_home_reports_its_queue_receipt() {
         json!({"name":"infra","scope":"deploys","location":{"peer":"home-b"}}),
     );
     ok(&beta, "ship.put", json!({"name":"infra","scope":"deploys"}));
+    // The recipient's home knows apps as its peer, so it can accept the
+    // delivery once the sender may reach it.
+    ok(
+        &beta,
+        "peer.put",
+        json!({"name":"home-a","transport":"local","executable":peer,"home":alpha}),
+    );
+    ok(
+        &beta,
+        "ship.put",
+        json!({"name":"apps","scope":"apps","location":{"peer":"home-a"}}),
+    );
     // The recipient's home is read-only to the sender: it cannot be entered to
     // run the delivery, which is what a sandbox's read-only roots do to it.
     fs::set_permissions(&beta, fs::Permissions::from_mode(0o400)).unwrap();
@@ -1561,7 +1573,7 @@ fn a_send_that_cannot_write_the_recipient_home_reports_its_queue_receipt() {
     // Once the sender may write that home the queue delivers it: the receipt
     // was true, not a swallowed failure.
     let flushed = ok(&alpha, "mail.flush", json!({}));
-    assert_eq!(flushed["delivered"], 1);
+    assert_eq!(flushed["delivered"], 1, "{flushed}");
     let inbox = ok(&beta, "mail.inbox", json!({"address":"infra"}));
     assert_eq!(inbox["messages"][0]["id"], "deferred-send");
 }
