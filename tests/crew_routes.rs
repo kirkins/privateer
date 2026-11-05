@@ -1470,7 +1470,7 @@ fn bearings_report_the_window_that_would_refuse_the_reserve() {
     let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
     let text = bearings["text"].as_str().unwrap();
     assert!(
-        text.contains("78% reserve for crew on its five-hour window"),
+        text.contains("20% reserve for crew on its five-hour window"),
         "{text}"
     );
     assert!(!text.contains("0% reserve for crew"), "{text}");
@@ -1513,8 +1513,8 @@ fn bearings_use_the_crew_share_for_errand_and_review_lists() {
         .split("review: ")
         .next()
         .unwrap();
-    assert!(errand.contains("70% reserve for crew"), "{text}");
-    assert!(!errand.contains("95% reserve for first mate"), "{text}");
+    assert!(errand.contains("30% reserve for crew"), "{text}");
+    assert!(!errand.contains("5% reserve"), "{text}");
     let review = text
         .split("review: ")
         .nth(1)
@@ -1522,7 +1522,7 @@ fn bearings_use_the_crew_share_for_errand_and_review_lists() {
         .split('\n')
         .next()
         .unwrap();
-    assert!(review.contains("70% reserve for crew"), "{text}");
+    assert!(review.contains("30% reserve for crew"), "{text}");
 }
 
 /// An expired window counts as 0, so crew are not refused once the window's
