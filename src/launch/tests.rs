@@ -187,23 +187,105 @@ fn an_environment_larger_than_a_launcher_adopts_is_refused() {
 }
 
 #[test]
-fn an_adopted_environment_keeps_the_first_of_a_name_and_drops_the_sandbox_markers() {
-    let env: Vec<(OsString, OsString)> = [
-        ("PATH", "/usr/bin"),
+fn a_launch_uses_dispatcher_configuration_and_only_requester_caller_context() {
+    let pairs = |env: &[(&str, &str)]| -> Vec<(OsString, OsString)> {
+        env.iter().map(|(k, v)| (k.into(), v.into())).collect()
+    };
+    let dispatcher = pairs(&[
+        ("HOME", "/fixture/user"),
+        (
+            "PATH",
+            "/usr/bin:/fixture/user/.codex/tmp/arg0-linux/codex-arg0abc:/bin",
+        ),
+        ("PATH", "/duplicate"),
+        ("PRIVATEER_RESOURCE_HOME", "/fixture/ledger"),
+        ("PRIVATEER_JOB", "dispatcher-job"),
+        ("PRIVATEER_ROLE", "operator"),
+        ("PRIVATEER_ACTOR", "dispatcher"),
+        ("CODEX_HOME", "/fixture/codex"),
+        ("CODEX_CA_CERTIFICATE", "/fixture/ca.pem"),
+        ("CODEX_API_KEY", "fixture-not-a-credential"),
+        ("CODEX_FUTURE_CONFIGURATION", "dispatcher-config"),
+        ("CODEX_THREAD_ID", "dispatcher-session"),
+        ("CODEX_SESSION_ID", "dispatcher-session"),
+        ("CODEX_TOOL_CALL_ID", "dispatcher-tool-call"),
+        ("CODEX_TURN_ID", "dispatcher-turn"),
+        ("CODEX_CI", "1"),
+        ("CODEX_VERSION", "fixture-version"),
+        ("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "fixture-originator"),
         ("CODEX_SANDBOX", "seatbelt"),
-        ("PRIVATEER_LAUNCH_VIA", "dispatcher"),
-        ("PRIVATEER_JOB", "crew-1"),
-        ("PATH", "/tmp/evil"),
         ("CODEX_SANDBOX_NETWORK_DISABLED", "1"),
-    ]
-    .iter()
-    .map(|(k, v)| (OsString::from(k), OsString::from(v)))
-    .collect();
-    let block: Vec<String> = environment_block(&env)
+        ("__MISE_DIFF", "dispatcher-diff"),
+        ("PRIVATEER_LAUNCH_VIA", "dispatcher"),
+    ]);
+    let requester = pairs(&[
+        ("HOME", "/untrusted/user"),
+        (
+            "PATH",
+            "/untrusted/.codex/tmp/arg0-linux/codex-arg0xyz:/evil",
+        ),
+        ("PRIVATEER_RESOURCE_HOME", "/untrusted/ledger"),
+        ("PRIVATEER_FLEET", "/untrusted/fleet.sqlite"),
+        ("LD_PRELOAD", "/untrusted/loader.so"),
+        ("DYLD_INSERT_LIBRARIES", "/untrusted/loader.dylib"),
+        ("CODEX_HOME", "/untrusted/codex"),
+        ("CODEX_CA_CERTIFICATE", "/untrusted/ca.pem"),
+        ("CODEX_SANDBOX", "seatbelt"),
+        ("CODEX_SANDBOX_NETWORK_DISABLED", "1"),
+        ("CODEX_THREAD_ID", "requester-session"),
+        ("CODEX_TOOL_CALL_ID", "tool-call"),
+        ("__MISE_DIFF", "requester-diff"),
+        ("__MISE_TASK_TOOL_ARGS", "tool-args"),
+        ("PRIVATEER_LAUNCH_VIA", "dispatcher"),
+        ("PRIVATEER_ROLE", "agent"),
+        ("PRIVATEER_ACTOR", "harbor"),
+        ("PRIVATEER_JOB", "crew-1"),
+        ("PRIVATEER_JOB", "duplicate-job"),
+    ]);
+    let block: Vec<String> = environment_block(&dispatcher, &requester)
         .into_iter()
         .map(|entry| entry.into_string().unwrap())
         .collect();
-    assert_eq!(block, ["PATH=/usr/bin", "PRIVATEER_JOB=crew-1"]);
+    assert_eq!(
+        block,
+        [
+            "HOME=/fixture/user",
+            "PATH=/usr/bin:/bin",
+            "PRIVATEER_RESOURCE_HOME=/fixture/ledger",
+            "CODEX_HOME=/fixture/codex",
+            "CODEX_CA_CERTIFICATE=/fixture/ca.pem",
+            "CODEX_API_KEY=fixture-not-a-credential",
+            "CODEX_FUTURE_CONFIGURATION=dispatcher-config",
+            "PRIVATEER_ROLE=agent",
+            "PRIVATEER_ACTOR=harbor",
+            "PRIVATEER_JOB=crew-1",
+        ]
+    );
+    let without_context = environment_block(&dispatcher, &[]);
+    assert!(
+        without_context.iter().all(|entry| !REQUESTER_ENV
+            .iter()
+            .any(|name| { entry.as_bytes().starts_with(format!("{name}=").as_bytes()) })),
+        "absent requester context must not become the dispatcher's identity"
+    );
+}
+
+#[test]
+fn the_launch_path_drops_arg0_directories_and_preserves_other_unix_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    for path in [
+        b"/user/.codex/tmp/arg0-linux/codex-arg0abc".as_slice(),
+        b"/user/.codex/tmp/arg0/codex-arg0abc",
+        b"/custom/codex/tmp/arg0-linux/codex-arg0abc",
+    ] {
+        let mut raw = b":/usr/\xff/bin:".to_vec();
+        raw.extend_from_slice(path);
+        raw.extend_from_slice(b":/bin::/user/.codex/bin");
+        assert_eq!(
+            launch_path(std::ffi::OsStr::from_bytes(&raw)),
+            b":/usr/\xff/bin:/bin::/user/.codex/bin"
+        );
+    }
 }
 
 /// A live `sleep`, its identity as a requester records it, and the

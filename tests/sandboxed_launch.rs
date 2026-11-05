@@ -187,6 +187,19 @@ impl Ship {
     fn new() -> Option<Self> {
         let fleet = Fleet::new(now_settings());
         let wrap = support::sandbox_prefix(&fleet.root)?;
+        Some(Self::fixture(fleet, wrap))
+    }
+
+    /// Exercise the real waiter/dispatcher/supervisor boundary even on hosts
+    /// where a PID or Seatbelt sandbox cannot be created.
+    fn forced() -> Self {
+        Self::fixture(
+            Fleet::new(now_settings()),
+            vec!["env".into(), "PRIVATEER_LAUNCH_VIA=dispatcher".into()],
+        )
+    }
+
+    fn fixture(fleet: Fleet, wrap: Vec<OsString>) -> Self {
         fs::write(fleet.root.join("mate.py"), HARNESS).unwrap();
         let wrap_json: Vec<String> = wrap
             .iter()
@@ -201,11 +214,11 @@ impl Ship {
                 "heavy_estimate":{"memory_bytes":0,"disk_bytes":0}}),
             None,
         );
-        Some(Self {
+        Self {
             fleet,
             wrap,
             dispatcher: None,
-        })
+        }
     }
 
     /// Start the home's resident dispatcher and wait for its first pass,
@@ -473,6 +486,125 @@ fn comparable(job: &Value) -> Value {
     job
 }
 
+/// #747: requester session and executable lookup state must not enter the
+/// unsandboxed launcher's world. This runs real subprocesses without needing
+/// user namespaces; the sandbox qualification below repeats the assertion.
+#[test]
+fn a_forwarded_launch_inherits_the_dispatcher_not_the_requester_session() {
+    let mut ship = Ship::forced();
+    ship.serve_with(&[
+        ("PRIVATEER_TEST_LAUNCH_SOURCE", Path::new("dispatcher")),
+        (
+            "CODEX_CA_CERTIFICATE",
+            Path::new("/fixture/dispatcher-ca.pem"),
+        ),
+    ]);
+    assert_clean_forwarded_environment(
+        &ship,
+        &[
+            ("PRIVATEER_TEST_LAUNCH_SOURCE", "dispatcher"),
+            ("CODEX_CA_CERTIFICATE", "/fixture/dispatcher-ca.pem"),
+        ],
+    );
+}
+
+fn assert_clean_forwarded_environment(ship: &Ship, dispatcher_env: &[(&str, &str)]) {
+    let root = &ship.fleet.root;
+    let probe = root.join("session-placement");
+    let direct_probe = root.join("session-direct-placement");
+    let arg0 = root.join("user/.codex/tmp/arg0-linux/codex-arg0fixture");
+    fs::create_dir_all(&arg0).unwrap();
+    let mut baseline = ship.fleet.command();
+    baseline.envs(dispatcher_env.iter().copied());
+    let baseline_path = baseline
+        .get_envs()
+        .find(|(name, _)| *name == "PATH")
+        .and_then(|(_, value)| value)
+        .unwrap();
+    let path = format!("{}:{}", arg0.display(), baseline_path.to_string_lossy());
+    let output = ship.inside_with(
+        "job.start",
+        &json!({"task_id": "infra-repair", "command": placement_probe(&probe)}),
+        &[
+            ("PATH", &path),
+            ("__MISE_DIFF", "fixture-diff"),
+            ("__MISE_TASK_TOOL_ARGS", "fixture-tool-args"),
+            ("CODEX_THREAD_ID", "fixture-thread"),
+            ("CODEX_SESSION_ID", "fixture-session"),
+            ("CODEX_TOOL_CALL_ID", "fixture-tool-call"),
+            ("CODEX_CI", "1"),
+            ("CODEX_VERSION", "fixture-version"),
+            ("CODEX_CA_CERTIFICATE", "/untrusted/requester-ca.pem"),
+            ("PRIVATEER_TEST_REQUESTER_ONLY", "not-launcher-config"),
+            ("PRIVATEER_TEST_LAUNCH_SOURCE", "requester"),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let started: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let direct_output = baseline
+        .args([
+            "job.start",
+            "--json",
+            &json!({"task_id": "infra-repair", "command": placement_probe(&direct_probe)})
+                .to_string(),
+        ])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "infra")
+        .output()
+        .unwrap();
+    assert!(
+        direct_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&direct_output.stderr)
+    );
+    let direct: Value = serde_json::from_slice(&direct_output.stdout).unwrap();
+    for job in [&started, &direct] {
+        ship.wait_status(job["id"].as_str().unwrap(), &["succeeded"]);
+    }
+    let environment = |file: &Path| -> Vec<String> {
+        fs::read_to_string(file.with_extension("env"))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("PRIVATEER_JOB="))
+            .map(str::to_owned)
+            .collect()
+    };
+    let forwarded = environment(&probe);
+    for (name, value) in dispatcher_env {
+        assert!(
+            forwarded.contains(&format!("{name}={value}")),
+            "the dispatcher's marker must reach the payload"
+        );
+    }
+    assert!(!forwarded.contains(&"PRIVATEER_TEST_LAUNCH_SOURCE=requester".to_owned()));
+    assert!(
+        forwarded.iter().all(|line| {
+            !line.starts_with("__MISE_")
+                && ![
+                    "CODEX_THREAD_ID=",
+                    "CODEX_SESSION_ID=",
+                    "CODEX_TOOL_CALL_ID=",
+                    "CODEX_CI=",
+                    "CODEX_VERSION=",
+                ]
+                .iter()
+                .any(|name| line.starts_with(name))
+                && !line.starts_with("PRIVATEER_TEST_REQUESTER_ONLY=")
+                && !line.contains("codex-arg0fixture")
+        }),
+        "requester session state reached the payload"
+    );
+    assert_eq!(
+        forwarded,
+        environment(&direct_probe),
+        "a forwarded payload has a direct launch's environment"
+    );
+}
+
 #[test]
 fn a_sandboxed_first_mate_starts_runs_and_cancels_a_heavy_job_a_crew_and_an_errand() {
     let Some(mut ship) = Ship::new() else {
@@ -480,6 +612,7 @@ fn a_sandboxed_first_mate_starts_runs_and_cancels_a_heavy_job_a_crew_and_an_erra
     };
     ship.serve();
     let root = ship.fleet.root.clone();
+    assert_clean_forwarded_environment(&ship, &[]);
 
     // A heavy job: the same answer as a direct start, run outside the
     // sandbox, its outcome readable from inside.
