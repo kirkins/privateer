@@ -725,14 +725,22 @@ fn capture_history_gap_does_not_hide_a_more_specific_gap() {
     let c = contact_for_test(false);
     state(&db, &c).unwrap();
     capture_one(&db, &c, Instant::now() + Duration::from_secs(10)).unwrap();
-    for specific in ["unsupported", "backpressure", "unreadable", "integrity_gap"] {
+    // Transient backpressure is the one state the capture's membership
+    // marker supersedes (#699); every more specific diagnosis survives.
+    for (specific, expected) in [
+        ("unsupported", "unsupported"),
+        ("backpressure", "history_gap"),
+        ("unreadable", "unreadable"),
+        ("integrity_gap", "integrity_gap"),
+    ] {
         gap(&db, &c.manifest, SOURCE, specific).unwrap();
         capture_one(&db, &c, Instant::now() + Duration::from_secs(10)).unwrap();
         assert_eq!(
             db.query_row("SELECT state FROM desk_intake_gap", [], |r| r
                 .get::<_, String>(0))
                 .unwrap(),
-            specific
+            expected,
+            "{specific}"
         );
     }
 }

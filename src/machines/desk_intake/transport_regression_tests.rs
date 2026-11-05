@@ -176,7 +176,11 @@ fn strict_partial_envelope_is_backpressure_not_unsupported_and_never_loses_negot
 }
 
 #[test]
-fn partial_contact_and_membership_capture_keep_the_first_recoverable_diagnostic() {
+fn partial_contact_and_membership_capture_settle_on_history_gap_in_either_order() {
+    // #699: a budget-limited partial before the first capture used to keep
+    // backpressure for the whole generation. The capture's history marker
+    // supersedes only that transient state, and a later partial never
+    // replaces it, so the retained diagnosis no longer depends on ordering.
     for partial_first in [true, false] {
         let source = db();
         let c = contact_for_test(false);
@@ -209,11 +213,8 @@ fn partial_contact_and_membership_capture_keep_the_first_recoverable_diagnostic(
                 .query_row("SELECT state FROM desk_intake_gap", [], |r| r
                     .get::<_, String>(0))
                 .unwrap(),
-            if partial_first {
-                "backpressure"
-            } else {
-                "history_gap"
-            }
+            "history_gap",
+            "partial_first={partial_first}"
         );
         assert_eq!(count(&source, "desk_intake_loss"), 0);
         assert_eq!(
@@ -224,6 +225,51 @@ fn partial_contact_and_membership_capture_keep_the_first_recoverable_diagnostic(
             1
         );
         assert!(!frame(&c).unwrap().complete);
+    }
+}
+
+#[test]
+fn history_marker_supersedes_only_backpressure_and_is_never_replaced_by_it() {
+    for (retained, expected) in [
+        ("backpressure", "history_gap"),
+        ("history_gap", "history_gap"),
+        ("unreadable", "unreadable"),
+        ("unsupported", "unsupported"),
+        ("baseline_too_large", "baseline_too_large"),
+        ("integrity_gap", "integrity_gap"),
+    ] {
+        let source = db();
+        let c = contact_for_test(false);
+        state(&source, &c).unwrap();
+        source
+            .execute(
+                "INSERT INTO desk_intake_gap(domain,source,state) VALUES(?1,?2,?3)",
+                params![c.manifest.domain, c.source, retained],
+            )
+            .unwrap();
+        let gap_state = || {
+            source
+                .query_row("SELECT state FROM desk_intake_gap", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap()
+        };
+        capture_one(&source, &c, Instant::now()).unwrap();
+        assert_eq!(gap_state(), expected, "capture over {retained}");
+        if expected == "history_gap" {
+            // No backpressure writer replaces the settled history marker.
+            negotiation_gap(&source, &c, &partial_frame()).unwrap();
+            obstacle(&source, &c.manifest, &c.source, "backpressure").unwrap();
+            let failed: Result<()> = Err(anyhow::anyhow!("backpressure: injected"));
+            record_failure(&source, &c.manifest, &c.source, &failed).unwrap();
+            assert_eq!(gap_state(), "history_gap", "backpressure after {retained}");
+        }
+        assert_eq!(count(&source, "desk_intake_gap"), 1);
+        assert_eq!(
+            count(&source, "desk_intake_loss"),
+            0,
+            "the membership marker is not sticky loss"
+        );
     }
 }
 
