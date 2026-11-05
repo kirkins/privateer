@@ -73,7 +73,10 @@
 //! releases as the window's reset approaches: by default it shrinks in
 //! proportion to the time left, reaching zero at the reset, so the end of an
 //! allowance is used rather than lost. A route may set `reserve_release` to
-//! `"fixed"` to keep the configured share until the reset. Running work is
+//! `"fixed"` to keep the configured share until the reset. The crew share
+//! always stops `first_mate_margin_pct` (3 by default) below the first mate's
+//! own released limit on the same window, so a crew can never spend into the
+//! last of the plan and lock its first mate out until the reset. Running work is
 //! never stopped: what is already in flight is what spends the plan.
 use crate::crew_routes::{Allowance, Limits, Release, Shape};
 use crate::store::Store;
@@ -1026,17 +1029,28 @@ pub(crate) enum ReserveReason {
     BeyondWindow,
     /// The reset is now or already past, so the configured share stands.
     ResetNotAhead,
+    /// The crew share released far enough to reach into the margin kept below
+    /// the first mate's limit, so that margin holds it back (the percentage
+    /// points of the window kept).
+    FirstMateMargin(u8),
 }
 
 impl ReserveReason {
     /// The phrase a refusal and bearings use for this reason.
-    pub(crate) fn why(self) -> &'static str {
+    pub(crate) fn why(self) -> String {
         match self {
-            Self::Released => "released as the reset nears",
-            Self::Fixed => "fixed until the reset",
-            Self::UnknownReset => "configured share kept because the reset is unknown",
-            Self::BeyondWindow => "configured share kept because the reset is beyond the window",
-            Self::ResetNotAhead => "configured share kept because the reset is not ahead",
+            Self::Released => "released as the reset nears".to_owned(),
+            Self::Fixed => "fixed until the reset".to_owned(),
+            Self::UnknownReset => "configured share kept because the reset is unknown".to_owned(),
+            Self::BeyondWindow => {
+                "configured share kept because the reset is beyond the window".to_owned()
+            }
+            Self::ResetNotAhead => {
+                "configured share kept because the reset is not ahead".to_owned()
+            }
+            Self::FirstMateMargin(pct) => {
+                format!("kept {pct}% below the first mate's limit")
+            }
         }
     }
 }
@@ -1059,7 +1073,10 @@ pub(crate) fn reserve(
     let (Some(reset), Some(window)) = (reading.reset_ms, reading.window_ms) else {
         return (configured, ReserveReason::UnknownReset);
     };
-    if window <= 0 || reset <= now {
+    if window <= 0 {
+        return (configured, ReserveReason::UnknownReset);
+    }
+    if reset <= now {
         return (configured, ReserveReason::ResetNotAhead);
     }
     let left = ((reset - now) as f64 / window as f64).clamp(0.0, 1.0);
@@ -1067,6 +1084,26 @@ pub(crate) fn reserve(
         return (configured, ReserveReason::BeyondWindow);
     }
     ((configured * left).clamp(0.0, 1.0), ReserveReason::Released)
+}
+
+/// The kept share at `now` for a launch judged at the crew share, and why: the
+/// crew release curve, but never so little that a first mate would be refused
+/// on the same window. Crews must stop `first_mate_margin` below the first
+/// mate's limit, so the two limits never meet as both reserves release near a
+/// reset and lock the first mate out for the rest of the window. With no margin
+/// configured, or a route that keeps no first-mate share, nothing is kept back.
+pub(crate) fn crew_reserve(limits: &Limits, reading: &Spent, now: i64) -> (f64, ReserveReason) {
+    let (kept, reason) = reserve(limits, 1.0 - limits.crew, reading, now);
+    if limits.first_mate_margin <= 0.0 || limits.first_mate >= 1.0 {
+        return (kept, reason);
+    }
+    let (mate, _) = reserve(limits, 1.0 - limits.first_mate, reading, now);
+    let floor = (mate + limits.first_mate_margin).min(1.0);
+    if floor <= kept {
+        return (kept, reason);
+    }
+    let pct = (limits.first_mate_margin * 100.0).round().clamp(0.0, 100.0) as u8;
+    (floor, ReserveReason::FirstMateMargin(pct))
 }
 
 /// The share at which this kind of launch is refused a route.
@@ -1104,7 +1141,10 @@ pub(crate) fn binding(
     readings(usage, budget, run_window_ms, now)
         .into_iter()
         .map(|reading| {
-            let (kept, reason) = reserve(limits, configured, &reading, now);
+            let (kept, reason) = match who {
+                Who::Crew => crew_reserve(limits, &reading, now),
+                Who::FirstMate | Who::Errand => reserve(limits, configured, &reading, now),
+            };
             let over = reading.share - (1.0 - kept);
             Binding {
                 reading,
@@ -2735,7 +2775,7 @@ mod allowance_tests {
         );
         assert_eq!(
             keep(Some(now + window), Some(0)),
-            (configured, ReserveReason::ResetNotAhead)
+            (configured, ReserveReason::UnknownReset)
         );
         assert_eq!(
             keep(Some(now + 2 * window), Some(window)),
@@ -2758,6 +2798,110 @@ mod allowance_tests {
             reserve(&limits, configured, &reading, now),
             (configured, ReserveReason::Fixed)
         );
+    }
+
+    /// Crews and errands keep a fixed margin below the first mate's released
+    /// limit, so the two limits never meet as both reserves release near a
+    /// reset: in the final minutes of a five-hour or weekly window the crew
+    /// limit stays three points below the first mate's.
+    #[test]
+    fn the_crew_share_keeps_a_margin_below_the_first_mates_near_every_reset() {
+        let now = Store::now_ms();
+        let limits = Limits::default();
+        let limits_at = |reset: i64, window: i64| {
+            let reading = Spent {
+                share: 0.9,
+                what: "window".into(),
+                reset_ms: Some(reset),
+                window_ms: Some(window),
+            };
+            let (kept, reason) = crew_reserve(&limits, &reading, now);
+            let (mate, _) = reserve(&limits, 1.0 - limits.first_mate, &reading, now);
+            ((1.0 - kept) * 100.0, (1.0 - mate) * 100.0, reason)
+        };
+        for window in [5 * HOUR, 7 * 24 * HOUR] {
+            // The final minute: the first mate's limit is all but 100%, and
+            // crew stop three points below it instead of at it.
+            let (crew, mate, reason) = limits_at(now + 60_000, window);
+            assert!((crew - (mate - 3.0)).abs() < 0.01, "{crew} vs {mate}");
+            assert!(mate > 99.9, "{crew} vs {mate}");
+            assert_eq!(reason, ReserveReason::FirstMateMargin(3));
+            // Halfway through the margin is inside the released crew share,
+            // so the crew curve is the stricter of the two.
+            let (crew, mate, reason) = limits_at(now + window / 2, window);
+            assert!((crew - 90.0).abs() < 0.01, "{crew} vs {mate}");
+            assert!(crew < mate - 3.0, "{crew} vs {mate}");
+            assert_eq!(reason, ReserveReason::Released);
+        }
+    }
+
+    /// A margin of zero is exactly the release as it was before the margin
+    /// existed, at every point of the window.
+    #[test]
+    fn a_zero_margin_keeps_the_crew_release_as_it_was() {
+        let now = Store::now_ms();
+        let window = 5 * HOUR;
+        let mut limits = Limits::default();
+        limits.first_mate_margin = 0.0;
+        for left in [0, 1, window / 4, window / 2, window - 1, window] {
+            let reading = Spent {
+                share: 0.9,
+                what: "window".into(),
+                reset_ms: Some(now + left),
+                window_ms: Some(window),
+            };
+            assert_eq!(
+                crew_reserve(&limits, &reading, now),
+                reserve(&limits, 1.0 - limits.crew, &reading, now)
+            );
+            assert!(!matches!(
+                crew_reserve(&limits, &reading, now).1,
+                ReserveReason::FirstMateMargin(_)
+            ));
+        }
+    }
+
+    /// A route that keeps no first-mate share has nothing to protect, so the
+    /// margin does not apply to its crews either.
+    #[test]
+    fn a_route_with_no_first_mate_share_keeps_no_margin() {
+        let now = Store::now_ms();
+        let reading = Spent {
+            share: 0.9,
+            what: "window".into(),
+            reset_ms: Some(now + 60_000),
+            window_ms: Some(5 * HOUR),
+        };
+        let mut limits = Limits::default();
+        limits.first_mate = 1.0;
+        assert_eq!(
+            crew_reserve(&limits, &reading, now),
+            reserve(&limits, 1.0 - limits.crew, &reading, now)
+        );
+    }
+
+    /// `reserve_release: "fixed"` keeps the configured crew share, and the
+    /// margin only makes crews stricter when the configured share is closer to
+    /// the first mate's than the margin.
+    #[test]
+    fn a_fixed_route_keeps_its_share_unless_the_margin_is_stricter() {
+        let now = Store::now_ms();
+        let reading = Spent {
+            share: 0.9,
+            what: "window".into(),
+            reset_ms: Some(now + 60_000),
+            window_ms: Some(5 * HOUR),
+        };
+        let mut limits = Limits::default();
+        limits.release = Release::Fixed;
+        let (kept, reason) = crew_reserve(&limits, &reading, now);
+        assert!((kept - 0.20).abs() < 1e-9 && reason == ReserveReason::Fixed);
+        // A crew share inside the margin of the first mate's still stops the
+        // margin below it.
+        limits.crew = 0.97;
+        let (kept, reason) = crew_reserve(&limits, &reading, now);
+        assert!((kept - 0.08).abs() < 1e-9, "{kept}");
+        assert_eq!(reason, ReserveReason::FirstMateMargin(3));
     }
 
     /// A run that reached the provider counts against the budget, whether it

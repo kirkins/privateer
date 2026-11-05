@@ -23,7 +23,10 @@
 //! default the kept share releases as the window's reset approaches: it
 //! shrinks in proportion to the time left, reaching zero at the reset, so the
 //! end of an allowance is used rather than lost. `reserve_release: "fixed"`
-//! keeps the configured share until the reset. Running work is never stopped:
+//! keeps the configured share until the reset. Crews and errands always stop
+//! `first_mate_margin_pct` (3 by default) below the first mate's own released
+//! limit on the same window, so they cannot spend the last of a plan and lock
+//! the first mate out until the reset. Running work is never stopped:
 //! it is what spends the reserve.
 //!
 //! A `routes.set` may be temporary: with `until_ms`, or `until_reset` naming a
@@ -55,6 +58,9 @@ pub(crate) const USES: [&str; 4] = ["implement", "review", "diagnose", "design"]
 pub(crate) const CREW_HEADROOM_PCT: f64 = 80.0;
 /// The larger share a first mate keeps for itself by default.
 pub(crate) const FIRST_MATE_HEADROOM_PCT: f64 = 95.0;
+/// The points of the window crews and errands keep below the first mate's
+/// released limit by default, so they never spend the last of a plan.
+pub(crate) const FIRST_MATE_MARGIN_PCT: f64 = 3.0;
 /// The largest run budget a window may hold: far past any plan, so a
 /// mistyped figure refuses rather than refusing nothing.
 const MAX_RUNS: u64 = 10_000;
@@ -67,11 +73,14 @@ const MAX_TEMPORARY_MS: i64 = 31 * DAY_MS;
 
 /// What a route keeps in reserve: the share of its plan at which new crew and
 /// errands are refused, the share at which a first mate moves to its fallback,
-/// and the runs its window holds when the harness reports no usage of its own.
+/// the points of the window crew always keep below that first-mate share, and
+/// the runs its window holds when the harness reports no usage of its own.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Limits {
     pub crew: f64,
     pub first_mate: f64,
+    /// How far below the first mate's released limit crews and errands stop.
+    pub first_mate_margin: f64,
     pub runs: Option<u64>,
     /// The length of the window a run budget counts in, so its reserve can
     /// release with the time left. None when the route has no allowance.
@@ -94,6 +103,7 @@ impl Default for Limits {
         Limits {
             crew: CREW_HEADROOM_PCT / 100.0,
             first_mate: FIRST_MATE_HEADROOM_PCT / 100.0,
+            first_mate_margin: FIRST_MATE_MARGIN_PCT / 100.0,
             runs: None,
             runs_window_ms: None,
             max_running: None,
@@ -110,6 +120,7 @@ pub(crate) fn limits(route: &Value) -> Limits {
     Limits {
         crew: pct("crew_headroom_pct", CREW_HEADROOM_PCT),
         first_mate: pct("first_mate_headroom_pct", FIRST_MATE_HEADROOM_PCT),
+        first_mate_margin: pct("first_mate_margin_pct", FIRST_MATE_MARGIN_PCT),
         runs: declared.and_then(|allowance| allowance.runs),
         runs_window_ms: declared.map(run_window_ms),
         max_running: route["max_running"].as_u64(),
@@ -256,6 +267,7 @@ fn validate_at(value: &Value, depth: usize) -> Result<()> {
                         | "uses"
                         | "crew_headroom_pct"
                         | "first_mate_headroom_pct"
+                        | "first_mate_margin_pct"
                         | "reserve_release"
                         | "explicit_only"
                         | "max_running"
@@ -322,6 +334,12 @@ fn validate_at(value: &Value, depth: usize) -> Result<()> {
                 "route {name} {key} must be a whole percent from 1 to 100"
             );
         }
+        ensure!(
+            route
+                .get("first_mate_margin_pct")
+                .is_none_or(|p| p.as_u64().is_some_and(|p| p <= 50)),
+            "route {name} first_mate_margin_pct must be a whole percent from 0 to 50"
+        );
         ensure!(
             route
                 .get("reserve_release")
@@ -3031,6 +3049,18 @@ mod tests {
         assert_eq!(limits(&own).first_mate, 0.9);
         assert_eq!(limits(&own).runs, Some(12));
         assert_eq!(limits(&own).runs_window_ms, Some(5 * 3_600_000));
+        // Crew keep three points below the first mate's limit by default, and
+        // a route may state its own margin or none at all.
+        assert_eq!(default.first_mate_margin, 0.03);
+        own["first_mate_margin_pct"] = json!(0);
+        assert_eq!(limits(&own).first_mate_margin, 0.0);
+        own["first_mate_margin_pct"] = json!(7);
+        assert_eq!(limits(&own).first_mate_margin, 0.07);
+        assert!(
+            validate(&json!({"routes": {"own": own.clone()},
+            "first_mate": ["own"]}))
+            .is_ok()
+        );
         // A run budget needs no share settings, and shares alone no budget.
         own["allowance"] = json!({"window_hours": 5});
         assert_eq!(limits(&own).runs, None);

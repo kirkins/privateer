@@ -1367,7 +1367,8 @@ fn a_reserve_releases_as_the_weekly_reset_nears() {
     assert!(refused.contains("released as the reset nears"), "{refused}");
 
     // Ten hours before the reset the kept share has shrunk, so the same
-    // reading is inside it.
+    // reading is inside it; the margin below the first mate's limit is what
+    // it is inside now.
     set_reset(now + 10 * 3_600_000);
     let allowed = f.json(
         Some("engineering"),
@@ -1378,7 +1379,10 @@ fn a_reserve_releases_as_the_weekly_reset_nears() {
     let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
     let text = bearings["text"].as_str().unwrap();
     assert!(text.contains("reserve for crew"), "{text}");
-    assert!(text.contains("released as the reset nears"), "{text}");
+    assert!(
+        text.contains("kept 3% below the first mate's limit"),
+        "{text}"
+    );
 
     // A route can keep the configured share instead.
     let mut fixed = claude("sonnet");
@@ -1405,6 +1409,94 @@ fn a_reserve_releases_as_the_weekly_reset_nears() {
         json!({"task_id":"fix","route":"shared"}),
     );
     assert_eq!(f.model(&allowed), "sonnet", "{allowed}");
+}
+
+/// Crews stop a margin below the first mate's limit even in the last minutes
+/// of a window, so a crew cannot spend the plan down and lock the first mate
+/// out until the reset. An hour before a weekly reset a reading two points
+/// under the first mate's limit refuses crew and admits the first mate; the
+/// same route with `first_mate_margin_pct: 0` takes the crew again.
+#[test]
+fn crews_stop_below_the_first_mates_limit_near_the_reset() {
+    let f = Fleet::new();
+    let mut shared = claude("sonnet");
+    shared["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
+    shared["tier"] = json!(1);
+    let lists = |route: Value| {
+        json!({
+            "routes": {"shared": route, "other": codex("model-other", "plan")},
+            "crew": ["shared", "other"],
+            "first_mate": ["shared"]
+        })
+    };
+    f.routes(lists(shared.clone()));
+    f.tick();
+    let now = privateer::store::Store::now_ms();
+    let window = 7 * 24 * 3_600_000;
+    let left = 3_600_000;
+    // The first mate's released limit an hour before the weekly reset, and a
+    // reading two points inside it: a crew would take the last of the plan.
+    let mate_kept = 0.05 * (left as f64 / window as f64);
+    let reading = 1.0 - mate_kept - 0.02;
+    let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    ledger
+        .execute(
+            "INSERT OR REPLACE INTO route_usage(route, weekly_utilization, weekly_ends_ms,
+               updated_ms)
+             VALUES('claude/-/sonnet', ?1, ?2, ?3)",
+            rusqlite::params![reading, now + left, now],
+        )
+        .unwrap();
+
+    // Crew are refused, and the refusal says the margin is what binds.
+    let refused = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"shared"}),
+    );
+    assert!(
+        refused.contains("kept 3% below the first mate's limit"),
+        "{refused}"
+    );
+    // The first mate's own wake is admitted on the same route, same reading.
+    f.in_process(|store| {
+        store
+            .connection()
+            .execute(
+                "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms)
+                 VALUES('wake-margin','engineering','duty',0,'wake-margin','fresh','running',0)",
+                [],
+            )
+            .unwrap();
+    });
+    let wake = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"wake-margin"}),
+    );
+    assert_eq!(f.model(&wake), "sonnet", "{wake}");
+    // Bearings say why the crew share is where it is, and the first mate's
+    // own share is still released as the reset nears.
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("reserve for crew") && text.contains("kept 3% below the first mate's limit"),
+        "{text}"
+    );
+    assert!(
+        text.contains("reserve for first mate") && text.contains("released as the reset nears"),
+        "{text}"
+    );
+
+    // With no margin the route takes the crew again: the old behaviour.
+    shared["first_mate_margin_pct"] = json!(0);
+    f.routes(lists(shared));
+    let crew = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-margin-zero","route":"shared"}),
+    );
+    assert_eq!(f.model(&crew), "sonnet", "{crew}");
 }
 
 /// Bearings show the share and release setting of the first name for the
@@ -1840,6 +1932,21 @@ fn headroom_settings_and_run_budgets_are_bounded_and_agree_across_one_identity()
             "first_mate_headroom_pct",
             json!(95.5),
             "must be a whole percent from 1 to 100",
+        ),
+        (
+            "first_mate_margin_pct",
+            json!(51),
+            "must be a whole percent from 0 to 50",
+        ),
+        (
+            "first_mate_margin_pct",
+            json!(-1),
+            "must be a whole percent from 0 to 50",
+        ),
+        (
+            "first_mate_margin_pct",
+            json!(1.5),
+            "must be a whole percent from 0 to 50",
         ),
     ] {
         let mut route = codex("model-a", "plan");
