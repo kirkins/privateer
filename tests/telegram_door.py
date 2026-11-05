@@ -51,6 +51,15 @@ class FakeTelegram:
 
             def do_GET(self):
                 path = self.path.split("?")[0]
+                if path.startswith(f"/bot{TOKEN}/"):
+                    result = fake.handle(path.rsplit("/", 1)[1], {})
+                    body = json.dumps({"ok": True, "result": result}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 prefix = f"/file/bot{TOKEN}/"
                 assert path.startswith(prefix), path
                 data = fake.files.get(path[len(prefix):])
@@ -98,6 +107,8 @@ class FakeTelegram:
             if method == "getFile":
                 remote = self.file_paths.get(form.get("file_id"))
                 return {"file_path": remote} if remote else None
+            if method == "getMe":
+                return {"id": 123, "username": "fictional_bot"}
             if method == "getChat":
                 return {"id": int(form.get("chat_id", 0)), "type": self.chat_type}
             if method == "sendMessage":
@@ -250,7 +261,7 @@ import door, tg
 tg.STATE_DIR = tempfile.mkdtemp()
 said = []
 d = door.Door({"door": "t"}, {"tts": {}}, None)
-d.say = lambda text, reply_to=None, html=False, markup=None, quiet=False: (
+d.say = lambda text, reply_to=None, html=False, markup=None, quiet=False, durable=True: (
     said.append({"text": text, "quiet": quiet}) or (len(said), ""))
 unknown = {"id": "m1", "from": "ops", "kind": "notice", "urgency": "normal",
            "body": "joins an ask shown before cards were kept", "payload": {"attached_to": "gone"}}
@@ -885,6 +896,40 @@ inbound.LIMIT = old_limit
 assert all(secret not in line and "fictional-name" not in line and "/hidden" not in line for line in logs), logs
 outcomes = [line for line in logs if line.startswith("inbound ")]
 assert outcomes and all("update_id=" in line and "type=" in line and "length=" in line and "outcome=" in line for line in outcomes), logs
+
+# A final warning uses a reserved slot, not a handler's already-sent slot 0.
+spool.admit([update(7)])
+for _ in range(inbound.ATTEMPTS):
+    d = adapter()
+    def warned_then_broke(u):
+        d.say("first warning")
+        raise ValueError(secret)
+    d.on_update = warned_then_broke
+    hurry(spool); d.process_inbound()
+hurry(spool); adapter().process_inbound()
+assert sent[-1]["text"].startswith("⚠️ Could not complete this update."), sent
+assert sum(s["text"] == "first warning" for s in sent) == 1
+
+# One loop turn drains a burst, with no per-update one-second sleeps.
+spool.admit([update(i) for i in range(8, 18)])
+d = adapter(); count = 0
+while d.process_inbound(): count += 1
+assert count == 10 and spool.ready() is None
+
+# /waiting uses the push retry owner, not the notice spool. A failure is
+# returned to that caller, and a successful retry records the reply mapping.
+spool.admit([update(18)])
+d = adapter(); d.update_id = 18
+mail = dict(id="ask", kind="request", body="Question", **{"from": "ops"})
+fail_notice = True
+assert d.push(dict(mail=mail, ship="ops", ref="ops:ask"))
+with spool.db() as db:
+    assert db.execute("SELECT count(*) FROM notices WHERE update_id=18").fetchone()[0] == 0
+fail_notice = False
+assert not d.push(dict(mail=mail, ship="ops", ref="ops:ask"))
+assert tg.target_for_reply(sent[-1].get("_id", 500 + len(sent)))["mail"] == "ask"
+d.update_id = None
+d.process_inbound()
 
 # Real process death after the fake mail store commits, before the adapter sees
 # a response/ack. The next process must reuse the exact submitted id and args.

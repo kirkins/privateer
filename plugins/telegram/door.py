@@ -186,11 +186,11 @@ class Door:
         self.notice_slot = 0
         self.outcome = "terminal_ignored"
 
-    def process_inbound(self) -> None:
+    def process_inbound(self) -> bool:
         """Own one durable update until handling or bounded terminal refusal."""
         row = self.spool.ready()
         if row is None or row["next_at"] > time.time():
-            return
+            return False
         update = json.loads(row["data"])
         self.update_id = row["id"]
         self.notice_slot = 0
@@ -200,11 +200,16 @@ class Door:
                 self.outcome = "terminal_initial_backlog"
             elif row["attempts"] >= inbound.ATTEMPTS:
                 self.outcome = "terminal_handler_error"
-                msg = update.get("message") or update.get("edited_message") or {}
+                query = update.get("callback_query") or {}
+                msg = update.get("message") or update.get("edited_message") or query.get("message") or {}
                 if self.authorized((msg.get("chat") or {}).get("id"),
-                                   (msg.get("from") or {}).get("id")):
-                    self.say("⚠️ Could not complete this update. It was not confirmed sent; "
-                             "please check with the ship before sending it again.",
+                                   ((query or msg).get("from") or {}).get("id")):
+                    # Never reuse a handler's notice slot from an earlier attempt.
+                    self.notice_slot = -1
+                    committed = self.spool.result(self.update_id) is not None
+                    status = ("The mail committed, but confirmation failed." if committed else
+                              "Delivery is uncertain; please check with the ship before resending.")
+                    self.say(f"⚠️ Could not complete this update. {status}",
                              reply_to=msg.get("message_id"))
             else:
                 self.spool.begin(self.update_id)
@@ -221,6 +226,7 @@ class Door:
             tg.log(f"inbound update_id={self.update_id} type={kind} length={length} outcome=handler_retry")
         finally:
             self.update_id = None
+        return True
 
     def retry_notices(self) -> None:
         for row in self.spool.notices_ready():
@@ -249,7 +255,7 @@ class Door:
     # --- sending to Telegram ---------------------------------------------
 
     def say(self, text: str, reply_to=None, html: bool = False, markup: dict | None = None,
-            quiet: bool = False):
+            quiet: bool = False, durable: bool = True):
         params = {"chat_id": tg.chat_id(self.cfg), "text": text,
                   "disable_web_page_preview": "true"}
         if html:
@@ -261,7 +267,7 @@ class Door:
             params["reply_markup"] = json.dumps(markup)
         if quiet:
             params["disable_notification"] = "true"
-        if self.update_id is not None:
+        if durable and self.update_id is not None:
             slot = self.notice_slot
             self.notice_slot += 1
             row = self.spool.notice(self.update_id, slot, params)
@@ -310,7 +316,7 @@ class Door:
         text = "\n".join(str(line) for line in event.get("lines") or [])
         pieces = tg.split_markdown(text, TEXT_LIMIT) or [text]
         for piece in pieces:
-            _, err = self.say(piece, quiet=not event.get("loud"))
+            _, err = self.say(piece, quiet=not event.get("loud"), durable=False)
             if err:
                 return err
         return ""
@@ -409,7 +415,7 @@ class Door:
             last = index == len(pieces) - 1
             message_id, err = self.say(text, reply_to=reply_to if index == 0 else None,
                                        html=True, markup=markup if last else None,
-                                       quiet=bool(event.get("quiet")))
+                                       quiet=bool(event.get("quiet")), durable=False)
             if err:
                 return err
             if last and typed and markup:
@@ -516,9 +522,17 @@ class Door:
             args["kind"] = self.cfg["send_kind"]
         if self.update_id is not None:
             args = dict(args)
-            if not args.get("to") and self.recipient():
-                args["to"] = self.recipient()
-            identity = json.dumps([self.hello.get("door"), tg.chat_id(self.cfg), self.update_id])
+            if not args.get("to"):
+                to = self.recipient()
+                if not to:
+                    to = self.runtime.call("ships").get("recipient")
+                if not to:
+                    self.outcome = "terminal_refused"
+                    self.say("⚠️ not sent: no default recipient; use /to SHIP.", reply_to=msg_id)
+                    return
+                args["to"] = to
+            identity = json.dumps([self.cfg.get("bot_id"), self.hello.get("door"),
+                                   tg.chat_id(self.cfg), self.update_id])
             args = dict(args, id="telegram-" + hashlib.sha256(identity.encode()).hexdigest()[:32])
             args, msg_id, label = self.spool.submission(self.update_id, args, msg_id, label)
         try:
@@ -1417,6 +1431,12 @@ def main() -> int:
     if problem:
         print(f"Telegram door config: {problem}", file=sys.stderr)
         return 2
+    bot, err = tg.api(cfg, "getMe", {}, retries=2)
+    if err or not (bot or {}).get("id"):
+        tg.log("telegram outcome=bot_identity_failed")
+        return 2
+    cfg["bot_id"] = bot["id"]
+    cfg["bot_username"] = bot.get("username", "")
     kind = chat_kind(cfg)
     if kind != "private" and not cfg.get("allowed_user_ids"):
         print(f"Telegram door config: chat_id names a {kind}, and allowed_user_ids is not set; "
@@ -1450,7 +1470,8 @@ def main() -> int:
                 door.on_mail(item)
             elif source == "runtime":
                 tg.log(f"ignoring runtime message {item.get('type')!r}")
-            door.process_inbound()
+            while door.process_inbound():
+                pass
             door.retry_notices()
         except BrokenPipeError:
             break
