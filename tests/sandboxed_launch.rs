@@ -647,12 +647,21 @@ fn a_sandboxed_first_mate_starts_runs_and_cancels_a_heavy_job_a_crew_and_an_erra
         ),
         "{started}"
     );
-    let direct = ship.fleet.ok(
-        "job.start",
-        json!({"task_id": "infra-repair", "heavy": true, "wait_for_capacity": true,
-            "command": placement_probe(&root.join("direct-placement"))}),
-        Some("infra"),
+    let mut direct_cli = ship.fleet.command();
+    remove_mise_and_codex_environment(&mut direct_cli);
+    let direct_args = json!({"task_id": "infra-repair", "heavy": true, "wait_for_capacity": true,
+        "command": placement_probe(&root.join("direct-placement"))});
+    direct_cli
+        .args(["job.start", "--json", &direct_args.to_string()])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "infra");
+    let direct_output = direct_cli.output().unwrap();
+    assert!(
+        direct_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&direct_output.stderr)
     );
+    let direct: Value = serde_json::from_slice(&direct_output.stdout).unwrap();
     let mut started_keys: Vec<&String> = started.as_object().unwrap().keys().collect();
     let mut direct_keys: Vec<&String> = direct.as_object().unwrap().keys().collect();
     started_keys.sort();
