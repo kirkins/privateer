@@ -61,13 +61,10 @@ const HEARTBEAT: Duration = Duration::from_secs(2);
 const STALE_MS: i64 = 15_000;
 const POLL: Duration = Duration::from_millis(100);
 const LAUNCHER_POLL: Duration = Duration::from_millis(250);
-/// Describe the requester's own sandbox, or ask for this route; neither
-/// holds for the work the launcher starts outside it.
-const STRIPPED_ENV: &[&str] = &[
-    "CODEX_SANDBOX",
-    "CODEX_SANDBOX_NETWORK_DISABLED",
-    "PRIVATEER_LAUNCH_VIA",
-];
+/// Only caller context crosses from the requester into the launcher's
+/// environment. Configuration, executable lookup and loader settings belong
+/// to the dispatcher, not to an untrusted process inside a sandbox.
+const REQUESTER_ENV: &[&str] = &["PRIVATEER_ROLE", "PRIVATEER_ACTOR", "PRIVATEER_JOB"];
 
 /// Set in a `_launch-run` process: it carries out requests and never makes one.
 static LAUNCHER: AtomicBool = AtomicBool::new(false);
@@ -590,10 +587,11 @@ fn carry_out(home: &Path, conn: &Connection, row: &Row, me: &str) -> Result<Carr
             &reason.to_string(),
         )));
     }
-    // The command runs as a direct call from the requester would: with its
-    // environment, from its directory, on its registry. All three come from
-    // the kernel's view of the requester, never from the row, but the
-    // registry, which only a flag chose.
+    // Use the environment a direct launch from the dispatcher would inherit,
+    // with only caller context from the kernel's view of the requester. Its
+    // session, PATH, loaders and runtime configuration must not control the
+    // unsandboxed launcher. The cwd is kernel-checked; an explicit registry
+    // flag remains a command input, as on the direct path.
     adopt_environment(&found.env);
     heartbeat(home, &row.id, me);
     let _ = std::env::set_current_dir(found.cwd.as_deref().unwrap_or(home));
@@ -730,27 +728,48 @@ fn containment(
     Ok(None)
 }
 
-/// The requester's environment as `NAME=value` strings, less what describes
-/// its own sandbox. A name given twice keeps its first value, which `getenv`
-/// reads. Linear in its size.
-fn environment_block(env: &[(OsString, OsString)]) -> Vec<CString> {
+/// Rebuild from the dispatcher's direct-launch baseline, allowing only
+/// caller context from the requester. A duplicate keeps its first value,
+/// just as `getenv` does. Missing requester context never falls back to the
+/// dispatcher's own role or job. No requester configuration is adopted.
+fn environment_block(
+    dispatcher: &[(OsString, OsString)],
+    requester: &[(OsString, OsString)],
+) -> Vec<CString> {
     use std::os::unix::ffi::OsStrExt;
-    let mut seen = HashSet::with_capacity(env.len());
-    let mut block = Vec::with_capacity(env.len());
-    for (name, value) in env {
+    let context = |name: &OsString| {
+        REQUESTER_ENV
+            .iter()
+            .any(|s| s.as_bytes() == name.as_bytes())
+    };
+    let baseline = dispatcher.iter().filter(|(name, _)| !context(name));
+    let caller = requester.iter().filter(|(name, _)| context(name));
+    let mut seen = HashSet::with_capacity(dispatcher.len());
+    let mut block = Vec::with_capacity(dispatcher.len());
+    for (name, value) in baseline.chain(caller) {
         let bytes = name.as_bytes();
         if bytes.is_empty()
             || bytes.contains(&b'=')
-            || STRIPPED_ENV.iter().any(|s| s.as_bytes() == bytes)
+            || bytes.starts_with(b"__MISE_")
+            // CODEX_HOME is dispatcher-owned configuration, not session
+            // state. Retain it so isolated homes remain isolated.
+            || (bytes.starts_with(b"CODEX_") && bytes != b"CODEX_HOME")
+            || bytes == b"PRIVATEER_LAUNCH_VIA"
             || !seen.insert(bytes)
         {
             continue;
         }
+        let path;
+        let value = if bytes == b"PATH" {
+            path = launch_path(value);
+            path.as_slice()
+        } else {
+            value.as_bytes()
+        };
         let mut entry = Vec::with_capacity(bytes.len() + value.len() + 1);
         entry.extend_from_slice(bytes);
         entry.push(b'=');
-        entry.extend_from_slice(value.as_bytes());
-        // An environment read from the kernel has no NUL inside an entry.
+        entry.extend_from_slice(value);
         if let Ok(entry) = CString::new(entry) {
             block.push(entry);
         }
@@ -758,12 +777,43 @@ fn environment_block(env: &[(OsString, OsString)]) -> Vec<CString> {
     block
 }
 
-/// Replace this process's environment with `environment_block(env)` in one
+/// Remove Codex's ephemeral arg0 executable directories without interpreting
+/// the requester's HOME or touching the filesystem. Work on Unix bytes so a
+/// non-UTF-8 PATH cannot bypass the filter. Keep other entries and their order.
+fn launch_path(value: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut path = Vec::with_capacity(value.len());
+    let mut first = true;
+    for entry in value.as_bytes().split(|b| *b == b':') {
+        let components: Vec<_> = Path::new(std::ffi::OsStr::from_bytes(entry))
+            .components()
+            .map(|part| part.as_os_str().as_bytes())
+            .collect();
+        let arg0 = components.windows(3).any(|parts| {
+            (parts[0] == b".codex" && parts[1] == b"tmp" && parts[2].starts_with(b"arg0"))
+                || (parts[0] == b"tmp"
+                    && parts[1].starts_with(b"arg0")
+                    && parts[2].starts_with(b"codex-arg0"))
+        });
+        if arg0 {
+            continue;
+        }
+        if !first {
+            path.push(b':');
+        }
+        first = false;
+        path.extend_from_slice(entry);
+    }
+    path
+}
+
+/// Replace this process's environment with the rebuilt launch block in one
 /// pass: the C library's `environ` is pointed at a new array, where `setenv`
 /// per variable would scan the environment each time. The array is never
 /// freed: a launcher adopts once.
 fn adopt_environment(env: &[(OsString, OsString)]) {
-    let mut block: Vec<*mut libc::c_char> = environment_block(env)
+    let dispatcher: Vec<_> = std::env::vars_os().collect();
+    let mut block: Vec<*mut libc::c_char> = environment_block(&dispatcher, env)
         .into_iter()
         .map(CString::into_raw)
         .collect();
