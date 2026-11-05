@@ -229,6 +229,7 @@ impl Ship {
 
     fn serve_with(&mut self, env: &[(&str, &Path)]) {
         let mut command = self.fleet.command();
+        remove_mise_and_codex_environment(&mut command);
         command.args(["serve", "--json", r#"{"interval_secs":1}"#]);
         for (name, value) in env {
             command.env(name, value);
@@ -515,6 +516,7 @@ fn assert_clean_forwarded_environment(ship: &Ship, dispatcher_env: &[(&str, &str
     let arg0 = root.join("user/.codex/tmp/arg0-linux/codex-arg0fixture");
     fs::create_dir_all(&arg0).unwrap();
     let mut baseline = ship.fleet.command();
+    remove_mise_and_codex_environment(&mut baseline);
     baseline.envs(dispatcher_env.iter().copied());
     let baseline_path = baseline
         .get_envs()
@@ -605,6 +607,21 @@ fn assert_clean_forwarded_environment(ship: &Ship, dispatcher_env: &[(&str, &str
     );
 }
 
+fn remove_mise_and_codex_environment(command: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy();
+        if name.starts_with("__MISE_") || name.starts_with("CODEX_") {
+            command.env_remove(name.as_ref());
+        }
+    }
+    if let Some((_, Some(path))) = command.get_envs().find(|(name, _)| *name == "PATH") {
+        let entries: Vec<_> = std::env::split_paths(path)
+            .filter(|entry| !entry.to_string_lossy().contains("/.codex/tmp/arg0-"))
+            .collect();
+        command.env("PATH", std::env::join_paths(entries).unwrap());
+    }
+}
+
 #[test]
 fn a_sandboxed_first_mate_starts_runs_and_cancels_a_heavy_job_a_crew_and_an_errand() {
     let Some(mut ship) = Ship::new() else {
@@ -630,12 +647,21 @@ fn a_sandboxed_first_mate_starts_runs_and_cancels_a_heavy_job_a_crew_and_an_erra
         ),
         "{started}"
     );
-    let direct = ship.fleet.ok(
-        "job.start",
-        json!({"task_id": "infra-repair", "heavy": true, "wait_for_capacity": true,
-            "command": placement_probe(&root.join("direct-placement"))}),
-        Some("infra"),
+    let mut direct_cli = ship.fleet.command();
+    remove_mise_and_codex_environment(&mut direct_cli);
+    let direct_args = json!({"task_id": "infra-repair", "heavy": true, "wait_for_capacity": true,
+        "command": placement_probe(&root.join("direct-placement"))});
+    direct_cli
+        .args(["job.start", "--json", &direct_args.to_string()])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "infra");
+    let direct_output = direct_cli.output().unwrap();
+    assert!(
+        direct_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&direct_output.stderr)
     );
+    let direct: Value = serde_json::from_slice(&direct_output.stdout).unwrap();
     let mut started_keys: Vec<&String> = started.as_object().unwrap().keys().collect();
     let mut direct_keys: Vec<&String> = direct.as_object().unwrap().keys().collect();
     started_keys.sort();
