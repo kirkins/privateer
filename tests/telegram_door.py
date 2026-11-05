@@ -155,8 +155,8 @@ class FakeTelegram:
 
     def edit(self, message_id: int, text: str, reply_to: int | None = None,
              entities: list | None = None, chat: int = CHAT, user: int = CAPTAIN,
-             text_key: str = "text") -> None:
-        """The captain edited a message they had sent."""
+             text_key: str = "text") -> int:
+        """The captain edited a message they had sent; return its update id."""
         message = {"message_id": message_id, "chat": {"id": chat}, "from": {"id": user},
                    text_key: text, "edit_date": 1}
         if reply_to:
@@ -167,6 +167,7 @@ class FakeTelegram:
             update = {"update_id": self.next_update, "edited_message": message}
             self.next_update += 1
             self.updates.append(update)
+            return update["update_id"]
 
     def sent(self) -> list[dict]:
         with self.lock:
@@ -1434,13 +1435,17 @@ def main() -> int:
             approval2 = wait_for("the second approval recorded", lambda: [
                 r for r in approvals_of(step2["id"]) if r["state"] == "live"])[0]
             before = len(telegram.sent())
-            telegram.edit(yes2, "yes, ship it", reply_to=card2["_message_id"])
+            edit_id = telegram.edit(yes2, "yes, ship it", reply_to=card2["_message_id"])
+            # Wait for this update's terminal receipt, not the old log of the
+            # serialized runtime result (which included approval content).
+            receipt = (f"inbound update_id={edit_id} type=edited_message "
+                       "length=12 outcome=edit_rechecked")
             wait_for("the unchanged edit re-checked", lambda: any(
-                'edit re-checked:' in line and '"outcome": "unchanged"' in line
-                and approval2["id"] in line
+                line.endswith(receipt)
                 for line in (state / "telegram.log").read_text().splitlines()))
+            assert approval2["id"] not in (state / "telegram.log").read_text()
             assert not [m for m in telegram.sent()[before:] if "no longer approves" in m["text"]]
-            assert [r for r in approvals_of(step2["id"]) if r["state"] == "live"]
+            assert [r["id"] for r in approvals_of(step2["id"]) if r["state"] == "live"] == [approval2["id"]]
             telegram.edit(yes2, "yes", reply_to=card2["_message_id"],
                           entities=[{"type": "strikethrough", "offset": 0, "length": 3}])
             wait_for("the struck yes withdrawn", lambda: [
