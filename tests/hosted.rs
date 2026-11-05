@@ -2141,6 +2141,12 @@ fn ordinary_idle_ticks_launch_once_and_back_off_durably_before_recovery() {
             .unwrap()
             .is_empty()
     );
+    // The headless fallback below runs a payload that makes no Privateer
+    // call, so its wake settles failed and keeps its mail; a long retry
+    // backoff keeps that mail from waking it again however slow the runner.
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["retry_backoff_secs"] = json!(3600);
+    place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
     // Attendance, native compatibility, effective authority and cwd all apply
     // before an idle launch just as they do for mail-driven work.
     place.json(
@@ -2328,6 +2334,21 @@ fn ordinary_idle_ticks_launch_once_and_back_off_durably_before_recovery() {
     herdr.suppress_input.store(true, Ordering::SeqCst);
     let pending = place.tick();
     assert!(pending["hosted"].is_object(), "{pending}");
+    let fallback: (String, Option<String>) = place
+        .database()
+        .query_row(
+            "SELECT status, error FROM wakes WHERE id=?1",
+            [report["wake"].as_str().unwrap()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        fallback,
+        (
+            "failed".to_owned(),
+            Some("first mate ran no Privateer command".to_owned())
+        )
+    );
     let state = place.launch_state();
     assert_eq!(state.0, 2);
     assert!((100_000..=120_000).contains(&(state.1 - privateer::store::Store::now_ms())));
@@ -2336,7 +2357,11 @@ fn ordinary_idle_ticks_launch_once_and_back_off_durably_before_recovery() {
         .database()
         .execute("UPDATE presence SET expires_ms=0 WHERE ship='infra'", [])
         .unwrap();
-    assert_eq!(place.tick()["host_backoff_until_ms"], state.1);
+    // The failed wake's retry backoff holds its mail; the host's own durable
+    // backoff is still reported beside that skip.
+    let held = place.tick();
+    assert_eq!(held["skipped"], "backing off after a failed wake", "{held}");
+    assert_eq!(held["host_backoff_until_ms"], state.1, "{held}");
     assert!(!place.root.join("pi-env").exists());
     assert_eq!(place.launch_state(), state);
     // Saturate repeated failures without wall-clock sleeps; the deadline and

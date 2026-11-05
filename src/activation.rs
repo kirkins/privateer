@@ -1213,16 +1213,38 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
             Err(error) => host_error = Some(format!("{error:#}")),
         }
     }
-    headless_wake(
+    let mut report = headless_wake(
         store,
         name,
         profile,
         route,
-        host_error,
+        host_error.clone(),
         host_backoff_until_ms,
         own_blocked,
         true,
-    )
+    )?;
+    // The host's error and durable backoff stand whatever the headless path
+    // then decided: a skip for batching, a failed wake's retry backoff or the
+    // hourly budget must not read as a host with nothing pending.
+    with_host_state(&mut report, host_error, host_backoff_until_ms);
+    Ok(report)
+}
+
+/// `report` with the host's error and backoff, where it has none of its own.
+fn with_host_state(report: &mut Value, error: Option<String>, backoff_until_ms: Option<i64>) {
+    let Some(fields) = report.as_object_mut() else {
+        return;
+    };
+    for (key, value) in [
+        ("host_error", error.map(Value::from)),
+        ("host_backoff_until_ms", backoff_until_ms.map(Value::from)),
+    ] {
+        if let Some(value) = value
+            && fields.get(key).is_none_or(Value::is_null)
+        {
+            fields.insert(key.to_owned(), value);
+        }
+    }
 }
 
 /// The sequence a ship's first mate is woken through, and the times of the

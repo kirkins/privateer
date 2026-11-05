@@ -38,7 +38,7 @@ The walk (`crew_scope::ancestry::walk`) starts at this process and follows paren
 The nearest ancestor that is the recorded supervisor of a job is the caller's supervisor. That ancestor is found in one of two ways:
 
 - **Argv readable** (no sandbox): as today. Take `--home H _job-supervise J` from the argv, load `J` from `H`, and require `J.supervisor` to have the same pid, the same start identity and no PID namespace. The only change is that the start time comes from the kernel rather than from `ps`.
-- **Argv hidden** (sandbox): read the job records of the homes the caller can name: the target home and every home the real registry lists, which is the same set `world` already treats as `Home`. A job whose `supervisor` has this pid and this start identity is the match. If two records claim the same pid and start, the caller is refused. One unindexed query per home (`json_extract(record,'$.supervisor.pid') IN (pids)`) takes about 30 ms on a home with 6,000 jobs. It runs only when some argv is hidden.
+- **Argv hidden** (sandbox): every supervisor is a Privateer process, so only a hidden ancestor whose kernel command name is `privateer` or this CLI's own name (or is unknown) is looked up. Any other hidden ancestor, such as the root-owned `login` above every unsandboxed Terminal shell, is passed over, as the visible rule passes over any argv that is not `_job-supervise`. For a hidden Privateer ancestor, read the job records of the homes the caller can name: the target home and every home the real registry lists, which is the same set `world` already treats as `Home`. A job whose `supervisor` has this pid and this start identity is the match. If two records claim the same pid and start, the caller is refused. One unindexed query per home (`json_extract(record,'$.supervisor.pid') IN (pids)`) takes about 30 ms on a home with 6,000 jobs. It runs, and the registry is opened, only when some hidden ancestor is a Privateer process.
 
 **Failing closed.** A hidden ancestor that matches no record might still be a supervisor whose job is recorded in a home the caller cannot name. Every supervisor is a Privateer process, so a hidden ancestor whose kernel command name is `privateer` (or this CLI's own name) must be accounted for before the walk passes it. The two Privateer processes that legitimately sit above a first mate's harness record their identity:
 - an attended `privateer start` has a live presence lease `start:PID:...`;
@@ -53,6 +53,7 @@ A hidden Privateer ancestor that none of these records accounts for refuses the 
 | some argv hidden; two records claim the nearest such ancestor | refused (ambiguous) |
 | some argv hidden; a hidden Privateer ancestor nearer than any match, and no job, hosted pane or live `start` lease records it | refused (fail closed) |
 | some argv hidden; no match, and every hidden Privateer ancestor is a recorded `start` session (or there is none) | no job caller: resolved as before, including the `PRIVATEER_JOB` narrowing. This is what the visible rule gives for the same tree, which has no supervisor in it |
+| some argv hidden, but no hidden ancestor is a Privateer process (for example `login` above a Terminal shell) | no records read; the visible argv decide, as in the first row |
 | the kernel walk itself is refused | refused (sandbox limit) |
 
 Unit tests cover each row with an injected process chain and temporary homes, so they run on Linux CI as well (`crew_scope::tests`, `crew_scope::ancestry::tests`).
@@ -65,7 +66,7 @@ Everything after the match is unchanged: `world`, `classify`, the role-drop and 
 
 The fail-closed refusal says the same and adds "or name the job's home with --home". Naming the home adds it to the homes searched. Neither refusal points at `permissions.blocked` or any grant, because no Privateer permission would lift it.
 
-A pid that has disappeared ends the walk, as `/proc` does on Linux.
+A pid that has disappeared ends the walk, as `/proc` does on Linux. That includes an ancestor that exits (or whose pid is reused) between its `kinfo_proc` read and its argv read: neither it nor anything above it is reported.
 
 ### What a crew can and cannot forge
 
@@ -81,7 +82,7 @@ The proof is the pair (pid, start time), checked against a `supervisor` identity
 This is at least as strong as today's check. The proof is the same (pid and start identity against the record), and it is never weaker than the visible rule for the same tree: an ancestor it cannot place refuses. Unsandboxed macOS callers now read the exact argv from the kernel rather than from `ps`'s space-joined columns, so a home path with a space is recognised.
 
 Residuals:
-- A Privateer binary installed under a name that is neither `privateer` nor this CLI's own name is not recognised as a possible supervisor.
+- A Privateer binary installed under a name that is neither `privateer` nor this CLI's own name is not recognised as a possible supervisor: with its argv hidden it is neither looked up nor refused. A supervisor is spawned from the executable of the process that started its job, normally the same installation as this CLI.
 - An attended `start` lease names a pid without a start time. That lease lives at most 90 s after its process is gone, and the walk only reaches live processes.
 
 ### Why not a credential
@@ -145,7 +146,8 @@ Not covered: a first mate that runs one command and then fails every other one. 
 
 - **Every platform** (`crew_scope::ancestry::tests`, `crew_scope::tests`), using an injected process chain:
   - the walk reaches pid 1 and stops at its depth bound;
-  - a hidden argv is never read as empty, and an ancestor gone mid-read has no argv;
+  - a hidden argv is never read as empty, and an ancestor gone mid-read ends the walk;
+  - a hidden ancestor that is not a Privateer process reads no records;
   - a refused kernel read is the sandbox-limit refusal, not a crash;
   - the `lstart` formatter matches `date -u` references;
   - `procargs` parsing and the `kinfo_proc` layout (size 648; `p_stat` 36, `p_pid` 40, `p_comm` 243 and `e_ppid` 560, asserted at compile time);

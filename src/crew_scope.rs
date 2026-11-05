@@ -304,30 +304,50 @@ type Supervised = (PathBuf, String, Value);
 /// process proves nothing and is passed over.
 fn supervising_job(target: Option<&Path>) -> Result<Option<Supervised>> {
     let chain = ancestry::ancestors()?;
-    let homes = if chain.iter().any(|a| a.argv.is_none()) {
+    let mut comms = vec!["privateer".to_owned()];
+    comms.extend(ancestry::own_comm());
+    // Only a hidden Privateer process needs the records: an unsandboxed
+    // caller under a root-owned `login`, whose argv is always hidden, opens
+    // no registry and queries no home.
+    let homes = if needs_records(&chain, &comms) {
         world_homes(target)
     } else {
         vec![]
     };
-    let mut comms = vec!["privateer".to_owned()];
-    comms.extend(ancestry::own_comm());
     find_supervisor(&chain, &homes, &comms, Store::now_ms())
 }
 
+/// Whether `ancestor`'s argv is hidden and it may be a Privateer process: its
+/// kernel command name is one of `comms`, or unknown (never passed over on
+/// a guess).
+fn hidden_privateer(ancestor: &Ancestor, comms: &[String]) -> bool {
+    ancestor.argv.is_none() && ancestor.comm.as_ref().is_none_or(|c| comms.contains(c))
+}
+
+/// Whether finding the supervisor in `chain` reads any job records.
+fn needs_records(chain: &[Ancestor], comms: &[String]) -> bool {
+    chain.iter().any(|a| hidden_privateer(a, comms))
+}
+
 /// The supervisor among `chain`, nearest first. An ancestor whose argv is
-/// visible is proved as before, from the home and job its argv names. One
-/// whose argv a sandbox hides is proved by a job in `homes` whose recorded
-/// supervisor has its pid and start. A hidden Privateer process (by kernel
-/// command name, `comms`) that no record there accounts for may be the
-/// caller's supervisor in a home this caller cannot name, so the caller is
-/// refused rather than resolved as if it had none.
+/// visible is proved as before, from the home and job its argv names. A
+/// hidden ancestor that is not a Privateer process (by kernel command name,
+/// `comms`) cannot be a supervisor and is passed over, as the visible rule
+/// passes over any other argv. A hidden Privateer process is proved by a job
+/// in `homes` whose recorded supervisor has its pid and start; one that no
+/// record there accounts for may be the caller's supervisor in a home this
+/// caller cannot name, so the caller is refused rather than resolved as if
+/// it had none.
 fn find_supervisor(
     chain: &[Ancestor],
     homes: &[PathBuf],
     comms: &[String],
     now_ms: i64,
 ) -> Result<Option<Supervised>> {
-    let hidden: Vec<&Ancestor> = chain.iter().filter(|a| a.argv.is_none()).collect();
+    let hidden: Vec<&Ancestor> = chain
+        .iter()
+        .filter(|a| hidden_privateer(a, comms))
+        .collect();
     let recorded = if hidden.is_empty() {
         vec![]
     } else {
@@ -350,6 +370,9 @@ fn find_supervisor(
             }
             continue;
         }
+        if !hidden_privateer(ancestor, comms) {
+            continue;
+        }
         let mut matches = vec![];
         for supervised in &recorded {
             if proves(&supervised.2["supervisor"], ancestor)? {
@@ -368,8 +391,7 @@ fn find_supervisor(
                 b.0.display()
             ),
         }
-        let privateer = ancestor.comm.as_ref().is_some_and(|c| comms.contains(c));
-        if privateer && !session_process(homes, ancestor, now_ms) {
+        if !session_process(homes, ancestor, now_ms) {
             bail!(
                 "this caller's sandbox hides the command line of its ancestor process {} ({}), a Privateer process that no job, hosted pane or attended session in the {} home(s) this caller can name records. It may be this caller's supervisor, so Privateer refuses the command rather than guess its job. This is a limit of the sandbox, not a missing Privateer permission: run the command outside the sandbox, or name the job's home with --home.",
                 ancestor.pid,
@@ -764,6 +786,29 @@ mod tests {
             ancestor(250, CREW_START, "zsh", None),
         ];
         assert_eq!(find_supervisor(&tree, &[home], &comms(), 0).unwrap(), None);
+    }
+
+    #[test]
+    fn a_hidden_non_privateer_ancestor_reads_no_records() {
+        let temp = TempDir::new().unwrap();
+        let home = home(&temp, "a");
+        // An unsandboxed Terminal caller: a root-owned `login` hides its argv
+        // from this user, every other ancestor shows its own.
+        let tree = vec![
+            ancestor(300, CREW_START, "zsh", Some("-zsh")),
+            ancestor(200, CREW_START, "login", None),
+        ];
+        assert!(!needs_records(&tree, &comms()));
+        // Even a record naming its pid and start is not looked up: a
+        // supervisor is a Privateer process, so `login` is passed over.
+        assert_eq!(find_supervisor(&tree, &[home], &comms(), 0).unwrap(), None);
+        // A hidden Privateer ancestor, or one whose name is unknown, does.
+        let mut privateer = tree.clone();
+        privateer[1].comm = Some("privateer".into());
+        assert!(needs_records(&privateer, &comms()));
+        let mut unknown = tree;
+        unknown[1].comm = None;
+        assert!(needs_records(&unknown, &comms()));
     }
 
     #[test]

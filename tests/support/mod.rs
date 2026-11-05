@@ -249,15 +249,20 @@ if mode == "window":
     print(json.dumps({"type": "error", "timestamp": 1, "severity": "error",
         "message": "429 Too Many Requests. RESOURCE_EXHAUSTED: rate limit exceeded; resets in 5 hours"}), flush=True)
     sys.exit(1)
+def call(command, args):
+    out = subprocess.run(cli + [command, "--json", json.dumps(args)], capture_output=True, text=True, check=True)
+    return json.loads(out.stdout)
 if mode in ("crew", "no-action"):
-    # A crew's run or a no-action wake: Codex usage, no mailbox changes.
+    # A crew's run, or a wake whose first mate reads its inbox, decides the
+    # mail needs nothing and does not ack it: Codex usage, no mailbox changes.
+    # A real wake reaches the runtime at least once; one that never does
+    # settles failed (docs/design/codex-sandboxed-callers.md, (c)).
+    if mode == "no-action":
+        call("mail.inbox", {"address": ship})
     print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 300, "cached_input_tokens": 100, "output_tokens": 30}}))
     sys.exit(0)
 if mode.startswith("sleep"):
     time.sleep(float(mode.split()[1]))
-def call(command, args):
-    out = subprocess.run(cli + [command, "--json", json.dumps(args)], capture_output=True, text=True, check=True)
-    return json.loads(out.stdout)
 if mode == "half-throttle":
     # Answers the first open request, then the provider ends the run with a
     # limit: the mail shows a reply that must never be answered twice.

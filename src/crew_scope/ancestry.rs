@@ -44,8 +44,9 @@ pub(super) fn hidden_ancestry(pid: u32, error: &std::io::Error) -> String {
 
 /// Walk from `me` to its ancestors, nearest first, through `kinfo` (one
 /// kernel read; `Ok(None)` once the process has gone) and `argv` (an error
-/// is a hidden argv unless the process has gone meanwhile). A read the
-/// kernel refuses is a refusal, never an empty ancestry.
+/// is a hidden argv, or the end of the chain if the process has gone
+/// meanwhile). A read the kernel refuses is a refusal, never an empty
+/// ancestry.
 pub(crate) fn walk(
     me: u32,
     kinfo: impl Fn(u32) -> std::io::Result<Option<Kinfo>>,
@@ -71,11 +72,13 @@ pub(crate) fn walk(
         };
         let args = match argv(pid) {
             Ok(args) => Some(args),
-            // Gone since its child named it: no argv to read, as on Linux.
-            // Still there: the argv is hidden, never taken as empty.
+            // Still there: the argv is hidden, never taken as empty. Gone
+            // since its child named it (or its pid already reused): the
+            // chain ends here, as it does on Linux, and nothing above it
+            // is read as this caller's ancestry.
             Err(_) => match read(pid)? {
                 Some(again) if again.started == next.started => None,
-                _ => Some(vec![]),
+                _ => break,
             },
         };
         found.push(Ancestor {
@@ -177,6 +180,10 @@ pub(crate) fn procargs(buffer: &[u8]) -> Option<Vec<String>> {
     let rest = &buffer[4..];
     let path_end = rest.iter().position(|b| *b == 0)?;
     let mut at = path_end;
+    // An empty argv[0] (and any empty arguments right after it) cannot be
+    // told from this padding, so it is skipped too: the list then starts at
+    // the first non-empty argument and takes as many environment strings
+    // after the arguments to fill argc.
     while rest.get(at) == Some(&0) {
         at += 1;
     }
@@ -437,21 +444,48 @@ mod tests {
     }
 
     #[test]
-    fn an_ancestor_gone_before_its_argv_is_read_has_none() {
+    fn an_ancestor_gone_before_its_argv_is_read_ends_the_chain() {
+        // 30 exits between its kinfo and argv reads: neither it nor the
+        // process above it is reported, as Linux stops at a gone ancestor.
         let table = std::cell::RefCell::new(HashMap::from([
+            (50, info(40, "s50", "sh")),
             (40, info(30, "s40", "sh")),
-            (30, info(1, "s30", "privateer")),
+            (30, info(20, "s30", "sh")),
+            (20, info(1, "s20", "privateer")),
         ]));
         let found = walk(
-            40,
+            50,
             |pid| Ok(table.borrow().get(&pid).cloned()),
             |pid| {
-                table.borrow_mut().remove(&pid);
-                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+                if pid == 30 {
+                    table.borrow_mut().remove(&pid);
+                    return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                }
+                Ok(vec![format!("argv-{pid}")])
             },
         )
         .unwrap();
-        assert_eq!(found[0].argv, Some(vec![]));
+        assert_eq!(found.iter().map(|a| a.pid).collect::<Vec<_>>(), vec![40]);
+        assert_eq!(found[0].argv, Some(vec!["argv-40".to_owned()]));
+        // A pid reused by another process meanwhile ends it too.
+        let restarted = std::cell::RefCell::new(HashMap::from([
+            (40, info(30, "s40", "sh")),
+            (30, info(20, "s30", "sh")),
+            (20, info(1, "s20", "privateer")),
+        ]));
+        let found = walk(
+            40,
+            |pid| Ok(restarted.borrow().get(&pid).cloned()),
+            |pid| {
+                if pid == 30 {
+                    restarted.borrow_mut().insert(30, info(20, "later", "sh"));
+                    return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                }
+                Ok(vec![])
+            },
+        )
+        .unwrap();
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
