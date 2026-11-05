@@ -1735,45 +1735,228 @@ fn a_quiet_tick_with_nothing_changed_leaves_the_alarm_row_untouched() {
     assert!(notices(&fleet).is_empty());
 }
 
-/// A task that faults, is re-enqueued and faults again is a new revision, so
-/// the wake that listed its first fault counts as productive.
-#[test]
-fn a_fault_re_enqueued_and_faulted_again_counts_as_productive() {
-    let mut fleet = Fleet::new(support::now_settings());
-    enqueue(&mut fleet);
+/// An old fault whose owner left it running, without retrying the schedule.
+fn stranded(fleet: &mut Fleet) {
+    faulted(fleet);
+    call(
+        fleet,
+        "task.update",
+        json!({"id":"infra-repair","actor":"infra","status":"running"}),
+    );
+    fleet.store.connection().execute(
+        "UPDATE task_schedule SET record=json_set(record,'$.faulted_ms',?1) WHERE task_id='infra-repair'",
+        [privateer::store::Store::now_ms() - 3_600_001],
+    ).unwrap();
+}
+
+fn fault_reminders(fleet: &Fleet) -> Vec<Value> {
+    let mut statement = fleet.store.connection().prepare(
+        "SELECT body,payload,task_id FROM mail WHERE json_extract(payload,'$.schedule_fault_reminder') IS NOT NULL ORDER BY seq",
+    ).unwrap();
+    statement
+        .query_map([], |r| {
+            Ok(json!({"body":r.get::<_,String>(0)?,
+        "payload":serde_json::from_str::<Value>(&r.get::<_,String>(1)?).unwrap(),
+        "task_id":r.get::<_,Option<String>>(2)?}))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn age_fault_reminders(fleet: &Fleet, secs: i64) {
     fleet
         .store
         .connection()
         .execute(
-            "UPDATE task_schedule SET record=json_set(record,'$.state','fault','$.reason','first')
-             WHERE task_id='infra-repair'",
-            [],
+            "UPDATE schedule_fault_reminders SET next_ms=next_ms-?1",
+            [secs * 1000],
         )
         .unwrap();
-    fleet.tick();
-    pass(&fleet, 3600);
-    let first = backlog(&fleet.tick());
-    assert_eq!(first["fired"], "backlog-infra-1", "{first}");
-    fleet.settle();
-    // Re-enqueued (a new revision) and faulted again before the next check.
+}
+
+#[test]
+fn stranded_faults_name_requests_and_pins_without_replaying_work() {
+    let mut fleet = Fleet::new(support::now_settings());
+    stranded(&mut fleet);
     call(
         &mut fleet,
-        "task.enqueue",
-        json!({"id":"infra-repair","brief":"Try again."}),
+        "task.create",
+        json!({"id":"infra-child","parent":"infra-repair",
+        "charter_id":"fleet","owner":"infra","title":"Child review"}),
     );
+    fleet.send(
+        json!({"id":"old-child-request","from":"infra","to":"apps","kind":"request",
+        "body":"Which window?","task_id":"infra-child"}),
+    );
+    call(
+        &mut fleet,
+        "note.pin",
+        json!({"ship":"infra","focus":"task:infra-repair",
+        "key":"waiting","value":"an old reply"}),
+    );
+    call(
+        &mut fleet,
+        "note.pin",
+        json!({"ship":"infra","focus":"task:infra-child",
+        "key":"waiting","value":"child review"}),
+    );
+    assert!(
+        privateer::context::idle_tasks(&fleet.store, "infra")
+            .unwrap()
+            .is_empty()
+    );
+    let before = schedule_record(&mut fleet, "infra-repair");
+    let report = fleet.tick();
+    assert_eq!(
+        backlog(&report)["fault_reminders"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{report}"
+    );
+    let reminders = fault_reminders(&fleet);
+    assert_eq!(reminders.len(), 1);
+    let body = reminders[0]["body"].as_str().unwrap();
+    for fact in [
+        "infra-repair",
+        "old-child-request",
+        "task:infra-child",
+        "task:infra-repair/waiting",
+        "task:infra-child/waiting",
+        "Nothing was replayed and no authority was granted",
+    ] {
+        assert!(body.contains(fact), "{fact}: {body}");
+    }
+    assert!(
+        reminders[0]["task_id"].is_null(),
+        "decision mail is not a task offer"
+    );
+    assert_eq!(schedule_record(&mut fleet, "infra-repair"), before);
+    assert!(poll(&mut fleet, true)["offer"].is_null());
+    assert!(fleet.prompts().is_empty());
+    assert!(
+        notices(&fleet).is_empty(),
+        "no duplicate idle alarm for a fault"
+    );
+}
+
+/// Each tick is a new dispatcher process: counters and spacing must survive.
+#[test]
+fn stranded_fault_reminders_survive_restarts_with_only_one_bounded_repeat() {
+    let mut fleet = Fleet::new(support::now_settings());
+    stranded(&mut fleet);
+    fleet.tick();
+    fleet.tick();
+    assert_eq!(fault_reminders(&fleet).len(), 1);
+    age_fault_reminders(&fleet, 7 * 3600);
+    fleet.tick();
+    assert_eq!(fault_reminders(&fleet).len(), 1);
+    age_fault_reminders(&fleet, 3600);
+    fleet.tick();
+    assert_eq!(fault_reminders(&fleet).len(), 2);
+    age_fault_reminders(&fleet, 365 * 86400);
+    fleet.tick();
+    assert_eq!(fault_reminders(&fleet).len(), 2);
+    assert_eq!(audits(&mut fleet, "scheduling.fault_reminder"), 2);
+    assert_eq!(status(&mut fleet, "infra-repair")["state"], "fault");
+}
+
+#[test]
+fn owner_dispositions_stop_stranded_fault_reminders() {
+    for disposition in [
+        "time",
+        "manual",
+        "enqueue",
+        "done",
+        "cancelled",
+        "blocked",
+        "handoff",
+    ] {
+        let mut fleet = Fleet::new(support::now_settings());
+        stranded(&mut fleet);
+        fleet.tick();
+        assert_eq!(fault_reminders(&fleet).len(), 1);
+        match disposition {
+            "time" => {
+                call(
+                    &mut fleet,
+                    "task.defer",
+                    json!({"id":"infra-repair",
+                "wait":{"kind":"time","reason":"Owner holds it", "until_ms":privateer::store::Store::now_ms()+86_400_000}}),
+                );
+            }
+            "manual" => {
+                call(
+                    &mut fleet,
+                    "task.defer",
+                    json!({"id":"infra-repair",
+                "wait":{"kind":"manual","reason":"Owner holds it"}}),
+                );
+            }
+            "enqueue" => {
+                enqueue(&mut fleet);
+            }
+            "handoff" => {
+                call(
+                    &mut fleet,
+                    "task.handoff",
+                    json!({"id":"infra-repair","actor":"infra","target":"apps"}),
+                );
+            }
+            status => {
+                call(
+                    &mut fleet,
+                    "task.update",
+                    json!({"id":"infra-repair","actor":"infra","status":status}),
+                );
+            }
+        }
+        age_fault_reminders(&fleet, 24 * 3600);
+        fleet.tick();
+        fleet.tick();
+        assert_eq!(fault_reminders(&fleet).len(), 1, "{disposition}");
+    }
+}
+
+#[test]
+fn a_new_fault_revision_has_its_own_reminder_budget() {
+    let mut fleet = Fleet::new(support::now_settings());
+    stranded(&mut fleet);
+    fleet.tick();
+    age_fault_reminders(&fleet, 8 * 3600);
+    fleet.tick();
+    assert_eq!(fault_reminders(&fleet).len(), 2);
+    // Explicit retry is the owner's decision, not the reminder's.
+    stranded(&mut fleet);
+    fleet.tick();
+    let reminders = fault_reminders(&fleet);
+    assert_eq!(reminders.len(), 3);
+    assert_ne!(
+        reminders[0]["payload"]["schedule_fault_reminder"]["revision"],
+        reminders[2]["payload"]["schedule_fault_reminder"]["revision"]
+    );
+}
+
+#[test]
+fn legacy_faults_get_a_durable_first_seen_grace() {
+    let mut fleet = Fleet::new(support::now_settings());
+    stranded(&mut fleet);
     fleet
         .store
         .connection()
         .execute(
-            "UPDATE task_schedule SET record=json_set(record,'$.state','fault','$.reason','again')
-             WHERE task_id='infra-repair'",
+            "UPDATE task_schedule SET record=json_remove(record,'$.faulted_ms')",
             [],
         )
         .unwrap();
-    pass(&fleet, 3600);
     fleet.tick();
-    assert_eq!(audits(&mut fleet, "backlog.productive"), 1);
-    assert_eq!(audits(&mut fleet, "backlog.unproductive"), 0);
+    fleet.tick();
+    assert!(fault_reminders(&fleet).is_empty());
+    age_fault_reminders(&fleet, 3600);
+    fleet.tick();
+    assert_eq!(fault_reminders(&fleet).len(), 1);
 }
 
 /// With more candidates than a notice lists, only a handled task resets the

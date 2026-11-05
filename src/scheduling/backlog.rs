@@ -6,6 +6,8 @@
 use super::*;
 use std::collections::HashSet;
 
+mod faults;
+
 /// How often a quiet ship may be mailed about its backlog, in seconds.
 pub(crate) const DEFAULT_SECS: u64 = 3_600;
 /// Unproductive wakes back off to this spacing, or the interval if longer.
@@ -26,7 +28,7 @@ pub(super) fn init(store: &Store) -> Result<()> {
            quiet INTEGER NOT NULL, evaluated INTEGER NOT NULL CHECK(evaluated IN (0,1)),
            considered TEXT NOT NULL, candidates TEXT NOT NULL, mail_id TEXT);",
     )?;
-    Ok(())
+    faults::init(store)
 }
 
 /// A task nothing will start, with the schedule revision it was seen at.
@@ -143,8 +145,8 @@ fn held_above(store: &Store, task: &str) -> Result<bool> {
 }
 
 /// The ship's open tasks that nothing will start, next first: unscheduled
-/// open ones, running ones nothing is moving (`context::idle_tasks`), and
-/// faulted schedules. A task waiting on an open request the ship sent, under
+/// open ones and running ones nothing is moving (`context::idle_tasks`).
+/// Faults have their own task-scoped reminder. A task waiting on an open request the ship sent, under
 /// a held ancestor, blocked, handed off or the duty task is never one.
 fn candidates(store: &Store, ship: &str, duty: &str) -> Result<Vec<Candidate>> {
     let idle: HashSet<String> = crate::context::idle_tasks(store, ship)?
@@ -155,12 +157,11 @@ fn candidates(store: &Store, ship: &str, duty: &str) -> Result<Vec<Candidate>> {
         "WITH RECURSIVE tree(root, id) AS (
            SELECT id, id FROM tasks WHERE owner=?1 AND status IN ('open','running')
            UNION SELECT tree.root, t.id FROM tasks t JOIN tree ON t.parent=tree.id)
-         SELECT t.id, t.title, t.rank, t.status, json_extract(s.record,'$.revision'),
-           json_extract(s.record,'$.reason')
+         SELECT t.id, t.title, t.rank, t.status
          FROM tasks t LEFT JOIN task_schedule s ON s.task_id=t.id
          WHERE t.owner=?1 AND t.status IN ('open','running') AND t.handoff_to IS NULL
            AND t.id<>?1||'-duty' AND t.id<>?2
-           AND (s.task_id IS NULL OR json_extract(s.record,'$.state')='fault')
+           AND s.task_id IS NULL
            AND NOT EXISTS(SELECT 1 FROM tree JOIN mail m ON m.task_id=tree.id
              WHERE tree.root=t.id AND m.sender=?1 AND m.state='open')
          ORDER BY t.rank IS NULL, t.rank, t.rowid LIMIT ?3",
@@ -172,33 +173,28 @@ fn candidates(store: &Store, ship: &str, duty: &str) -> Result<Vec<Candidate>> {
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<i64>>(2)?,
                 r.get::<_, String>(3)?,
-                r.get::<_, Option<i64>>(4)?,
-                r.get::<_, Option<String>>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
     let mut set = vec![];
-    for (id, title, rank, status, revision, reason) in rows {
+    for (id, title, rank, status) in rows {
         if status == "running" && !idle.contains(&id) {
             continue;
         }
         if held_above(store, &id)? {
             continue;
         }
-        let label = match (revision, status.as_str()) {
-            (Some(_), _) => format!(
-                "fault: {}",
-                clip(reason.as_deref().unwrap_or(""), REASON_CHARS)
-            ),
-            (None, "running") => "running, nothing moving it".into(),
-            (None, _) => "unscheduled".into(),
+        let label = if status == "running" {
+            "running, nothing moving it".into()
+        } else {
+            "unscheduled".into()
         };
         set.push(Candidate {
             id,
             title,
             rank,
-            revision: revision.map_or(0, |r| r.max(0) as u64),
+            revision: 0,
             label,
             stale: false,
         });
@@ -594,12 +590,21 @@ pub(crate) fn tick(store: &Store) -> Result<Vec<Value>> {
     let mut reports = vec![];
     for ship in crate::activation::ships(store)? {
         let name = ship["name"].as_str().unwrap_or("").to_owned();
-        reports.push(
-            consider(store, &name, &ship["first_mate"]).unwrap_or_else(|error| {
-                json!({"ship": name,
-                    "error": format!("{error:#}").chars().take(2_000).collect::<String>()})
-            }),
-        );
+        // Persist task-local reminders before the idle alarm's ship-wide
+        // gates. Ordinary mail delivery still enforces wake/route budgets.
+        let reminders = faults::consider(store, &name, &ship["first_mate"]);
+        let mut report = consider(store, &name, &ship["first_mate"]).unwrap_or_else(|error| {
+            json!({"ship": name,
+                "error": format!("{error:#}").chars().take(2_000).collect::<String>()})
+        });
+        match reminders {
+            Ok(ids) => report["fault_reminders"] = json!(ids),
+            Err(error) => {
+                report["fault_reminder_error"] =
+                    json!(format!("{error:#}").chars().take(2_000).collect::<String>())
+            }
+        }
+        reports.push(report);
     }
     Ok(reports)
 }
