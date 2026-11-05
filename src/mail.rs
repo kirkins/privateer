@@ -1540,6 +1540,12 @@ fn send_with_bound(
     );
     ensure!(from != to, "a mailbox cannot write to itself");
     let peer = recipient.as_ref().and_then(remote_peer).map(str::to_owned);
+    // Only a peer that runs on this machine fails a delivery because this
+    // caller may not write the recipient's home; see `deferred_write_error`.
+    let local_transport = match peer.as_deref() {
+        Some(peer) => crate::peers::local_transport(store, peer)?,
+        None => false,
+    };
     // A bound chat answer to a desk copy goes back over the machine link to
     // the home holding the request, which records or refuses the approval.
     let desk_answer = bound.is_some_and(|b| b.link.is_none())
@@ -1976,6 +1982,8 @@ fn send_with_bound(
         tx.commit()?;
         let mut existing = annotate(existing, Store::now_ms());
         existing["duplicate"] = json!(true);
+        // A retried send answers for the same queue as the first attempt did.
+        report_queued_delivery(&mut existing, local_transport);
         return Ok(existing);
     }
     confirm_stow(store, &payload)?;
@@ -2234,7 +2242,7 @@ fn send_with_bound(
     }
     // A committed send whose only failure was the opportunistic direct
     // delivery answers with its queue receipt, never with the write error.
-    report_queued_delivery(&mut result);
+    report_queued_delivery(&mut result, local_transport);
     // Keep ordinary native post-commit notifications, but expose only the
     // durable, content-free receipt on the linked approval gateway.
     Ok(linked_receipt.unwrap_or(result))
@@ -2251,8 +2259,21 @@ pub(crate) const QUEUED_DELIVERY: &str = "queued; the dispatcher delivers it";
 /// checkout, so the opportunistic direct delivery into another ship's home
 /// fails with EROFS, EACCES or EPERM (SQLite reports the last two as a
 /// read-only or unopenable database).
-fn deferred_write_error(error: &str) -> bool {
+///
+/// `local_transport` is the recipient peer's transport, and only a transport
+/// that runs on this machine can fail this way: an ssh peer's own refusal
+/// arrives as `peer transport exited with ...: <stderr>`, and a refusal such
+/// as `Permission denied (publickey).` is the far side's answer, which no
+/// dispatcher pass can fix. Text from a remote `ssh` client is refused even
+/// on a local transport, so the rewrite can never cover a publickey refusal.
+fn deferred_write_error(error: &str, local_transport: bool) -> bool {
+    if !local_transport {
+        return false;
+    }
     let error = error.to_ascii_lowercase();
+    if error.contains("publickey") {
+        return false;
+    }
     [
         "read-only file system",
         "permission denied",
@@ -2270,13 +2291,13 @@ fn deferred_write_error(error: &str) -> bool {
 /// captain a decision. The record keeps its `delivery_error` for the operator,
 /// who reads it with `mail.outbox`, and the message stays pending for the
 /// dispatcher.
-fn report_queued_delivery(result: &mut Value) {
+fn report_queued_delivery(result: &mut Value, local_transport: bool) {
     if result["delivery"] != json!("pending") {
         return;
     }
     if !result["delivery_error"]
         .as_str()
-        .is_some_and(deferred_write_error)
+        .is_some_and(|error| deferred_write_error(error, local_transport))
     {
         return;
     }
@@ -4116,6 +4137,64 @@ mod desk_placement_tests {
             Mark::Privileged,
         ] {
             assert!(!records_desk_placement(&mark));
+        }
+    }
+}
+
+#[cfg(test)]
+mod queued_delivery_tests {
+    use super::*;
+
+    fn deferred(error: &str) -> Value {
+        json!({"delivery":"pending","delivery_error":error})
+    }
+
+    #[test]
+    fn only_a_local_transports_write_refusal_reads_as_queued() {
+        // A sandbox's own refusal to write the recipient's home.
+        for error in [
+            "unable to open database file: Permission denied (os error 13)",
+            "attempt to write a readonly database",
+            "read-only file system (os error 30)",
+            "launch peer transport: Operation not permitted (os error 1)",
+        ] {
+            assert!(deferred_write_error(error, true), "{error}");
+            let mut result = deferred(error);
+            report_queued_delivery(&mut result, true);
+            assert_eq!(result["delivery"], QUEUED_DELIVERY, "{error}");
+            assert_eq!(result["queued"], json!(true), "{error}");
+            assert!(result.get("delivery_error").is_none(), "{error}");
+        }
+        // The same text from an ssh peer is the far side's answer: the
+        // dispatcher can never fix it, so it stays pending with its reason.
+        let publickey = "peer transport exited with exit status: 255: \
+                         apps@fleet.example: Permission denied (publickey).";
+        assert!(!deferred_write_error(publickey, false));
+        let mut result = deferred(publickey);
+        report_queued_delivery(&mut result, false);
+        assert_eq!(result["delivery"], json!("pending"));
+        assert_eq!(result["delivery_error"], json!(publickey));
+        assert!(result.get("queued").is_none());
+        // A publickey refusal never reads as queued, whatever the transport.
+        assert!(!deferred_write_error(publickey, true));
+        // An ssh transport's own local launch refusal (the ssh client itself
+        // is not executable) is not ours to rewrite either.
+        let launch = "launch peer transport: Permission denied (os error 13)";
+        assert!(!deferred_write_error(launch, false));
+        // A peer that answered or was absent is unchanged.
+        for error in [
+            "peer refused delivery",
+            "peer call timed out after 10000 milliseconds",
+            "peer response missing boolean ok",
+        ] {
+            assert!(!deferred_write_error(error, true), "{error}");
+        }
+        // Nothing is rewritten unless delivery is still pending.
+        for delivery in [json!("delivered"), json!("quarantined"), json!(null)] {
+            let mut result = deferred("read-only file system");
+            result["delivery"] = delivery.clone();
+            report_queued_delivery(&mut result, true);
+            assert_eq!(result["delivery"], delivery);
         }
     }
 }

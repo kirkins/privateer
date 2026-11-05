@@ -1554,6 +1554,18 @@ fn a_send_that_cannot_write_the_recipient_home_reports_its_queue_receipt() {
             "{text} reached the sender: {heard}"
         );
     }
+    // A retried send answers for the queue as well, instead of returning the
+    // stored write error the sender already knows about.
+    let retried = ok(
+        &alpha,
+        "mail.send",
+        json!({"id":"deferred-send","from":"apps","to":"infra",
+            "kind":"request","body":"Is staging healthy?"}),
+    );
+    assert_eq!(retried["duplicate"], true, "{retried}");
+    assert_eq!(retried["delivery"], "queued; the dispatcher delivers it");
+    assert_eq!(retried["queued"], true);
+    assert!(retried.get("delivery_error").is_none(), "{retried}");
     // The message is durably queued, and the record keeps the real reason for
     // the operator who reads the outbox.
     let outbox = ok(
@@ -1576,6 +1588,99 @@ fn a_send_that_cannot_write_the_recipient_home_reports_its_queue_receipt() {
     assert_eq!(flushed["delivered"], 1, "{flushed}");
     let inbox = ok(&beta, "mail.inbox", json!({"address":"infra"}));
     assert_eq!(inbox["messages"][0]["id"], "deferred-send");
+}
+
+/// A refusal that arrives over an ssh peer is the far side's answer, not this
+/// caller's sandbox: it keeps the message pending with its reason in the reply
+/// instead of reading as queued, so no ship waits for a dispatcher pass that
+/// could never fix it (issue 731 review).
+#[cfg(unix)]
+#[test]
+fn an_ssh_peers_publickey_refusal_stays_pending_with_its_error() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    let temp = tempdir();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (alpha, beta) = (root.join("alpha"), root.join("beta"));
+    fs::create_dir_all(&beta).unwrap();
+    // A stand-in ssh client: it consumes the request and refuses the login,
+    // which is what a missing key on the other machine prints. No network.
+    let ssh = root.join("fake-ssh");
+    fs::write(
+        &ssh,
+        "#!/bin/sh\ncat >/dev/null\necho 'apps@fleet.example: Permission denied (publickey).' >&2\nexit 255\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |home: &Path, command: &str, args: Value| {
+        support::isolated(&root)
+            .env("PRIVATEER_SSH_EXECUTABLE", &ssh)
+            .args([
+                "--home",
+                home.to_str().unwrap(),
+                command,
+                "--json",
+                &args.to_string(),
+            ])
+            .output()
+            .unwrap()
+    };
+    let ok = |home: &Path, command: &str, args: Value| -> Value {
+        let output = run(home, command, args);
+        assert!(
+            output.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    ok(
+        &alpha,
+        "peer.put",
+        json!({"name":"home-b","transport":"ssh","host":"ops@fleet.example",
+            "executable":env!("CARGO_BIN_EXE_privateer"),"home":beta}),
+    );
+    ok(&alpha, "ship.put", json!({"name":"apps","scope":"apps"}));
+    ok(
+        &alpha,
+        "ship.put",
+        json!({"name":"infra","scope":"deploys","location":{"peer":"home-b"}}),
+    );
+    let sent = ok(
+        &alpha,
+        "mail.send",
+        json!({"id":"ssh-refused","from":"apps","to":"infra",
+            "kind":"request","body":"Is staging healthy?"}),
+    );
+    assert_eq!(sent["delivery"], "pending", "{sent}");
+    assert!(sent.get("queued").is_none(), "{sent}");
+    let error = sent["delivery_error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("Permission denied (publickey)"),
+        "the refusal was not reported: {sent}"
+    );
+    // The record is unchanged for the operator, and a retry says the same.
+    let outbox = ok(
+        &alpha,
+        "mail.outbox",
+        json!({"from":"apps","delivery":"pending"}),
+    );
+    assert_eq!(outbox["messages"][0]["id"], "ssh-refused");
+    let retried = ok(
+        &alpha,
+        "mail.send",
+        json!({"id":"ssh-refused","from":"apps","to":"infra",
+            "kind":"request","body":"Is staging healthy?"}),
+    );
+    assert_eq!(retried["duplicate"], true, "{retried}");
+    assert_eq!(retried["delivery"], "pending", "{retried}");
+    assert!(retried.get("queued").is_none(), "{retried}");
+    assert!(
+        retried["delivery_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("Permission denied (publickey)")),
+        "{retried}"
+    );
 }
 
 #[test]
