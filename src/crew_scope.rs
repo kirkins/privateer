@@ -421,7 +421,7 @@ fn needs_records(chain: &[Ancestor], comms: &[String]) -> bool {
 /// record there accounts for may be the caller's supervisor in a home this
 /// caller cannot name, so the caller is refused rather than resolved as if
 /// it had none.
-fn find_supervisor(
+pub(crate) fn find_supervisor(
     chain: &[Ancestor],
     homes: &[PathBuf],
     comms: &[String],
@@ -501,7 +501,7 @@ fn proves(recorded: &Value, ancestor: &Ancestor) -> Result<bool> {
 
 /// The homes a caller can name: the target and every home the real
 /// registry lists, canonical and once each.
-fn world_homes(target: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn world_homes(target: Option<&Path>) -> Vec<PathBuf> {
     let mut homes: Vec<PathBuf> = target.map(Path::to_owned).into_iter().collect();
     if let Some(registry) = real_registry().filter(|r| r.is_file()) {
         let listed = Connection::open_with_flags(&registry, OpenFlags::SQLITE_OPEN_READ_ONLY)

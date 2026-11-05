@@ -181,8 +181,9 @@ pub(super) fn ensure_leaves_sandbox(found: &Found, _claimed_sandbox: &str) -> Re
             .ok()
             .map(|link| link.to_string_lossy().into_owned())
     };
-    let theirs =
-        namespace(found.pid).with_context(|| format!("process {} has exited", found.pid))?;
+    let theirs = std::fs::read_link(format!("/proc/{}/ns/pid", found.pid))
+        .map(|link| link.to_string_lossy().into_owned())
+        .map_err(|error| namespace_unread(found.pid, &error))?;
     if Some(theirs.as_str()) == crate::jobs::pid_namespace() {
         return Ok(());
     }
@@ -196,6 +197,23 @@ pub(super) fn ensure_leaves_sandbox(found: &Found, _claimed_sandbox: &str) -> Re
         never_leaves(found.pid, "its own PID namespace")
     );
     Ok(())
+}
+
+/// Why a requester's `/proc/<pid>/ns/pid` could not be read: it has exited
+/// (ENOENT, ESRCH), or it is alive and the kernel denied the read (EACCES,
+/// EPERM), or something else failed. Each is refused, never read as leaving
+/// its sandbox.
+#[cfg(target_os = "linux")]
+pub(super) fn namespace_unread(pid: u32, error: &std::io::Error) -> anyhow::Error {
+    match error.raw_os_error() {
+        Some(libc::ENOENT | libc::ESRCH) => anyhow::anyhow!("process {pid} has exited"),
+        Some(libc::EACCES | libc::EPERM) => anyhow::anyhow!(
+            "the kernel denied reading the PID namespace of process {pid} (/proc/{pid}/ns/pid: {error}), so whether it leaves its sandbox cannot be told"
+        ),
+        _ => anyhow::anyhow!(
+            "the PID namespace of process {pid} could not be read (/proc/{pid}/ns/pid: {error}), so whether it leaves its sandbox cannot be told"
+        ),
+    }
 }
 
 /// Whether process `pid` runs in a Seatbelt sandbox, by libsystem_sandbox's

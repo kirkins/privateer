@@ -471,14 +471,15 @@ fn a_proven_job_in_another_home_is_judged_from_that_home() {
     job(&other, "cove-writer", json!({}));
     job(&other, "cove-reader", json!({"codex_read_only_crew": true}));
     let elsewhere = Some(other.home());
+    let listed = [std::fs::canonicalize(other.home()).unwrap()];
     let proven = |id: &str| vec![(id.to_owned(), true)];
     // Absent here, loadable where it was proven: judged there.
     assert_eq!(
-        containment(&store, elsewhere, &proven("cove-writer")).unwrap(),
+        containment(&store, elsewhere, &listed, &proven("cove-writer")).unwrap(),
         None
     );
     assert_eq!(
-        containment(&store, elsewhere, &proven("cove-reader")).unwrap(),
+        containment(&store, elsewhere, &listed, &proven("cove-reader")).unwrap(),
         Some(("cove-reader".to_owned(), "read-only"))
     );
     // A crew classified with the proven job is judged there too.
@@ -486,6 +487,7 @@ fn a_proven_job_in_another_home_is_judged_from_that_home() {
         containment(
             &store,
             elsewhere,
+            &listed,
             &[("cove-writer".into(), true), ("cove-reader".into(), true)]
         )
         .unwrap(),
@@ -493,24 +495,158 @@ fn a_proven_job_in_another_home_is_judged_from_that_home() {
     );
     // Without a proven home the record is looked for here, and missing.
     assert_eq!(
-        containment(&store, None, &proven("cove-writer")).unwrap(),
+        containment(&store, None, &listed, &proven("cove-writer")).unwrap(),
         Some(("cove-writer".to_owned(), UNREADABLE))
     );
     // A proven home that is gone, or holds no such job, is unknown.
     let gone = other_dir.path().join("no-such-home");
     assert_eq!(
-        containment(&store, Some(&gone), &proven("cove-writer")).unwrap(),
+        containment(&store, Some(&gone), &listed, &proven("cove-writer")).unwrap(),
         Some(("cove-writer".to_owned(), UNREADABLE))
     );
     assert_eq!(
-        containment(&store, elsewhere, &proven("cove-missing")).unwrap(),
+        containment(&store, elsewhere, &listed, &proven("cove-missing")).unwrap(),
         Some(("cove-missing".to_owned(), UNREADABLE))
     );
     // A job only PRIVATEER_JOB names is looked for in this home, and a
     // missing one is tolerated, as before.
     assert_eq!(
-        containment(&store, elsewhere, &[("cove-reader".into(), false)]).unwrap(),
+        containment(&store, elsewhere, &listed, &[("cove-reader".into(), false)]).unwrap(),
         None
+    );
+}
+
+/// Review 76c970dc: a requester whose PID namespace link cannot be read is
+/// refused either way, and the text says whether it exited or the read was
+/// denied while it lives.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unreadable_namespace_says_whether_the_requester_exited_or_was_denied() {
+    let text = |errno| {
+        identify::namespace_unread(42, &std::io::Error::from_raw_os_error(errno)).to_string()
+    };
+    for errno in [libc::ENOENT, libc::ESRCH] {
+        assert_eq!(text(errno), "process 42 has exited");
+    }
+    for errno in [libc::EACCES, libc::EPERM] {
+        let text = text(errno);
+        assert!(
+            text.contains("denied") && !text.contains("exited"),
+            "{text}"
+        );
+        assert!(text.contains("/proc/42/ns/pid"), "{text}");
+    }
+    let other = text(libc::EIO);
+    assert!(
+        other.contains("could not be read") && !other.contains("exited"),
+        "{other}"
+    );
+    // A real read of a process that is gone gives ENOENT.
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    let error = std::fs::read_link(format!("/proc/{pid}/ns/pid")).unwrap_err();
+    assert_eq!(
+        identify::namespace_unread(pid, &error).to_string(),
+        format!("process {pid} has exited")
+    );
+}
+
+/// Review 76c970dc: from outside a sandbox every argv is visible, so a
+/// requester that can write files can start its own process with a
+/// `_job-supervise` argv, nearer than its real supervisor, pointed at a
+/// database it wrote whose record names that process as the supervisor of a
+/// job that writes. The walk believes it (that weakness predates the
+/// launcher); containment does not, because the home is not one the caller
+/// could name: it is refused as unknown, never read as no containment.
+#[test]
+fn a_fake_nearer_supervisor_in_an_unlisted_home_stays_contained() {
+    use crate::crew_scope::ancestry::Ancestor;
+    let (_dir, store) = home();
+    let forged_dir = tempfile::tempdir().unwrap();
+    let forged = Store::open(&forged_dir.path().join("decoy")).unwrap();
+    const REAL_START: &str = "Mon Nov  2 09:00:00 2026";
+    const FAKE_START: &str = "Mon Nov  2 09:30:00 2026";
+    let job = |store: &Store, id: &str, pid: u32, started: &str, extra: Value| {
+        let mut record = json!({"id": id, "task_id": "harbor-duty", "incarnation": "alpha",
+            "command": ["true"], "cwd": "/ships/harbor", "action": "spawn", "heavy": false,
+            "timeout_secs": 60, "ledger": "/ships/ledger", "status": "running",
+            "created_ms": 0, "cancel_requested": false,
+            "supervisor": {"pid": pid, "started": started, "pid_namespace": null}});
+        for (key, value) in extra.as_object().unwrap() {
+            record[key] = value.clone();
+        }
+        store
+            .connection()
+            .execute(
+                "INSERT INTO jobs(id, record) VALUES(?1, ?2)",
+                params![id, record.to_string()],
+            )
+            .unwrap();
+        crate::jobs::record(store, id).unwrap();
+    };
+    // The requester's real job, in this home: a read-only crew.
+    job(
+        &store,
+        "harbor-reader",
+        200,
+        REAL_START,
+        json!({"codex_read_only_crew": true}),
+    );
+    // The forgery: the same job id, recorded as a writer, supervised by the
+    // requester's own process 250.
+    job(&forged, "harbor-reader", 250, FAKE_START, json!({}));
+    let supervise = |home: &Path| {
+        Some(
+            [
+                "privateer",
+                "--home",
+                &home.display().to_string(),
+                "_job-supervise",
+                "harbor-reader",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        )
+    };
+    let ancestor = |pid: u32, started: &str, argv: Option<Vec<String>>| Ancestor {
+        pid,
+        started: Some(started.into()),
+        comm: Some("privateer".into()),
+        argv,
+    };
+    let chain = [
+        ancestor(300, FAKE_START, Some(vec!["codex".into(), "exec".into()])),
+        ancestor(250, FAKE_START, supervise(forged.home())),
+        ancestor(200, REAL_START, supervise(store.home())),
+    ];
+    let comms = ["privateer".to_owned()];
+    let (proven_home, proven_job, _) = crate::crew_scope::find_supervisor(&chain, &[], &comms, 0)
+        .unwrap()
+        .unwrap();
+    let forged_home = std::fs::canonicalize(forged.home()).unwrap();
+    assert_eq!(
+        (&proven_home, proven_job.as_str()),
+        (&forged_home, "harbor-reader")
+    );
+    let jobs = [("harbor-reader".to_owned(), true)];
+    // The homes this caller can name: this one only. The forged home is not
+    // believed, so the job is refused as unknown.
+    let listed = [std::fs::canonicalize(store.home()).unwrap()];
+    assert_eq!(
+        containment(&store, Some(&proven_home), &listed, &jobs).unwrap(),
+        Some(("harbor-reader".to_owned(), UNREADABLE))
+    );
+    // Had the forged home been believed, the writer record would have let
+    // the launch out of the sandbox: what the listing check prevents.
+    assert_eq!(
+        containment(&store, Some(&proven_home), &[forged_home], &jobs).unwrap(),
+        None
+    );
+    // The real supervisor's home is this one, judged here: read-only.
+    assert_eq!(
+        containment(&store, Some(store.home()), &listed, &jobs).unwrap(),
+        Some(("harbor-reader".to_owned(), "read-only"))
     );
 }
 

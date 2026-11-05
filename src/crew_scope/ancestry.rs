@@ -1006,8 +1006,10 @@ mod tests {
                 "{members:?}"
             );
             let table = crate::jobs::process_table().unwrap();
+            assert!(!table.independent(pid));
+            let table = table.rows;
             let row = table.iter().find(|row| row.0 == pid).copied();
-            assert_eq!(row, Some((pid, me, group, false)));
+            assert_eq!(row, Some((pid, me, group)));
             // Every process both saw is the same (pid, parent, group); a
             // process may start or end between the two reads.
             let ps = ps_table();
@@ -1016,7 +1018,7 @@ mod tests {
                 .filter(|row| ps.iter().any(|p| p.0 == row.0))
                 .count();
             assert!(common > 0);
-            for (pid, ppid, pgid, _) in &table {
+            for (pid, ppid, pgid) in &table {
                 if let Some(p) = ps.iter().find(|p| p.0 == *pid) {
                     assert_eq!((p.1, p.2), (*ppid, *pgid), "process {pid}");
                 }
@@ -1121,7 +1123,7 @@ mod tests {
                 "own_identity": read(crate::jobs::own_identity()),
                 "group_members": read(crate::jobs::group_members(unsafe { libc::getpgrp() } as u32)),
                 "child_pids": read(crate::jobs::child_pids(parent)),
-                "process_table": read(crate::jobs::process_table()),
+                "process_table": read(crate::jobs::process_table().map(|table| table.rows)),
             });
             eprintln!(
                 "\nPROBE {}",

@@ -2083,34 +2083,59 @@ fn independently_supervised(args: &str) -> bool {
         || words.last() == Some(&"serve")
         || words.windows(2).any(|w| w == ["door", "run"])
 }
-/// Live processes as (pid, parent, process group, independently supervised).
-/// macOS reads one `sysctl kern.proc.all` and each process's argv from
-/// `kern.procargs2`, as `ps` does. Codex's Seatbelt profile has no rule for
-/// `kern.proc.all`, so inside that sandbox this may fail, as a sandbox limit.
-/// An argv the kernel does not show (another user's process) is no
-/// supervisor's, as `ps` printing only the command name was.
+/// Live processes, as (pid, parent, process group) `rows`, and which of them
+/// are independently supervised.
+pub(crate) struct ProcessTable {
+    pub(crate) rows: Vec<(u32, u32, u32)>,
+    /// Linux: the independently supervised pids, from the same `ps` read.
+    #[cfg(not(target_os = "macos"))]
+    independent: std::collections::HashSet<u32>,
+}
+
+impl ProcessTable {
+    /// Whether `pid` is independently supervised. macOS reads its argv from
+    /// `kern.procargs2` now, as `ps` does, so a caller asks only of the
+    /// processes it walks. An argv the kernel does not show (another user's
+    /// process) is no supervisor's, as `ps` printing only the command name
+    /// was.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn independent(&self, pid: u32) -> bool {
+        crate::crew_scope::ancestry::argv(pid)
+            .is_ok_and(|argv| independently_supervised(&argv.join(" ")))
+    }
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn independent(&self, pid: u32) -> bool {
+        self.independent.contains(&pid)
+    }
+}
+
+/// The live processes. macOS reads one `sysctl kern.proc.all`, and no argv
+/// until `ProcessTable::independent` asks. Codex's Seatbelt profile has no
+/// rule for `kern.proc.all`, so inside that sandbox this may fail, as a
+/// sandbox limit.
 #[cfg(target_os = "macos")]
-pub(crate) fn process_table() -> Result<Vec<(u32, u32, u32, bool)>> {
+pub(crate) fn process_table() -> Result<ProcessTable> {
     let table = crate::crew_scope::ancestry::all()
         .map_err(|error| kernel_read_failed("the process table", "kern.proc.all", &error))?;
-    Ok(table
-        .into_iter()
-        .filter(|entry| !entry.zombie)
-        .map(|entry| {
-            let independent = crate::crew_scope::ancestry::argv(entry.pid)
-                .is_ok_and(|argv| independently_supervised(&argv.join(" ")));
-            (entry.pid, entry.ppid, entry.pgid, independent)
-        })
-        .collect())
+    Ok(ProcessTable {
+        rows: table
+            .into_iter()
+            .filter(|entry| !entry.zombie)
+            .map(|entry| (entry.pid, entry.ppid, entry.pgid))
+            .collect(),
+    })
 }
-/// Live processes as (pid, parent, process group, independently supervised).
+/// The live processes, from one `ps` read of each one's argv.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn process_table() -> Result<Vec<(u32, u32, u32, bool)>> {
+pub(crate) fn process_table() -> Result<ProcessTable> {
     let output = Command::new("ps")
         .args(["-eo", "pid=,ppid=,pgid=,stat=,args="])
         .output()?;
     ensure!(output.status.success(), "process inspection failed");
-    let mut table = vec![];
+    let mut table = ProcessTable {
+        rows: vec![],
+        independent: Default::default(),
+    };
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let mut fields = line.split_whitespace();
         let (Some(pid), Some(parent), Some(group), Some(stat)) =
@@ -2121,13 +2146,12 @@ pub(crate) fn process_table() -> Result<Vec<(u32, u32, u32, bool)>> {
         if stat.starts_with('Z') {
             continue;
         }
+        let pid = pid.parse()?;
+        table.rows.push((pid, parent.parse()?, group.parse()?));
         let args = fields.collect::<Vec<_>>().join(" ");
-        table.push((
-            pid.parse()?,
-            parent.parse()?,
-            group.parse()?,
-            independently_supervised(&args),
-        ));
+        if independently_supervised(&args) {
+            table.independent.insert(pid);
+        }
     }
     Ok(table)
 }
@@ -2153,17 +2177,16 @@ fn escaped_descendants(payload: &Process, known: &[Process]) -> Result<Vec<Proce
     }
     let table = process_table()?;
     let mut children: std::collections::HashMap<u32, Vec<(u32, u32)>> = Default::default();
-    for (pid, parent, group, independent) in table {
-        // Independently supervised processes and everything under them are
-        // their own jobs' business.
-        if !independent {
-            children.entry(parent).or_default().push((pid, group));
-        }
+    for &(pid, parent, group) in &table.rows {
+        children.entry(parent).or_default().push((pid, group));
     }
     let mut seen: std::collections::HashSet<u32> = roots.iter().copied().collect();
     while let Some(parent) = roots.pop() {
         for &(pid, group) in children.get(&parent).map(Vec::as_slice).unwrap_or(&[]) {
-            if !seen.insert(pid) {
+            // Independently supervised processes and everything under them
+            // are their own jobs' business. Only the processes this walk
+            // reaches are asked about (macOS reads each one's argv).
+            if !seen.insert(pid) || table.independent(pid) {
                 continue;
             }
             roots.push(pid);

@@ -643,7 +643,14 @@ fn carry_out(home: &Path, conn: &Connection, row: &Row, me: &str) -> Result<Carr
         .chain(crew.as_ref().map(|c| (c.crew.clone(), true)))
         .collect();
     let proven_home = crate::crew_scope::proven_home();
-    if let Some((id, what)) = containment(&store, proven_home.as_deref(), &jobs)? {
+    // A visible `_job-supervise` argv names the home it proves in, and from
+    // outside every argv is visible, so a home is trusted only when the
+    // caller could name it anyway: this one, or one the real registry lists.
+    let listed = match &proven_home {
+        Some(_) => crate::crew_scope::world_homes(Some(home)),
+        None => vec![],
+    };
+    if let Some((id, what)) = containment(&store, proven_home.as_deref(), &listed, &jobs)? {
         return Ok(Carried::Refused(contained_refusal(&row.command, &id, what)));
     }
     store.audit(
@@ -687,16 +694,29 @@ fn contained(store: &Store, job: &str, proven: bool) -> Result<Option<&'static s
 /// closed, each judged from the home that holds its record: a proven job,
 /// and the crew classified with it, from `proven_home`, the home the walk
 /// proved it in, which may be another ship's than this one; any other job
-/// from this home. A proven home that cannot be opened is an unknown
-/// containment, never none.
+/// from this home. A proven home is believed only when it is this home or
+/// one of `listed` (canonical: this home and those the real registry
+/// lists): the walk takes a visible supervisor's home from its argv, which
+/// a requester can forge with a process of its own pointed at a database it
+/// wrote. A proven home that is not listed, or cannot be opened, is an
+/// unknown containment, never none.
 fn containment(
     store: &Store,
     proven_home: Option<&Path>,
+    listed: &[PathBuf],
     jobs: &[(String, bool)],
 ) -> Result<Option<(String, &'static str)>> {
     let elsewhere = proven_home
         .filter(|home| *home != store.home())
-        .map(|home| Store::open_readonly(home, Caller::Operator));
+        .map(|home| {
+            let canonical = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_owned());
+            ensure!(
+                listed.contains(&canonical),
+                "home {} is neither this home nor one the fleet registry lists",
+                home.display()
+            );
+            Store::open_readonly(home, Caller::Operator)
+        });
     for (id, proven) in jobs {
         let what = match (&elsewhere, proven) {
             (Some(Ok(other)), true) => contained(other, id, true)?,
