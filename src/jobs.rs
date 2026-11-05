@@ -1775,6 +1775,19 @@ fn kernel_read_failed(what: &str, read: &str, error: &std::io::Error) -> anyhow:
         "cannot inspect {what}: sysctl {read} failed ({error}). Inside a sandbox such as Codex's this is a limit of the sandbox, not a missing Privateer permission: run the command outside the sandbox"
     )
 }
+/// Tests only: fail a process-table or process-group read while the marker
+/// file `PRIVATEER_TEST_PROCESS_FAULT` names exists. Elsewhere those reads run
+/// `ps`, which a test fails with a fake `ps` on PATH; macOS reads the kernel,
+/// so tests/jobs.rs injects the same failure here, at the same reads.
+#[cfg(all(feature = "test-process-faults", target_os = "macos"))]
+fn test_process_fault() -> Result<()> {
+    let marker = std::env::var_os("PRIVATEER_TEST_PROCESS_FAULT");
+    ensure!(
+        marker.is_none_or(|marker| !Path::new(&marker).exists()),
+        "process inspection failed (test fault)"
+    );
+    Ok(())
+}
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn identity(pid: u32) -> Result<Option<Process>> {
     // lstart is rendered in local time and locale; pin both.
@@ -2023,6 +2036,8 @@ pub(crate) fn census_payload(record: &Value) -> Result<Option<String>> {
 /// kern.proc.pgrp.<group>`, which Codex's Seatbelt profile allows.
 #[cfg(target_os = "macos")]
 pub(crate) fn group_members(group: u32) -> Result<Vec<u32>> {
+    #[cfg(feature = "test-process-faults")]
+    test_process_fault()?;
     let members = crate::crew_scope::ancestry::group(group).map_err(|error| {
         kernel_read_failed(
             "a process group",
@@ -2115,6 +2130,8 @@ impl ProcessTable {
 /// sandbox limit.
 #[cfg(target_os = "macos")]
 pub(crate) fn process_table() -> Result<ProcessTable> {
+    #[cfg(feature = "test-process-faults")]
+    test_process_fault()?;
     let table = crate::crew_scope::ancestry::all()
         .map_err(|error| kernel_read_failed("the process table", "kern.proc.all", &error))?;
     Ok(ProcessTable {

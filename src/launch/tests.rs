@@ -498,8 +498,16 @@ fn a_proven_job_in_another_home_is_judged_from_that_home() {
         containment(&store, None, &listed, &proven("cove-writer")).unwrap(),
         Some(("cove-writer".to_owned(), UNREADABLE))
     );
-    // A proven home that is gone, or holds no such job, is unknown.
+    // A proven home the registry lists that is gone cannot be opened, and
+    // is unknown; so is one that holds no such job.
     let gone = other_dir.path().join("no-such-home");
+    assert!(Store::open_readonly(&gone, Caller::Operator).is_err());
+    let listed_gone = [listed[0].clone(), gone.clone()];
+    assert_eq!(
+        containment(&store, Some(&gone), &listed_gone, &proven("cove-writer")).unwrap(),
+        Some(("cove-writer".to_owned(), UNREADABLE))
+    );
+    // One the registry does not list is refused before any open.
     assert_eq!(
         containment(&store, Some(&gone), &listed, &proven("cove-writer")).unwrap(),
         Some(("cove-writer".to_owned(), UNREADABLE))
