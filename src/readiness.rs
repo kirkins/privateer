@@ -40,7 +40,6 @@ const TREEHOUSE_INSTALL: &str =
     "install Treehouse 3.1.2 or later, see https://github.com/kunchenguid/treehouse#install";
 const HERDR_INSTALL: &str = "install Herdr so herdr is on the dispatcher's PATH";
 const SSH_INSTALL: &str = "install an OpenSSH client so ssh is on the dispatcher's PATH";
-#[cfg(target_os = "linux")]
 const BWRAP_INSTALL: &str = "install bubblewrap (bwrap) with your package manager; if it is installed, allow it unprivileged user namespaces (Ubuntu 24+ AppArmor restrict_unprivileged_userns)";
 /// A failure is probed again this soon, since an install clears it.
 const FAIL_TTL_MS: i64 = 5 * 60_000;
