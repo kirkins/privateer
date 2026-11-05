@@ -25,6 +25,7 @@ B0_DISPATCHER_SHA256 = "13ebd926418ea7ee13ec7503fdf5d02ea54e13619ace2bc9413eb6e6
 B1_DISPATCHER_SHA256 = "a523c4c8500b1c42425a1ba16188f10763db9227cdeb56efc0d822ceefaae5e4"
 B2_DISPATCHER_SHA256 = "6a9c023e7cc6a52fd508dd449005aa83ee681c9f935e0b4800341f7237cc5388"
 B5A_DISPATCHER_SHA256 = "28c74254b8d4e82abd8aaf6d7e4b18482bd4880673fd08f3ad13a6725bba26ab"
+ACT3A_DISPATCHER_SHA256 = "798b08066b7d97d93cf7b42a2bf85cd7b8160c29aa3ea486ca6c43be39755b24"
 
 PATH_ENV = ("HOME", "CODEX_HOME", "PRIVATEER_FLEET", "PRIVATEER_RESOURCE_HOME", "TMPDIR",
             "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "PRIVATEER_SERVICE")
@@ -87,7 +88,29 @@ with registry.open("rb") as stream:
     preview_data = stream.read((1 << 20) + 1)
 if len(preview_data) > 1 << 20:
     raise ValueError("Codex launch exceeds limit")
-if event.get("session_id") != json.loads(preview_data).get("session"):
+preview = json.loads(preview_data)
+reason = None
+if event.get("session_id") != preview.get("session"):
+    reason = "callback_uuid_changed"
+elif event.get("source") == "resume":
+    # A second client and a native reconnect have identical callbacks. Neither
+    # proves renewed wait custody. Conservatively fence an already owned launch.
+    custody_path = registry.with_name("custody.json")
+    try:
+        info = custody_path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError("unsafe Codex custody state")
+        with custody_path.open("rb") as stream:
+            custody_data = stream.read((1 << 20) + 1)
+        if len(custody_data) > 1 << 20:
+            raise ValueError("Codex custody exceeds limit")
+        custody = json.loads(custody_data)
+        if custody.get("state") == "owned" and custody.get("generation") == preview.get("generation"):
+            reason = "resume_callback_requires_relaunch"
+if reason:
     custody_fence = registry.with_name("custody-poison.json")
     try:
         info = custody_fence.lstat()
@@ -104,7 +127,7 @@ if event.get("session_id") != json.loads(preview_data).get("session"):
     fd, name = tempfile.mkstemp(prefix=".poison-", dir=registry.parent)
     try:
         with os.fdopen(fd, "w") as stream:
-            json.dump({"token": str(uuid.uuid4()), "reason": "callback_uuid_changed"}, stream)
+            json.dump({"token": str(uuid.uuid4()), "reason": reason}, stream)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(name, custody_fence)
@@ -205,7 +228,7 @@ def install_dispatcher(directory):
         body = path.read_bytes()
         if body == DISPATCHER.encode():
             return
-        if hashlib.sha256(body).hexdigest() not in (B0_DISPATCHER_SHA256, B1_DISPATCHER_SHA256, B2_DISPATCHER_SHA256, B5A_DISPATCHER_SHA256):
+        if hashlib.sha256(body).hexdigest() not in (B0_DISPATCHER_SHA256, B1_DISPATCHER_SHA256, B2_DISPATCHER_SHA256, B5A_DISPATCHER_SHA256, ACT3A_DISPATCHER_SHA256):
             raise ValueError("Codex project dispatcher differs; inspect it before relaunch")
         # prepare holds the project lock and has refused any live owner. The
         # declaration/command stays unchanged; native trust is never rewritten.
@@ -319,8 +342,22 @@ def invalidate(registry, event=None):
                 event = {}
         if not isinstance(event, dict):
             event = {}
-        if event.get("session_id") != load(registry).get("session"):
-            publish_request(registry, "custody-poison.json", reason="callback_uuid_changed")
+        preview = load(registry)
+        reason = None
+        if event.get("session_id") != preview.get("session"):
+            reason = "callback_uuid_changed"
+        elif event.get("source") == "resume":
+            custody_path = registry.with_name("custody.json")
+            try:
+                safe(custody_path, private=True)
+            except FileNotFoundError:
+                pass
+            else:
+                custody = load(custody_path)
+                if custody.get("state") == "owned" and custody.get("generation") == preview.get("generation"):
+                    reason = "resume_callback_requires_relaunch"
+        if reason:
+            publish_request(registry, "custody-poison.json", reason=reason)
     with locked(registry.parent):
         previous = load(registry)
         record = dict(previous)
@@ -598,7 +635,11 @@ def control(record, command, args):
             child.wait()
 
 
-def validate_launch(record, event, daemon):
+class Superseded(ValueError):
+    """A newer callback/launch owns the result; do not stop its native turn."""
+
+
+def validate_launch(record, event):
     """Prove callback custody before settings failures can stop a TUI turn."""
     if not live(record) or Path(f"/proc/{record['pid']}/exe").resolve() != Path(record["executable"]):
         raise ValueError("Codex launch identity is stale")
@@ -617,13 +658,13 @@ def validate_launch(record, event, daemon):
         raise ValueError("Codex resume UUID does not match launch")
     if event["source"] == "compact" and session != record.get("binding", record.get("last_binding", {})).get("session"):
         raise ValueError("Codex compact callback has no matching binding")
-    if record.get("attach_daemon") is not None and record["attach_daemon"] != daemon_proof(daemon):
-        raise ValueError("Codex attach daemon changed; callback does not match launch")
     return session
 
 
 def validate(record, event, daemon):
-    session = validate_launch(record, event, daemon)
+    session = validate_launch(record, event)
+    if record.get("attach_daemon") is not None and record["attach_daemon"] != daemon_proof(daemon):
+        raise ValueError("Codex attach daemon changed; callback does not match launch")
     loaded = daemon.call("thread/loaded/list", {"limit": 32})
     if (not isinstance(loaded.get("data"), list) or "nextCursor" not in loaded
             or session not in loaded["data"] or loaded["nextCursor"] or len(loaded["data"]) > 32):
@@ -687,7 +728,7 @@ def bind(registry, event, context=None, on_launch_verified=None):
     if event.get("session_id") != record["session"]:
         publish_request(registry, "custody-poison.json", reason="callback_uuid_changed")
     with Daemon(record["codex_home"]) as daemon:
-        validate_launch(previous, event, daemon)
+        validate_launch(previous, event)
         presence = control(record, "ship.presence", {"ship": record["ship"]})
         if presence.get("attended") is not True or presence.get("lease", {}).get("holder") != record["holder"]:
             raise ValueError("Codex binding does not own current presence")
@@ -709,7 +750,7 @@ def bind(registry, event, context=None, on_launch_verified=None):
         current = load(registry)
         if (current.get("callback_generation") != token or current["generation"] != record["generation"]
                 or request_token(registry) != request):
-            raise ValueError("Codex binding superseded by a newer callback or launch")
+            raise Superseded("Codex binding superseded by a newer callback or launch")
         binding.update(fence_version=1, invalidation_token=request)
         current.update(binding=binding, last_binding=binding, state="bound", delivery_enabled=False)
         atomic(registry, current)
@@ -740,7 +781,7 @@ def main():
         result = {"systemMessage": "Privateer Codex binding UNBOUND (" + reason + "): inspect the launch, trusted project hook, presence and shared daemon; automatic mail remains disabled."}
         # SettingsError is defensive: bind checks live UUID/daemon/presence
         # custody before settings validation, which already arms stop_turn.
-        if stop_turn or isinstance(error, SettingsError):
+        if not isinstance(error, Superseded) and (stop_turn or isinstance(error, SettingsError)):
             result.update({"continue": False, "stopReason": reason})
         print(json.dumps(result))
 

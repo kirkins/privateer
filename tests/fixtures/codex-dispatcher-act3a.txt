@@ -1,0 +1,137 @@
+import fcntl, io, json, os, pathlib, runpy, stat, sys, tempfile, time, uuid
+sys.dont_write_bytecode = True
+registry = pathlib.Path(__file__).with_name("launch.json")
+for path in (registry.parent, registry):
+    info = path.lstat()
+    expected = stat.S_ISDIR if path == registry.parent else stat.S_ISREG
+    if not expected(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("unsafe Codex binding dispatcher state")
+# Publish before attempting the state lock. A timeout/crash cannot leave the old
+# binding usable. This code stays self-contained even if the release is gone.
+request = str(uuid.uuid4())
+fence = registry.with_name("invalidate.json")
+try:
+    info = fence.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("unsafe Codex invalidation request")
+    # Remove the old capability first. ENOSPC/write/fsync failure or a crash
+    # before rename must never leave the previous usable binding token.
+    os.unlink(fence)
+except FileNotFoundError:
+    pass  # A concurrent publisher already removed the old capability.
+parent = os.open(registry.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    os.fsync(parent)
+finally:
+    os.close(parent)
+fd, name = tempfile.mkstemp(prefix=".poison-", dir=registry.parent)
+try:
+    with os.fdopen(fd, "w") as stream:
+        json.dump({"token": request}, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(name, fence)
+    parent = os.open(registry.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+finally:
+    if os.path.exists(name):
+        os.unlink(name)
+# Wrong-UUID callbacks revoke custody BEFORE flock, including lock timeout.
+# Keep the original input for the release handler; never read stdin twice.
+event_data = sys.stdin.buffer.read((1 << 20) + 1)
+try:
+    event = json.loads(event_data) if len(event_data) <= 1 << 20 else {}
+except (ValueError, UnicodeError):
+    event = {}
+if not isinstance(event, dict):
+    event = {}
+# Even malformed/oversized callbacks still commit unbound state below.
+sys.stdin = io.TextIOWrapper(io.BytesIO(event_data), encoding="utf-8")
+with registry.open("rb") as stream:
+    preview_data = stream.read((1 << 20) + 1)
+if len(preview_data) > 1 << 20:
+    raise ValueError("Codex launch exceeds limit")
+if event.get("session_id") != json.loads(preview_data).get("session"):
+    custody_fence = registry.with_name("custody-poison.json")
+    try:
+        info = custody_fence.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError("unsafe Codex custody poison")
+        custody_fence.unlink()
+    except FileNotFoundError:
+        pass
+    parent = os.open(registry.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+    fd, name = tempfile.mkstemp(prefix=".poison-", dir=registry.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump({"token": str(uuid.uuid4()), "reason": "callback_uuid_changed"}, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, custody_fence)
+        parent = os.open(registry.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+lock = os.open(registry.with_name("lock"), os.O_CREAT | os.O_NOFOLLOW | os.O_RDWR, 0o600)
+try:
+    info = os.fstat(lock)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("unsafe Codex binding dispatcher lock")
+    deadline = time.monotonic() + 1
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Codex binding state lock timed out")
+            time.sleep(0.01)
+    with registry.open("rb") as stream:
+        data = stream.read((1 << 20) + 1)
+    if len(data) > 1 << 20:
+        raise ValueError("Codex binding dispatcher record exceeds limit")
+    previous = json.loads(data)
+    record = dict(previous)
+    token = str(uuid.uuid4())
+    record.update(state="unbound", delivery_enabled=False, callback_generation=token)
+    if "binding" in record:
+        record["last_binding"] = record.pop("binding")
+    fd, name = tempfile.mkstemp(prefix=".binding-", dir=registry.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(record, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, registry)
+        parent = os.open(registry.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+finally:
+    os.close(lock)
+# Invalidation is durable even when a release was pruned or is unsafe to load.
+handler = pathlib.Path(record["handler"])
+if not handler.is_absolute() or handler.name != "codex_binding.py":
+    raise ValueError("Codex binding handler must be absolute and named codex_binding.py")
+info = handler.lstat()
+if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+    raise ValueError("unsafe Codex binding handler")
+sys.path.insert(0, str(handler.parent))
+sys.argv = [str(handler), "--registry", str(registry)]
+runpy.run_path(str(handler), run_name="__main__",
+              init_globals={"_DISPATCH_CONTEXT": (previous, token, request), "_DISPATCH_EVENT": event_data})

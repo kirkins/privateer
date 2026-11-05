@@ -314,12 +314,47 @@ class BindingTests(unittest.TestCase):
         report.assert_not_called()
         self.assertEqual(codex_socket.load(self.registry)["state"], "unbound")
 
-    def test_wrong_daemon_or_presence_settings_callback_does_not_stop(self):
+    def test_replaced_attach_daemon_stops_verified_settings_launch(self):
         self.settings_launch()
-        for changed in ["daemon", "holder", "unattended"]:
+        self.record["attach_daemon"]["pid"] += 1
+        binding.atomic(self.registry, self.record)
+        with patch.object(binding, "Daemon", return_value=self.daemon), \
+                patch.object(binding, "control", return_value={
+                    "attended": True, "lease": {"holder": "host:alpha"}}) as report:
+            result = self.run_hook()
+        self.assertIs(result["continue"], False)
+        self.assertIn("attach daemon changed", result["stopReason"])
+        self.assertEqual([call.args[1] for call in report.call_args_list], ["ship.presence"])
+        self.assertEqual(codex_socket.load(self.registry)["state"], "unbound")
+
+    def test_superseded_settings_callback_does_not_stop_newer_turn(self):
+        self.settings_launch()
+        self.daemon.responses["thread/read"]["thread"].update(model="ship-model", reasoningEffort="high")
+        for newer in ["callback", "launch", "poison"]:
+            def report(record, command, args):
+                if command == "ship.presence":
+                    return {"attended": True, "lease": {"holder": "host:alpha"}}
+                current = codex_socket.load(self.registry)
+                if newer == "poison":
+                    binding.publish_request(self.registry)
+                elif newer == "launch":
+                    current["generation"] = str(uuid.uuid4())
+                else:
+                    current["callback_generation"] = str(uuid.uuid4())
+                binding.atomic(self.registry, current)
+                return {"recorded": True}
+            with self.subTest(newer=newer), patch.object(binding, "Daemon", return_value=self.daemon), \
+                    patch.object(binding, "control", side_effect=report):
+                result = self.run_hook()
+            self.assertIn("superseded", result["systemMessage"])
+            self.assertNotIn("continue", result)
+            self.assertNotIn("stopReason", result)
+            self.assertEqual(codex_socket.load(self.registry)["state"], "unbound")
+
+    def test_wrong_presence_settings_callback_does_not_stop(self):
+        self.settings_launch()
+        for changed in ["holder", "unattended"]:
             self.record["attach_daemon"] = binding.daemon_proof(self.daemon)
-            if changed == "daemon":
-                self.record["attach_daemon"]["pid"] += 1
             binding.atomic(self.registry, self.record)
             presence = {"attended": changed != "unattended", "lease": {
                 "holder": "other-holder" if changed == "holder" else "host:alpha"}}
@@ -695,6 +730,21 @@ class BindingTests(unittest.TestCase):
         self.assertEqual((self.cwd / ".codex/hooks.json").read_bytes(), hooks)
         self.assertFalse(codex_socket.load(self.registry)["delivery_enabled"])
 
+    def test_exact_act3a_dispatcher_migration_and_near_match_refusal(self):
+        path = self.registry.with_name("hook.py")
+        body = (ROOT / "tests/fixtures/codex-dispatcher-act3a.txt").read_bytes()
+        self.assertEqual(hashlib.sha256(body).hexdigest(), binding.ACT3A_DISPATCHER_SHA256)
+        hooks = (self.cwd / ".codex/hooks.json").read_bytes()
+        self.record["process_identity"]["bootId"] = "stale"
+        binding.atomic(self.registry, self.record)
+        path.write_bytes(body + b"\n")
+        with self.assertRaisesRegex(ValueError, "dispatcher differs"):
+            binding.prepare(self.argv, self.env)
+        path.write_bytes(body)
+        binding.prepare(self.argv, self.env)
+        self.assertEqual(path.read_text(), binding.DISPATCHER)
+        self.assertEqual((self.cwd / ".codex/hooks.json").read_bytes(), hooks)
+
     def test_near_b0_body_is_not_migrated(self):
         path = self.registry.with_name("hook.py")
         body = (ROOT / "tests/fixtures/codex-dispatcher-b0.txt").read_bytes() + b"\n"
@@ -761,6 +811,43 @@ class BindingTests(unittest.TestCase):
         poison = self.registry.with_name("custody-poison.json").read_bytes()
         self.bind_current()
         self.assertEqual(self.registry.with_name("custody-poison.json").read_bytes(), poison)
+
+    def test_same_uuid_resume_poison_precedes_lock_and_requires_relaunch(self):
+        bound = self.bind_current()
+        custody = {"state": "owned", "generation": bound["generation"]}
+        binding.atomic(self.registry.with_name("custody.json"), custody)
+        original = self.registry.read_bytes()
+        for native_dispatcher in (False, True):
+            with self.subTest(native_dispatcher=native_dispatcher):
+                before = codex_socket.load(self.registry.with_name("custody-poison.json"))["token"]
+                with binding.locked(self.registry.parent):
+                    if native_dispatcher:
+                        result = subprocess.run(shlex.split(bound["hook_command"]), input=json.dumps(self.event),
+                                                text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("state lock timed out", result.stderr)
+                    else:
+                        with self.assertRaises(TimeoutError):
+                            binding.bind(self.registry, self.event)
+                poison = codex_socket.load(self.registry.with_name("custody-poison.json"))
+                self.assertNotEqual(poison["token"], before)
+                self.assertEqual(poison["reason"], "resume_callback_requires_relaunch")
+                self.assertEqual(self.registry.read_bytes(), original)
+        # A successful compact may restore binding, never custody. Only prepare
+        # (an explicit new launch generation) can mint an unrevoked token.
+        poison = self.registry.with_name("custody-poison.json").read_bytes()
+        with patch.object(binding, "Daemon", return_value=self.daemon), \
+                patch.object(binding, "control", side_effect=[
+                    {"attended": True, "lease": {"holder": "host:alpha"}}, {"recorded": True}]):
+            binding.bind(self.registry, {**self.event, "source": "compact"})
+        self.assertEqual(self.registry.with_name("custody-poison.json").read_bytes(), poison)
+        self.assertEqual(codex_socket.load(self.registry)["state"], "bound")
+
+    def test_old_generation_custody_does_not_poison_new_resume(self):
+        binding.atomic(self.registry.with_name("custody.json"), {"state": "owned", "generation": "old-launch"})
+        before = self.registry.with_name("custody-poison.json").read_bytes()
+        self.bind_current()
+        self.assertEqual(self.registry.with_name("custody-poison.json").read_bytes(), before)
 
     def test_daemon_change_callback_revokes_custody_without_enabling_delivery(self):
         self.bind_current()
@@ -1436,6 +1523,104 @@ class ReceiptTests(unittest.TestCase):
         self.assertNotIn("turn_id", events[1])
         self.assertEqual(result["accepted_through"], 4)
         self.assertEqual(result["acknowledged_through"], 0)
+
+    def test_captured_pty_race_receipt_belongs_only_to_queue_turn(self):
+        captured = json.loads((ROOT / "tests/fixtures/codex-attended-pty.json").read_text())
+        race = captured["qualification"]["race"]
+        self.assertEqual(captured["provider_requests"], [{"path": "/v1/responses", "valid": True}])
+        self.assertEqual(race["busy_status"]["type"], "active")
+        self.assertEqual((race["mail_hook_count"], race["captain_hook_count"]), (1, 1))
+        self.intent(through=1)
+        self.ledger.invoking(self.session, self.nonce)
+        events = copy.deepcopy(race["events"])
+        users = [event for event in events if event["type"] == "user_message"]
+        self.assertEqual(len(users), 1)
+        users[0]["message"] = self.body  # only substitute this test's exact marker/body
+        starts = [event for event in events if event["type"] == "task_started"]
+        self.assertEqual([event["turn_attribution"]["turn_trigger"] for event in starts], ["queue", "user"])
+        self.append(*events)
+        # Reconstruct the reducer, as after a crash; CLI output is not a receipt.
+        self.ledger = receipts.Ledger(self.registry, self.offer_record["home"], "alpha")
+        result = self.reconcile()
+        self.assertEqual(result["evidence"]["receipt"], race["receipt"])
+        self.assertEqual(result["evidence"]["receipt"]["turn_id"], starts[0]["turn_id"])
+        self.assertEqual((result["accepted_through"], result["acknowledged_through"]), (1, 0))
+        self.assertEqual(self.reconcile()["evidence"]["receipt"], race["receipt"])
+
+    def test_captured_pty_submit_first_holds_mail_and_stops_without_receipt(self):
+        captured = json.loads((ROOT / "tests/fixtures/codex-attended-pty.json").read_text())
+        race = captured["qualification"]["submit_first_race"]
+        self.assertEqual((race["captain_hook_count"], race["mail_hook_count"]), (1, 1))
+        self.assertEqual(race["pending_count_before_release"], 1)
+        pending = race["pending"]
+        self.assertEqual(len(pending["data"]), 1)
+        self.assertIsNone(pending["nextCursor"])
+        self.assertEqual(pending["data"][0]["input"], [{"type": "text",
+            "text": "ACT3b mail after captain submission", "text_elements": []}])
+        events = race["events"]
+        self.assertEqual([event["turn_attribution"]["turn_trigger"] for event in events
+                          if event["type"] == "task_started"], ["user", "queue"])
+        self.assertFalse(any(event["type"] == "user_message" for event in events))
+        self.intent(through=1)
+        self.ledger.invoking(self.session, self.nonce)
+        self.append(*events)
+        result = self.reconcile()
+        self.assertEqual(result["state"], "uncertain")
+        self.assertEqual((result["accepted_through"], result["acknowledged_through"]), (0, 0))
+        self.assertNotIn("receipt", result["evidence"])
+
+    def test_captured_pty_draft_and_second_client_are_not_receipts_or_attachment(self):
+        captured = json.loads((ROOT / "tests/fixtures/codex-attended-pty.json").read_text())
+        qualification, hooks = captured["qualification"], captured["hooks"]
+        self.assertEqual(qualification["draft"], {"unsent_during_delivery": True,
+            "submitted_exactly_once_after_explicit_enter": True})
+        prompts = [event.get("prompt") for event in hooks if event["hook_event_name"] == "UserPromptSubmit"]
+        for body in ("ACT3b unsent captain draft", "ACT3b racing captain typed suffix",
+                     "ACT3b captain submit first", "ACT3b mail after captain submission"):
+            self.assertEqual(prompts.count(body), 1)
+        second = qualification["second_client"]
+        self.assertFalse(second["idle_attach_callback"])
+        self.assertFalse(second["first_submission_session_start"])
+        self.assertFalse(second["fenced_at_attach"])
+        self.assertFalse(second["first_submission_fenced"])
+        self.assertEqual(second["binding_state"], "bound")
+        self.assertEqual(second["native_status"], {"type": "idle"})
+        self.assertEqual([event["hook_event_name"] for event in second["first_submission_hooks"]], ["UserPromptSubmit"])
+        self.assertEqual(set(second["first_submission_hooks"][0]), {
+            "session_id", "turn_id", "transcript_path", "cwd", "hook_event_name", "model", "permission_mode", "prompt"})
+        self.assertFalse(captured["live_mail_qualified"])
+
+    def test_captured_pty_reconnect_and_navigation_limits(self):
+        captured = json.loads((ROOT / "tests/fixtures/codex-attended-pty.json").read_text())
+        qualification = captured["qualification"]
+        for key in ("same_daemon_reconnect", "reconnect"):
+            self.assertTrue(qualification[key]["new_generation"])
+            self.assertTrue(qualification[key]["same_uuid"])
+        same = qualification["same_daemon_reconnect"]
+        self.assertTrue(same["same_daemon"])
+        self.assertTrue(same["session_start"])
+        self.assertEqual(same["settings"], {"model": "ship-model", "effort": "high"})
+        self.assertEqual(same["state"], "bound")
+        self.assertFalse(same["delivery_enabled"])
+        restarted = qualification["reconnect"]
+        self.assertTrue(restarted["new_daemon"])
+        self.assertNotEqual(restarted["attach_daemon"], same["attach_daemon"])
+        for launch in (same, restarted):
+            self.assertEqual(launch["settings"], {"model": "ship-model", "effort": "high"})
+            argv = launch["prepare_argv"]
+            self.assertEqual(argv[argv.index("--remote") + 1], "unix://" + launch["attach_daemon"]["socket"])
+            self.assertEqual(argv[argv.index("--model") + 1], "ship-model")
+            self.assertIn('model_reasoning_effort="high"', argv)
+        self.assertTrue(qualification["reconnect"]["dead_old_process_refused"])
+        self.assertFalse(qualification["reconnect"]["replayed"])
+        self.assertEqual(qualification["reconnect"]["accepted_through"], 1)
+        navigation = qualification["navigation"]
+        self.assertFalse(navigation["idle_callback"])
+        self.assertEqual(navigation["binding_before_turn"], "bound")
+        self.assertTrue(navigation["callback_unbound"])
+        self.assertEqual(navigation["custody_poison_reason"], "callback_uuid_changed")
+        self.assertFalse(navigation["instantaneous_ui_continuity"])
+        self.assertTrue(captured["daemon_exited_confirmed"])
 
     def test_unqualified_native_input_shape_pauses_with_clear_reason(self):
         self.intent()

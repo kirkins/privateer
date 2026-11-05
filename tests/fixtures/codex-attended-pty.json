@@ -1,0 +1,400 @@
+{
+  "version": "codex-cli 0.166.0",
+  "provider_requests": [
+    {
+      "path": "/v1/responses",
+      "valid": true
+    }
+  ],
+  "qualification": {
+    "draft": {
+      "unsent_during_delivery": true,
+      "submitted_exactly_once_after_explicit_enter": true
+    },
+    "race": {
+      "captain_prompt": "ACT3b racing captain typed suffix",
+      "captain_hook_count": 1,
+      "mail_hook_count": 1,
+      "busy_status": {
+        "type": "active",
+        "activeFlags": []
+      },
+      "events": [
+        {
+          "type": "task_started",
+          "turn_attribution": {
+            "turn_id": "01a1ad82-5a82-7831-abb0-aff7c5edefe5",
+            "turn_trigger": "queue",
+            "parent_turn_id": null,
+            "initiating_agent_path": null,
+            "root_turn_id": "01a1ad82-5a82-7831-abb0-aff7c5edefe5"
+          },
+          "turn_id": "01a1ad82-5a82-7831-abb0-aff7c5edefe5",
+          "root_turn_id": "01a1ad82-5a82-7831-abb0-aff7c5edefe5",
+          "started_at": 1793912363,
+          "model_context_window": 258400,
+          "collaboration_mode_kind": "default"
+        },
+        {
+          "type": "user_message",
+          "client_id": "01a1ad82-5a81-73a3-896b-146b4b142592",
+          "message": "{\"after_seq\":0,\"home\":\"/var/tmp/act3b-pty-run8/privateer\",\"notification_id\":\"7bcb5e78-5c21-4d1a-a360-30fabee2ba2a\",\"session\":\"01a1ad82-5710-7870-bae9-8043260f973a\",\"ship\":\"alpha\",\"through_seq\":1,\"type\":\"privateer-mail\",\"version\":1}\nACT3b mail notification, not acknowledgement.",
+          "images": [],
+          "local_images": [],
+          "audio": [],
+          "local_audio": [],
+          "text_elements": []
+        },
+        {
+          "type": "task_complete",
+          "root_turn_id": "01a1ad82-5a82-7831-abb0-aff7c5edefe5",
+          "turn_id": "01a1ad82-5a82-7831-abb0-aff7c5edefe5",
+          "last_agent_message": null,
+          "started_at": 1793912363,
+          "completed_at": 1793912363,
+          "duration_ms": 115
+        },
+        {
+          "type": "task_started",
+          "turn_attribution": {
+            "turn_id": "01a1ad82-5afc-7063-9003-f0d903966ed1",
+            "turn_trigger": "user",
+            "parent_turn_id": null,
+            "initiating_agent_path": null,
+            "root_turn_id": "01a1ad82-5afc-7063-9003-f0d903966ed1"
+          },
+          "turn_id": "01a1ad82-5afc-7063-9003-f0d903966ed1",
+          "root_turn_id": "01a1ad82-5afc-7063-9003-f0d903966ed1",
+          "started_at": 1793912363,
+          "model_context_window": 258400,
+          "collaboration_mode_kind": "default"
+        },
+        {
+          "type": "task_complete",
+          "root_turn_id": "01a1ad82-5afc-7063-9003-f0d903966ed1",
+          "turn_id": "01a1ad82-5afc-7063-9003-f0d903966ed1",
+          "last_agent_message": null,
+          "started_at": 1793912363,
+          "completed_at": 1793912363,
+          "duration_ms": 25
+        }
+      ],
+      "receipt": {
+        "turn_id": "01a1ad82-5a82-7831-abb0-aff7c5edefe5",
+        "client_id": "01a1ad82-5a81-73a3-896b-146b4b142592"
+      },
+      "accepted_through": 1,
+      "acknowledged_through": 0,
+      "recovered_from_new_ledger": true
+    },
+    "submit_first_race": {
+      "captain_hook_count": 1,
+      "mail_hook_count": 1,
+      "pending_count_before_release": 1,
+      "turn_triggers": [
+        "user",
+        "queue"
+      ],
+      "pending": {
+        "data": [
+          {
+            "id": "01a1ad82-5b85-7ee2-b2ea-7aecb1b739d7",
+            "input": [
+              {
+                "type": "text",
+                "text": "ACT3b mail after captain submission",
+                "text_elements": []
+              }
+            ],
+            "clientUserMessageId": "01a1ad82-5b84-7ed1-abe3-1c38c61f0c30"
+          }
+        ],
+        "nextCursor": null
+      },
+      "events": [
+        {
+          "type": "task_started",
+          "turn_attribution": {
+            "turn_id": "01a1ad82-5b48-7591-9171-25284f3ec608",
+            "turn_trigger": "user",
+            "parent_turn_id": null,
+            "initiating_agent_path": null,
+            "root_turn_id": "01a1ad82-5b48-7591-9171-25284f3ec608"
+          },
+          "turn_id": "01a1ad82-5b48-7591-9171-25284f3ec608",
+          "root_turn_id": "01a1ad82-5b48-7591-9171-25284f3ec608",
+          "started_at": 1793912363,
+          "model_context_window": 258400,
+          "collaboration_mode_kind": "default"
+        },
+        {
+          "type": "task_complete",
+          "root_turn_id": "01a1ad82-5b48-7591-9171-25284f3ec608",
+          "turn_id": "01a1ad82-5b48-7591-9171-25284f3ec608",
+          "last_agent_message": null,
+          "started_at": 1793912363,
+          "completed_at": 1793912363,
+          "duration_ms": 62
+        },
+        {
+          "type": "task_started",
+          "turn_attribution": {
+            "turn_id": "01a1ad82-5b8d-7131-8a19-e7d02a9efb72",
+            "turn_trigger": "queue",
+            "parent_turn_id": null,
+            "initiating_agent_path": null,
+            "root_turn_id": "01a1ad82-5b8d-7131-8a19-e7d02a9efb72"
+          },
+          "turn_id": "01a1ad82-5b8d-7131-8a19-e7d02a9efb72",
+          "root_turn_id": "01a1ad82-5b8d-7131-8a19-e7d02a9efb72",
+          "started_at": 1793912363,
+          "model_context_window": 258400,
+          "collaboration_mode_kind": "default"
+        },
+        {
+          "type": "task_complete",
+          "root_turn_id": "01a1ad82-5b8d-7131-8a19-e7d02a9efb72",
+          "turn_id": "01a1ad82-5b8d-7131-8a19-e7d02a9efb72",
+          "last_agent_message": null,
+          "started_at": 1793912363,
+          "completed_at": 1793912363,
+          "duration_ms": 24
+        }
+      ],
+      "stopped_hooks_are_not_receipts": true
+    },
+    "second_client": {
+      "idle_attach_callback": false,
+      "native_status": {
+        "type": "idle"
+      },
+      "binding_state": "bound",
+      "fenced_at_attach": false,
+      "reason": "native public API has no per-TUI attachment identity",
+      "first_submission_session_start": false,
+      "first_submission_hooks": [
+        {
+          "session_id": "01a1ad82-5710-7870-bae9-8043260f973a",
+          "turn_id": "01a1ad82-5d70-7ec2-b80c-3e208e55d4b2",
+          "transcript_path": "/var/tmp/act3b-pty-run8/c/sessions/2026/11/05/rollout-2026-11-05T15-59-22-01a1ad82-5710-7870-bae9-8043260f973a.jsonl",
+          "cwd": "/var/tmp/act3b-pty-run8/alpha",
+          "hook_event_name": "UserPromptSubmit",
+          "model": "ship-model",
+          "permission_mode": "default",
+          "prompt": "ACT3b second-client probe"
+        }
+      ],
+      "first_submission_fenced": false,
+      "fixture_custody_subset": true,
+      "resume_callback_fence": "deterministic tests only; this native attach does not emit one"
+    },
+    "same_daemon_reconnect": {
+      "state": "bound",
+      "delivery_enabled": false,
+      "new_generation": true,
+      "same_uuid": true,
+      "same_daemon": true,
+      "settings": {
+        "model": "ship-model",
+        "effort": "high"
+      },
+      "session_start": true,
+      "prepare_argv": [
+        "/usr/local/bin/codex",
+        "resume",
+        "--remote",
+        "unix:///tmp/codex-daemon-1000/5ace88030347b547e0dbf76a7125fa3e46371bef5bba07838f8aef7fafd3920a",
+        "01a1ad82-5710-7870-bae9-8043260f973a",
+        "--no-alt-screen",
+        "-C",
+        "/var/tmp/act3b-pty-run8/alpha",
+        "--model",
+        "ship-model",
+        "-c",
+        "model_reasoning_effort=\"high\"",
+        "--",
+        "You are the first mate of alpha. Read your charter and inbox, handle requests within your authority, reply with correlation IDs, and acknowledge only handled mail. Production deployment still needs explicit approval."
+      ],
+      "attach_daemon": {
+        "pid": 565953,
+        "identity": {
+          "bootId": "c8c7f7b0-d2a5-4550-a35c-4b87041e5fbd",
+          "startTicks": 6923850
+        },
+        "socket": "/tmp/codex-daemon-1000/5ace88030347b547e0dbf76a7125fa3e46371bef5bba07838f8aef7fafd3920a",
+        "rendezvous": "/var/tmp/act3b-pty-run8/c/app-server-control/app-server-control.sock",
+        "socket_identity": [
+          60,
+          283833
+        ]
+      }
+    },
+    "reconnect": {
+      "dead_old_process_refused": true,
+      "new_generation": true,
+      "same_uuid": true,
+      "accepted_through": 1,
+      "replayed": false,
+      "settings": {
+        "model": "ship-model",
+        "effort": "high"
+      },
+      "new_daemon": true,
+      "prepare_argv": [
+        "/usr/local/bin/codex",
+        "resume",
+        "--remote",
+        "unix:///tmp/codex-daemon-1000/5ace88030347b547e0dbf76a7125fa3e46371bef5bba07838f8aef7fafd3920a",
+        "01a1ad82-5710-7870-bae9-8043260f973a",
+        "--no-alt-screen",
+        "-C",
+        "/var/tmp/act3b-pty-run8/alpha",
+        "--model",
+        "ship-model",
+        "-c",
+        "model_reasoning_effort=\"high\"",
+        "--",
+        "You are the first mate of alpha. Read your charter and inbox, handle requests within your authority, reply with correlation IDs, and acknowledge only handled mail. Production deployment still needs explicit approval."
+      ],
+      "attach_daemon": {
+        "pid": 566529,
+        "identity": {
+          "bootId": "c8c7f7b0-d2a5-4550-a35c-4b87041e5fbd",
+          "startTicks": 6924112
+        },
+        "socket": "/tmp/codex-daemon-1000/5ace88030347b547e0dbf76a7125fa3e46371bef5bba07838f8aef7fafd3920a",
+        "rendezvous": "/var/tmp/act3b-pty-run8/c/app-server-control/app-server-control.sock",
+        "socket_identity": [
+          60,
+          283835
+        ]
+      }
+    },
+    "navigation": {
+      "idle_callback": false,
+      "binding_before_turn": "bound",
+      "callback_unbound": true,
+      "custody_poison_reason": "callback_uuid_changed",
+      "instantaneous_ui_continuity": false
+    }
+  },
+  "daemon_exited_confirmed": true,
+  "hooks": [
+    {
+      "session_id": "01a1ad82-5710-7870-bae9-8043260f973a",
+      "transcript_path": "/var/tmp/act3b-pty-run8/c/sessions/2026/11/05/rollout-2026-11-05T15-59-22-01a1ad82-5710-7870-bae9-8043260f973a.jsonl",
+      "cwd": "/var/tmp/act3b-pty-run8/alpha",
+      "hook_event_name": "SessionStart",
+      "model": "ship-model",
+      "permission_mode": "default",
+      "source": "resume"
+    },
+    {
+      "session_id": "01a1ad82-5710-7870-bae9-8043260f973a",
+      "turn_id": "01a1ad82-59cf-7230-b860-970a9632a072",
+      "transcript_path": "/var/tmp/act3b-pty-run8/c/sessions/2026/11/05/rollout-2026-11-05T15-59-22-01a1ad82-5710-7870-bae9-8043260f973a.jsonl",
+      "cwd": "/var/tmp/act3b-pty-run8/alpha",
+      "hook_event_name": "UserPromptSubmit",
+      "model": "ship-model",
+      "permission_mode": "default",
+      "prompt": "ACT3b stopped draft-preservation mail"
+    },
+    {
+      "session_id": "01a1ad82-5710-7870-bae9-8043260f973a",
+      "turn_id": "01a1ad82-5a1b-7081-92bc-ef885da5e71c",
+      "transcript_path": "/var/tmp/act3b-pty-run8/c/sessions/2026/11/05/rollout-2026-11-05T15-59-22-01a1ad82-5710-7870-bae9-8043260f973a.jsonl",
+      "cwd": "/var/tmp/act3b-pty-run8/alpha",
+      "hook_event_name": "UserPromptSubmit",
+      "model": "ship-model",
+      "permission_mode": "default",
+      "prompt": "ACT3b unsent captain draft"
+    },
+    {
+      "session_id": "01a1ad82-5710-7870-bae9-8043260f973a",
+      "turn_id": "01a1ad82-5a82-7831-abb0-aff7c5edefe5",
+      "transcript_path": "/var/tmp/act3b-pty-run8/c/sessions/2026/11/05/rollout-2026-11-05T15-59-22-01a1ad82-5710-7870-bae9-8043260f973a.jsonl",
+      "cwd": "/var/tmp/act3b-pty-run8/alpha",
+      "hook_event_name": "UserPromptSubmit",
+      "model": "ship-model",
+      "permission_mode": "default",
+      "prompt": "{\"after_seq\":0,\"home\":\"/var/tmp/act3b-pty-run8/privateer\",\"notification_id\":\"7bcb5e78-5c21-4d1a-a360-30fabee2ba2a\",\"session\":\"01a1ad82-5710-7870-bae9-8043260f973a\",\"ship\":\"alpha\",\"through_seq\":1,\"type\":\"privateer-mail\",\"version\":1}\nACT3b mail notification, not acknowledgement."
+    },
+    {
+      "session_id": "01a1ad82-5710-7870-bae9-8043260f973a",
+      "turn_id": "01a1ad82-5afc-7063-9003-f0d903966ed1",
+      "transcript_path": "/var/tmp/act3b-pty-run8/c/sessions/2026/11/05/rollout-2026-11-05T15-59-22-01a1ad82-5710-7870-bae9-8043260f973a.jsonl",
+      "cwd": "/var/tmp/act3b-pty-run8/alpha",
+      "hook_event_name": "UserPromptSubmit",
+      "model": "ship-model",
+      "permission_mode": "default",
+      "prompt": "ACT3b racing captain typed suffix"
+    },
+    {
+      "session_id": "01a1ad82-5710-7870-bae9-8043260f973a",
+      "turn_id": "01a1ad82-5b48-7591-9171-25284f3ec608",
+      "transcript_path": "/var/tmp/act3b-pty-run8/c/sessions/2026/11/05/rollout-2026-11-05T15-59-22-01a1ad82-5710-7870-bae9-8043260f973a.jsonl",
+      "cwd": "/var/tmp/act3b-pty-run8/alpha",
+      "hook_event_name": "UserPromptSubmit",
+      "model": "ship-model",
+      "permission_mode": "default",
+      "prompt": "ACT3b captain submit first"
+    },
+    {
+      "session_id": "01a1ad82-5710-7870-bae9-8043260f973a",
+      "turn_id": "01a1ad82-5b8d-7131-8a19-e7d02a9efb72",
+      "transcript_path": "/var/tmp/act3b-pty-run8/c/sessions/2026/11/05/rollout-2026-11-05T15-59-22-01a1ad82-5710-7870-bae9-8043260f973a.jsonl",
+      "cwd": "/var/tmp/act3b-pty-run8/alpha",
+      "hook_event_name": "UserPromptSubmit",
+      "model": "ship-model",
+      "permission_mode": "default",
+      "prompt": "ACT3b mail after captain submission"
+    },
+    {
+      "session_id": "01a1ad82-5710-7870-bae9-8043260f973a",
+      "turn_id": "01a1ad82-5d70-7ec2-b80c-3e208e55d4b2",
+      "transcript_path": "/var/tmp/act3b-pty-run8/c/sessions/2026/11/05/rollout-2026-11-05T15-59-22-01a1ad82-5710-7870-bae9-8043260f973a.jsonl",
+      "cwd": "/var/tmp/act3b-pty-run8/alpha",
+      "hook_event_name": "UserPromptSubmit",
+      "model": "ship-model",
+      "permission_mode": "default",
+      "prompt": "ACT3b second-client probe"
+    },
+    {
+      "session_id": "01a1ad82-5710-7870-bae9-8043260f973a",
+      "transcript_path": "/var/tmp/act3b-pty-run8/c/sessions/2026/11/05/rollout-2026-11-05T15-59-22-01a1ad82-5710-7870-bae9-8043260f973a.jsonl",
+      "cwd": "/var/tmp/act3b-pty-run8/alpha",
+      "hook_event_name": "SessionStart",
+      "model": "ship-model",
+      "permission_mode": "default",
+      "source": "resume"
+    },
+    {
+      "session_id": "01a1ad82-5710-7870-bae9-8043260f973a",
+      "transcript_path": "/var/tmp/act3b-pty-run8/c/sessions/2026/11/05/rollout-2026-11-05T15-59-22-01a1ad82-5710-7870-bae9-8043260f973a.jsonl",
+      "cwd": "/var/tmp/act3b-pty-run8/alpha",
+      "hook_event_name": "SessionStart",
+      "model": "ship-model",
+      "permission_mode": "default",
+      "source": "resume"
+    },
+    {
+      "session_id": "01a1ad82-6367-7731-b6b8-2092bcae5086",
+      "transcript_path": "/var/tmp/act3b-pty-run8/c/sessions/2026/11/05/rollout-2026-11-05T15-59-25-01a1ad82-6367-7731-b6b8-2092bcae5086.jsonl",
+      "cwd": "/var/tmp/act3b-pty-run8/alpha",
+      "hook_event_name": "SessionStart",
+      "model": "ship-model",
+      "permission_mode": "default",
+      "source": "startup"
+    }
+  ],
+  "live_mail_qualified": false,
+  "capture": {
+    "source": "scripts/codex-attended-pty-spike.py",
+    "run": "act3b-pty-run8",
+    "omitted_event_types": [
+      "token_count",
+      "thread_settings_applied"
+    ],
+    "note": "Fixture-only native observations; other payloads/hooks are unchanged. Raw PTY/daemon logs retained in the private run root."
+  }
+}
