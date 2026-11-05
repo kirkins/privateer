@@ -92,8 +92,21 @@ fn config_diagnostic_survives_an_early_ssh_exit_and_does_not_classify_auth_failu
             "args":{"large":"x".repeat(200_000)}}),
             &ssh,
         );
-        let diagnostic = String::from_utf8_lossy(&rejected.stdout);
-        assert!(diagnostic.contains(message), "{diagnostic}");
+        let response: Value = serde_json::from_slice(&rejected.stdout).unwrap();
+        assert_eq!(response["ok"], false, "{response}");
+        let diagnostic = response["error"].as_str().unwrap();
+        if classified {
+            assert!(
+                diagnostic.contains("/alpha/ssh_config.d/beta.conf"),
+                "{diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("bad owner or permissions"),
+                "{diagnostic}"
+            );
+        } else {
+            assert!(diagnostic.contains(message), "{diagnostic}");
+        }
         assert_eq!(diagnostic.contains("job.start"), classified, "{diagnostic}");
     }
 }
