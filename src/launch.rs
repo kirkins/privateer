@@ -342,6 +342,9 @@ fn unconfirmed(command: &str, reason: &str) -> String {
     )
 }
 
+/// How `contained` names a proven job whose record this home cannot load.
+const UNREADABLE: &str = "under a record this home's dispatcher cannot load (it may be read-only)";
+
 fn contained_refusal(command: &str, job: &str, what: &str) -> String {
     format!(
         "{command} was not started: job {job} runs {what}, and its sandbox stays closed: Privateer does not start work outside it. This is a limit of that job's sandbox, not a missing Privateer permission."
@@ -625,13 +628,17 @@ fn carry_out(home: &Path, conn: &Connection, row: &Row, me: &str) -> Result<Carr
         params![row.id, resolved.to_string()],
     )?;
     let mut store = Store::open_as(home, caller)?;
-    for proven in job.iter().chain(crew.as_ref().map(|c| &c.crew)) {
-        if let Some(what) = contained(&store, proven)? {
-            return Ok(Carried::Refused(contained_refusal(
-                &row.command,
-                proven,
-                what,
-            )));
+    // The walk's job, and the crew a job record names, are proven; a job
+    // only `PRIVATEER_JOB` names is not, and a direct call tolerates one
+    // that does not exist.
+    let walked = crate::crew_scope::proven_job();
+    let jobs = job
+        .iter()
+        .map(|id| (id, walked.as_ref() == Some(id)))
+        .chain(crew.as_ref().map(|c| (&c.crew, true)));
+    for (id, proven) in jobs {
+        if let Some(what) = contained(&store, id, proven)? {
+            return Ok(Carried::Refused(contained_refusal(&row.command, id, what)));
         }
     }
     store.audit(
@@ -647,14 +654,18 @@ fn carry_out(home: &Path, conn: &Connection, row: &Row, me: &str) -> Result<Carr
     )
 }
 
-/// Whether a proven job keeps its sandbox closed: a review errand, or a
-/// read-only launch.
-fn contained(store: &Store, job: &str) -> Result<Option<&'static str>> {
+/// Whether the caller's job keeps its sandbox closed: a review errand, or a
+/// read-only launch. A `proven` job whose record this home cannot load is
+/// refused: it may be read-only (in another home, or in a record that no
+/// longer parses), and an unknown containment is never read as none.
+fn contained(store: &Store, job: &str, proven: bool) -> Result<Option<&'static str>> {
     if crate::review::is_review_errand(store, job)? {
         return Ok(Some("as a read-only review errand"));
     }
-    let Ok(record) = crate::jobs::record(store, job) else {
-        return Ok(None);
+    let record = match crate::jobs::record(store, job) {
+        Ok(record) => record,
+        Err(_) if proven => return Ok(Some(UNREADABLE)),
+        Err(_) => return Ok(None),
     };
     if record["codex_read_only_crew"] == json!(true)
         || record["launch"]["options"]["sandbox"] == json!("read-only")

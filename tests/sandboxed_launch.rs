@@ -17,7 +17,7 @@ use support::{Fleet, Resident, now_settings};
 /// The first mate's harness. Its own process runs outside the sandbox, as
 /// Codex's app does; every Privateer call it makes runs inside `wrap.json`'s
 /// sandbox, as the model's shell commands do.
-const HARNESS: &str = r#"import json, os, pathlib, re, subprocess, sys, time
+const HARNESS: &str = r#"import json, os, pathlib, re, signal, subprocess, sys, time
 cli, ship, prompt = json.loads(sys.argv[1]), sys.argv[2], sys.argv[3]
 root = pathlib.Path(sys.argv[4]).parent
 wrap = json.loads((root / "wrap.json").read_text())
@@ -64,10 +64,31 @@ if kind == "forge":
     # A crew that claims the operator: no role, no actor, no PRIVATEER_JOB.
     env = {k: v for k, v in os.environ.items()
            if k not in ("PRIVATEER_ROLE", "PRIVATEER_ACTOR", "PRIVATEER_JOB")}
-    def forge(job):
+    def forge(job, err=None):
         args = {"task_id": task, "id": job, "command": ["touch", str(root / ("ran-" + job))]}
-        return subprocess.Popen(wrap + cli + ["job.start", "--json", json.dumps(args)], env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        argv = wrap + cli + ["job.start", "--json", json.dumps(args)]
+        if err is None:
+            return subprocess.Popen(argv, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+        # Detached: its parent exits at once, so launchd adopts it and its
+        # ancestry no longer reaches this crew's supervisor. Without that, a
+        # Seatbelt sandbox, which hides no ancestry, lets the CLI's own walk
+        # refuse it before it records any request.
+        pid = os.fork()
+        if pid == 0:
+            if os.fork() == 0:
+                try:
+                    fd = os.open(str(err), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    null = os.open(os.devnull, os.O_RDWR)
+                    os.dup2(null, 0)
+                    os.dup2(fd, 1)
+                    os.dup2(fd, 2)
+                    os.execvpe(argv[0], argv, env)
+                finally:
+                    os._exit(127)
+            os._exit(0)
+        os.waitpid(pid, 0)
+        return None
     live = forge("forged-live")
     _, err = live.communicate(timeout=60)
     (root / "forge-live.txt").write_text("%d\n%s" % (live.returncode, err))
@@ -75,16 +96,23 @@ if kind == "forge":
     # requester; the requester then exits, as a crew that kills and reaps
     # its own waiter would, and only then is its caller resolved.
     gaps = root / "gaps"
-    gapped = forge("forged-gap")
+    stderr = gaps / "forged-gap.stderr"
+    gapped = forge("forged-gap", stderr if sys.platform == "darwin" else None)
     identified = gaps / "forged-gap.identified"
     deadline = time.time() + 60
     while not (identified.exists() and identified.read_text()) and time.time() < deadline:
         time.sleep(0.05)
-    gapped.kill()
-    gapped.wait()
+    waiter = int(identified.read_text()) if identified.exists() and identified.read_text() else None
+    if gapped is not None:
+        gapped.kill()
+        try:
+            stderr.write_text(gapped.communicate(timeout=10)[1])
+        except subprocess.TimeoutExpired:
+            gapped.wait()
+    elif waiter is not None:
+        os.kill(waiter, signal.SIGKILL)
     note = "never identified"
-    if identified.exists():
-        waiter = int(identified.read_text())
+    if waiter is not None:
         while time.time() < deadline:
             try:
                 os.kill(waiter, 0)
@@ -92,19 +120,28 @@ if kind == "forge":
                 note = "requester %d gone" % waiter
                 break
             time.sleep(0.05)
+    if waiter is None:
+        note += "; requester stderr: " + (stderr.read_text() if stderr.exists() else "(none)")
     (gaps / "forged-gap.hold").unlink()
     (root / "forge-gap.txt").write_text(note)
     done()
 marker = root / ("parked-on-" + task)
 if not marker.exists():
     started = call("job.start", {"task_id": task, "heavy": True, "wait_for_capacity": True,
-        # Long enough that it is still running when the crew parks on it.
-        "command": ["sh", "-c", "sleep 2; echo crew-build-ok > %s" % (root / ("crew-build-" + task))]})
+        "command": ["sh", "-c", "echo crew-build-ok > %s" % (root / ("crew-build-" + task))]})
     marker.write_text(started["id"])
-    call("crew.park", {"job_id": started["id"], "next": "read the build"})
-    done()
+    parked = run("crew.park", {"job_id": started["id"], "next": "read the build"})
+    if parked.returncode == 0:
+        done()
+    # A build that settled before the park: a real crew reads its outcome now.
+    if "read its outcome instead of parking" not in parked.stderr:
+        (root / "harness-error").write_text("crew.park: %s" % parked.stderr)
+        sys.exit(3)
+    how = "read at its park"
+else:
+    how = "resumed"
 job = call("job.status", {"id": marker.read_text().strip()})
-call("crew.report", {"kind": "progress", "body": "resumed on %s; build %s" % (task, job["status"])})
+call("crew.report", {"kind": "progress", "body": "%s on %s; build %s" % (how, task, job["status"])})
 done()
 "#;
 
@@ -505,7 +542,7 @@ fn a_sandboxed_first_mate_starts_runs_and_cancels_a_heavy_job_a_crew_and_an_erra
 
     // A crew: launched from inside; its harness's own calls run inside the
     // sandbox too. It starts a heavy job, parks on it, is resumed by the
-    // outcome and reports.
+    // outcome and reports; a build that settled first it reads at once.
     let crew = ship.ok_inside(
         "agent.start",
         json!({"id": "sandboxed-crew", "task_id": "infra-repair"}),
@@ -516,10 +553,10 @@ fn a_sandboxed_first_mate_starts_runs_and_cancels_a_heavy_job_a_crew_and_an_erra
         json!({"id": "direct-crew", "task_id": "infra-duty"}),
         Some("infra"),
     );
-    ship.until("the crew's report after its resume", || {
+    ship.until("the crew's report on its build", || {
         let db = rusqlite::Connection::open(ship.fleet.home.join("privateer.sqlite")).unwrap();
         db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM mail WHERE body LIKE '%resumed on infra-repair; build succeeded%')",
+            "SELECT EXISTS(SELECT 1 FROM mail WHERE body LIKE '% on infra-repair; build succeeded%')",
             [],
             |r| r.get::<_, bool>(0),
         )
@@ -942,12 +979,19 @@ fn a_crew_claiming_the_operator_is_refused_even_if_its_requester_exits_mid_launc
     );
     let gap = ship.fleet.root.join("forge-gap.txt");
     ship.until("the crew's attempts", || gap.exists());
-    // With its requester alive, the walk finds the crew's supervisor.
+    // With its requester alive, the walk finds the crew's supervisor: the
+    // launcher's on Linux, where the PID namespace hides the ancestry from
+    // the CLI, and the CLI's own under Seatbelt, which hides none.
     let live = fs::read_to_string(ship.fleet.root.join("forge-live.txt")).unwrap();
     assert!(!live.starts_with("0\n"), "{live}");
     assert!(live.contains("cannot drop its role"), "{live}");
     let note = fs::read_to_string(&gap).unwrap();
-    assert!(note.contains("gone"), "{note}");
+    assert!(
+        note.contains("gone"),
+        "{note}; forged-gap request: {:?}; all requests: {:?}",
+        ship.request_for("forged-gap"),
+        ship.requests()
+    );
     ship.until("the gapped request to be judged", || {
         ship.request_for("forged-gap")
             .is_some_and(|(state, _)| state != "pending" && state != "claimed")

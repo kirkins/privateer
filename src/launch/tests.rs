@@ -386,7 +386,7 @@ fn a_caller_that_is_a_review_errand_or_a_read_only_launch_stays_contained() {
             params![id, record.to_string()],
         )
         .unwrap();
-        // `contained` reads a record it cannot load as no containment.
+        // Each fixture loads: `contained` refuses a proven job that does not.
         crate::jobs::record(&store, id).unwrap();
     };
     job("review-errand", json!({}));
@@ -400,19 +400,51 @@ fn a_caller_that_is_a_review_errand_or_a_read_only_launch_stays_contained() {
         json!({"launch": {"options": {"sandbox": "workspace-write"}}}),
     );
     assert_eq!(
-        contained(&store, "review-errand").unwrap(),
+        contained(&store, "review-errand", true).unwrap(),
         Some("as a read-only review errand")
     );
     assert_eq!(
-        contained(&store, "read-only-crew").unwrap(),
+        contained(&store, "read-only-crew", true).unwrap(),
         Some("read-only")
     );
     assert_eq!(
-        contained(&store, "read-only-launch").unwrap(),
+        contained(&store, "read-only-launch", true).unwrap(),
         Some("read-only")
     );
-    assert_eq!(contained(&store, "writing-crew").unwrap(), None);
-    assert_eq!(contained(&store, "no-such-job").unwrap(), None);
+    assert_eq!(contained(&store, "writing-crew", true).unwrap(), None);
+    // Only named by PRIVATEER_JOB: a direct call tolerates a job that does
+    // not exist, and so does a forwarded one.
+    assert_eq!(contained(&store, "no-such-job", false).unwrap(), None);
+}
+
+/// Review 11b5a79e: a job the walk proved whose record this home cannot
+/// load, because it is missing here or is not a job record, is refused,
+/// never read as no containment, even when the raw row says read-only.
+#[test]
+fn a_proven_job_whose_record_cannot_be_loaded_stays_contained() {
+    let (_dir, store) = home();
+    store
+        .connection()
+        .execute(
+            "INSERT INTO jobs(id, record) VALUES('garbled-crew', '{\"id\": \"garbled-crew\", \"codex_read_only_crew\": true}')",
+            [],
+        )
+        .unwrap();
+    assert!(crate::jobs::record(&store, "garbled-crew").is_err());
+    for job in ["garbled-crew", "elsewhere-crew"] {
+        assert_eq!(
+            contained(&store, job, true).unwrap(),
+            Some(UNREADABLE),
+            "{job}"
+        );
+    }
+    let text = contained_refusal("job.start", "elsewhere-crew", UNREADABLE);
+    assert!(text.contains("was not started"), "{text}");
+    assert!(text.contains("may be read-only"), "{text}");
+}
+
+#[test]
+fn a_contained_refusal_names_the_job_and_a_sandbox_limit() {
     // The refusal names the caller's own job and a sandbox limit.
     let text = contained_refusal("job.start", "review-errand", "as a read-only review errand");
     assert!(text.contains("job review-errand runs as a read-only review errand"));

@@ -47,6 +47,9 @@ pub struct CrewCaller {
 struct Resolved {
     job: Option<String>,
     crew: Option<CrewCaller>,
+    /// `job` is the one a supervisor in the ancestry proved, not only named
+    /// by `PRIVATEER_JOB`.
+    proven: bool,
 }
 
 static RESOLVED: OnceLock<Resolved> = OnceLock::new();
@@ -64,6 +67,15 @@ pub(crate) fn job_id() -> Option<String> {
         Some(resolved) => resolved.job.clone(),
         None => env_job(),
     }
+}
+
+/// The job a supervisor in this process's ancestry proved it runs in: never
+/// one only `PRIVATEER_JOB` names.
+pub(crate) fn proven_job() -> Option<String> {
+    RESOLVED
+        .get()
+        .filter(|resolved| resolved.proven)
+        .and_then(|resolved| resolved.job.clone())
 }
 
 /// The crew this process was resolved to, if any.
@@ -145,6 +157,7 @@ fn resolve_with(
                 let _ = RESOLVED.set(Resolved {
                     job: Some(job),
                     crew: None,
+                    proven: true,
                 });
                 return Ok(caller);
             };
@@ -190,6 +203,7 @@ fn resolve_with(
             let _ = RESOLVED.set(Resolved {
                 job: if supervisor { env_job } else { Some(job) },
                 crew,
+                proven: !supervisor,
             });
             return Ok(Caller::Agent { actor });
         }
@@ -206,7 +220,11 @@ fn resolve_with(
         },
         None => caller,
     };
-    let _ = RESOLVED.set(Resolved { job: env_job, crew });
+    let _ = RESOLVED.set(Resolved {
+        job: env_job,
+        crew,
+        proven: false,
+    });
     Ok(caller)
 }
 
