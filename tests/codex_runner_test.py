@@ -107,6 +107,8 @@ class RunnerTests(unittest.TestCase):
             def check(self):
                 runner.native_check(fixture.record, fixture.custody)
             def call(self, method, params):
+                with binding.locked(fixture.directory):
+                    pass  # Both loaded-thread fences must run outside flock.
                 if method == "thread/loaded/list":
                     return {"data": list(fixture.loaded_sessions), "nextCursor": None}
                 if method == "thread/read":
@@ -249,6 +251,128 @@ class RunnerTests(unittest.TestCase):
             spawn.assert_not_called()
         self.assertEqual(load(self.registry)["session"], self.session)
         self.assert_not_invoked()
+
+    def test_loaded_list_requires_explicit_end_of_bounded_page(self):
+        for reply in ({"data": [self.session]},
+                      {"data": [self.session], "nextCursor": "more"},
+                      {"data": [self.session] + [str(uuid.uuid4()) for _ in range(32)],
+                       "nextCursor": None}):
+            with self.subTest(reply=reply):
+                original = self.daemon_class.call
+                def call(daemon, method, params):
+                    if method == "thread/loaded/list":
+                        return reply
+                    return original(daemon, method, params)
+                ledger = self.runner.ledger.read()
+                with patch.object(self.daemon_class, "call", new=call), patch.object(runner.subprocess, "Popen") as spawn:
+                    with self.assertRaisesRegex(ValueError, "thread not loaded"):
+                        self.runner.dispatch()
+                    spawn.assert_not_called()
+                self.assertEqual(self.runner.ledger.read(), ledger)
+                self.assert_not_invoked()
+
+    def test_new_between_first_fence_and_spawn_sticks_across_recovery(self):
+        new_session = str(uuid.uuid4())
+        original = runner.control
+        def control(record, command, args):
+            if command == "ship.presence":
+                # Dispatch's first loaded-list fence already passed; /new has
+                # no callback until the user submits a turn in the new UUID.
+                self.loaded_sessions.append(new_session)
+                self.other_threads[new_session] = {"id": new_session, "cwd": self.record["cwd"]}
+            return original(record, command, args)
+        original_drain = runner.drain
+        def drain(child):
+            # A crash or delay in cleanup must not lose the detected custody gap.
+            a = self.runner.ledger.read()["runner"]
+            self.assertIn(runner.THREAD_FENCE_LOST, a["sticky"])
+            self.assertIn("concurrent Codex threads in this cwd", a["thread_fence_reason"])
+            return original_drain(child)
+        with patch.object(runner, "control", side_effect=control), patch.object(runner, "drain", side_effect=drain):
+            result = self.runner.dispatch()
+        self.assertTrue((self.root / "invoked.json").exists())
+        invoked = json.loads((self.root / "invoked.json").read_text())["argv"]
+        self.assertEqual(invoked[invoked.index("--thread") + 1], self.session)
+        self.assertEqual(load(self.registry), self.record)  # Never silently rebind.
+        self.assertEqual(self.runner.ledger.read()["sessions"][self.session]["intent"]["state"], "uncertain")
+        self.assertEqual(result["possibly_unattended_spent"], 1)
+        self.assertTrue(result["paused"])
+        self.assertFalse(result["report_eligible"])
+        self.assertIn(runner.THREAD_FENCE_LOST, result["diagnostics"])
+        self.assertIn("concurrent Codex threads in this cwd", result["pause_reason"])
+        self.runner.publish(self.record, result)
+        self.assertFalse(any(command == "wake.hosted" for command, _ in self.calls))
+
+        # Unloading the new UUID and restarting do not erase the sticky pause.
+        self.loaded_sessions = [self.session]
+        restarted = runner.Runner(self.registry)
+        result = restarted.observe()
+        self.assertTrue(result["paused"])
+        self.assertFalse(result["report_eligible"])
+        # Preserve positive native facts without reporting watched delivery or
+        # automatically resuming mail when the old offer becomes settled.
+        self.promoted()
+        result = restarted.observe()
+        self.assertEqual(result["accepted_through"], 1)
+        self.assertTrue(result["paused"])
+        self.assertFalse(result["report_eligible"])
+        self.assertIn("concurrent Codex threads in this cwd", result["pause_reason"])
+        restarted.publish(self.record, result)
+        self.assertFalse(any(command == "wake.hosted" for command, _ in self.calls))
+        with patch.object(runner.subprocess, "Popen") as spawn:
+            self.assertEqual(runner.tick(self.registry), {"tick": "idle"})
+            self.prepare(1)
+            with self.assertRaisesRegex(ValueError, "runner paused"):
+                restarted.dispatch()
+            spawn.assert_not_called()
+        self.assertEqual(restarted.report(self.session)["possibly_unattended_spent"], 1)
+
+    def test_post_spawn_fence_refuses_changed_cwd_uuid(self):
+        new_session = str(uuid.uuid4())
+        original = subprocess.Popen
+        def spawn(*args, **kwargs):
+            self.loaded_sessions.append(new_session)
+            self.other_threads[self.session] = {"id": self.session, "cwd": str(self.root / "elsewhere")}
+            self.other_threads[new_session] = {"id": new_session, "cwd": self.record["cwd"]}
+            return original(*args, **kwargs)
+        with patch.object(runner.subprocess, "Popen", side_effect=spawn):
+            result = self.runner.dispatch()
+        self.assertTrue(result["paused"])
+        self.assertFalse(result["report_eligible"])
+        self.assertIn("loaded thread for this cwd is not the bound UUID", result["pause_reason"])
+
+    def test_post_spawn_fence_failure_still_drains_child(self):
+        original_spawn = subprocess.Popen
+        original_call = self.daemon_class.call
+        children = []
+        def spawn(*args, **kwargs):
+            child = original_spawn(*args, **kwargs)
+            children.append(child)
+            return child
+        def call(daemon, method, params):
+            # Failure is specifically in the second loaded-list fence.
+            if children and method == "thread/loaded/list":
+                raise ConnectionError("fixture post-spawn disconnect")
+            return original_call(daemon, method, params)
+        with patch.object(runner.subprocess, "Popen", side_effect=spawn), patch.object(self.daemon_class, "call", new=call):
+            result = self.runner.dispatch()
+        self.assertEqual(len(children), 1)
+        self.assertIsNotNone(children[0].returncode)
+        self.assertTrue(result["paused"])
+        self.assertFalse(result["report_eligible"])
+        self.assertIn("fixture post-spawn disconnect", result["pause_reason"])
+        self.assertEqual(result["possibly_unattended_spent"], 1)
+
+    def test_post_spawn_fence_allows_own_turn_to_be_active(self):
+        original = subprocess.Popen
+        def spawn(*args, **kwargs):
+            self.status = {"type": "active"}
+            return original(*args, **kwargs)
+        with patch.object(runner.subprocess, "Popen", side_effect=spawn):
+            result = self.runner.dispatch()
+        self.assertTrue(result["report_eligible"])
+        self.assertNotIn(runner.THREAD_FENCE_LOST, result["diagnostics"])
+        self.assertIsNone(result["pause_reason"])
 
     def test_loaded_threads_in_other_cwds_do_not_block_bound_dispatch(self):
         other_session = str(uuid.uuid4())
