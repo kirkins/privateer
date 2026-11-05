@@ -2229,6 +2229,9 @@ fn add(args: &Value) -> Result<Value> {
     if let Some(fleet) = args.get("fleet").and_then(Value::as_str) {
         peer["fleet"] = json!(fleet);
     }
+    if let Some(config) = args.get("ssh_config") {
+        peer["ssh_config"] = config.clone();
+    }
     if let Some(transport) = args.get("transport").and_then(Value::as_str) {
         // Tests reach a gateway on the same machine without SSH.
         peer["transport"] = json!(transport);
@@ -2300,6 +2303,7 @@ fn list() -> Result<Value> {
             "name": machine.name,
             "direction": if machine.role == "collects" { "reached from here" } else { "reaches here" },
             "target": machine.peer["host"],
+            "ssh_config": machine.peer["ssh_config"],
             "known_as": machine.known_as,
             "refreshed_ms": machine.refreshed_ms,
             "stows": stows_of(&conn, &machine.name)?,
@@ -3721,11 +3725,11 @@ pub fn gateway(caller: Caller) -> Result<()> {
 }
 
 /// `privateer machine add NAME SSH_TARGET --executable PATH [--remote-fleet
-/// PATH] [--as NAME] | list | refresh [NAME] | collect [NAME] | remove NAME |
+/// PATH] [--as NAME] [--ssh-config PATH] | list | refresh [NAME] | collect [NAME] | remove NAME |
 /// forget-removed NAME | owner [SHIP|--clear] | captain [MACHINE|--here]`
 pub fn cli(args: &[String]) -> Result<()> {
-    let usage = "usage: privateer machine add NAME SSH_TARGET --executable /remote/privateer [--remote-fleet /remote/fleet.sqlite] [--as THIS_MACHINE] | list | refresh [NAME] | collect [NAME] | remove NAME | forget-removed NAME | owner [SHIP|--clear] | captain [MACHINE|--here]";
-    let flags = crate::cli::flags(args, &["executable", "remote-fleet", "as"])?;
+    let usage = "usage: privateer machine add NAME SSH_TARGET --executable /remote/privateer [--remote-fleet /remote/fleet.sqlite] [--as THIS_MACHINE] [--ssh-config /local/ssh_config] | list | refresh [NAME] | collect [NAME] | remove NAME | forget-removed NAME | owner [SHIP|--clear] | captain [MACHINE|--here]";
+    let flags = crate::cli::flags(args, &["executable", "remote-fleet", "as", "ssh-config"])?;
     let result = match flags.positional.first().map(String::as_str) {
         Some("add") => {
             let mut request = json!({
@@ -3738,6 +3742,9 @@ pub fn cli(args: &[String]) -> Result<()> {
             }
             if let Some(known_as) = flags.values.get("as") {
                 request["as"] = json!(known_as);
+            }
+            if let Some(config) = flags.values.get("ssh-config") {
+                request["ssh_config"] = json!(config);
             }
             add(&request)?
         }
@@ -3796,7 +3803,15 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
     ),
     (
         "machine.add",
-        &["name", "target", "executable", "as", "fleet", "transport"],
+        &[
+            "name",
+            "target",
+            "executable",
+            "as",
+            "fleet",
+            "transport",
+            "ssh_config",
+        ],
     ),
     ("machine.captain", &["machine"]),
     ("machine.collect", &["name"]),
