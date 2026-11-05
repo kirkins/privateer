@@ -352,12 +352,14 @@ fn no_imports(conn: &Connection) -> Result<()> {
 /// 200 characters). Runtime-composed text must fit before anything is stored:
 /// a generation-one manifest with many sources used to refuse the card only
 /// after the pending record, audit row and owner guard were durable. Truncate
-/// on a character boundary; the full facts stay in the body and the record.
+/// on a character boundary; only this summary is bounded, while the card body
+/// and the stored record keep every source and its ships.
 fn card_text(text: String, max: usize) -> String {
+    debug_assert!(max > 0);
     if text.chars().count() <= max {
         return text;
     }
-    let mut bounded: String = text.chars().take(max - 1).collect();
+    let mut bounded: String = text.chars().take(max.saturating_sub(1)).collect();
     bounded.push('…');
     bounded
 }
@@ -388,6 +390,13 @@ fn write_decision(conn: &Connection, p: &Proposal) -> Result<()> {
         })
         .collect::<Vec<_>>()
         .join("; ");
+    let source_ships = p
+        .manifest
+        .sources
+        .iter()
+        .map(|s| format!("{}: {}", s.name, s.ships.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
     let question = card_text(
         format!("Place desk domain {} at {owner}?", p.manifest.domain),
         DECISION_QUESTION_MAX,
@@ -410,7 +419,7 @@ fn write_decision(conn: &Connection, p: &Proposal) -> Result<()> {
     crate::mail::record_runtime(
         &store,
         &json!({"id":p.decision,"from":member.name,"to":"captain","kind":"decision",
-        "body":format!("Desk placement {}: generation {}; manifest {}; owner {owner}; {directions}.",p.manifest.domain,p.manifest.generation,p.manifest_hash),"payload":payload,"urgency":"normal"}),
+        "body":format!("Desk placement {}: generation {}; manifest {}; owner {owner}; {directions}. Ships by source: {source_ships}.",p.manifest.domain,p.manifest.generation,p.manifest_hash),"payload":payload,"urgency":"normal"}),
     )?;
     Ok(())
 }
@@ -622,9 +631,24 @@ fn absorb_record(conn: &Connection, incoming: &Record) -> Result<()> {
             }
             card_written = true;
         }
-        save(conn, &r)?;
-        if new {
-            audit(conn, "desk.placement.proposed", p)?;
+        let staged = (|| -> Result<()> {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            save(&tx, &r)?;
+            if new {
+                audit(&tx, "desk.placement.proposed", p)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = staged {
+            if staged_guard {
+                clear_pending_guard(p)
+                    .with_context(|| format!("pending record refused: {error:#}"))?;
+            }
+            return Err(error);
         }
     }
     // Commit/replay paths above do not stage a card, but a certified record

@@ -243,6 +243,12 @@ fn a_large_manifest_still_writes_the_decision_card() {
     for name in &names {
         assert!(body.contains(name.as_str()), "{body}");
     }
+    for i in 0..machines.len() {
+        for j in [0, 19] {
+            let ship = format!("m{i}-{j:02}");
+            assert!(body.contains(&ship), "body must list ship {ship}: {body}");
+        }
+    }
     assert_eq!(a.status()["records"].as_array().unwrap().len(), 1);
 }
 
@@ -267,7 +273,7 @@ fn a_refused_decision_card_leaves_no_pending_record_or_guard() {
     assert_eq!(status["restore_guard"], false, "{status}");
     assert!(!a.registry().with_extension("desk-placement-owner.json").exists());
     assert_eq!(a.audit_count("desk.placement.proposed"), 0);
-    // Stable home paths only: drop the injected failure and stage normally.
+    // Drop the injected mail refusal so the retry can write the card and stage.
     let store = Connection::open(a.root.join("survey/.privateer/privateer.sqlite")).unwrap();
     store.execute_batch("DROP TRIGGER refuse_decision;").unwrap();
     drop(store);
@@ -276,4 +282,69 @@ fn a_refused_decision_card_leaves_no_pending_record_or_guard() {
     let card = a.ok("mail.show", json!({"id":p["decision"]}));
     assert_eq!(card["kind"], "decision");
     assert_eq!(a.status()["restore_guard"], false);
+}
+
+/// A failure after the card is written must leave neither the staged owner
+/// guard nor a pending record behind, and a retry must stage normally.
+fn assert_failed_staging_leaves_no_guard_or_record(
+    a: &Machine,
+    trigger: &str,
+    table: &str,
+    condition: &str,
+    why: &str,
+) {
+    let store = Connection::open(a.registry()).unwrap();
+    store
+        .execute_batch(&format!(
+            "CREATE TRIGGER {trigger} BEFORE INSERT ON {table} {condition}
+             BEGIN SELECT RAISE(ABORT, '{why}'); END;"
+        ))
+        .unwrap();
+    drop(store);
+    a.fails(
+        "machine.desk.propose",
+        json!({"domain":"survey-domain","owner":"beta","sources":["alpha","beta"]}),
+        why,
+    );
+    let status = a.status();
+    assert!(status["records"].as_array().unwrap().is_empty(), "{status}");
+    assert_eq!(status["restore_guard"], false, "{status}");
+    assert!(!a.registry().with_extension("desk-placement-owner.json").exists());
+    assert_eq!(a.audit_count("desk.placement.proposed"), 0);
+    let store = Connection::open(a.registry()).unwrap();
+    store
+        .execute_batch(&format!("DROP TRIGGER {trigger};"))
+        .unwrap();
+    drop(store);
+    proposal(a, "beta", &["alpha", "beta"]);
+    let status = a.status();
+    assert_eq!(status["records"].as_array().unwrap().len(), 1, "{status}");
+    assert_eq!(status["restore_guard"], false, "{status}");
+    assert_eq!(a.audit_count("desk.placement.proposed"), 1);
+    let p = a.row()["proposal"].clone();
+    assert_eq!(a.ok("mail.show", json!({"id":p["decision"]}))["kind"], "decision");
+}
+
+#[test]
+fn a_refused_pending_record_clears_the_staged_guard_and_retries() {
+    let (_t, a, _b) = pair();
+    assert_failed_staging_leaves_no_guard_or_record(
+        &a,
+        "refuse_pending_record",
+        "desk_placement_record",
+        "",
+        "forced record refusal",
+    );
+}
+
+#[test]
+fn a_refused_audit_rolls_back_the_pending_record_and_guard() {
+    let (_t, a, _b) = pair();
+    assert_failed_staging_leaves_no_guard_or_record(
+        &a,
+        "refuse_pending_audit",
+        "desk_placement_audit",
+        "WHEN NEW.event='desk.placement.proposed'",
+        "forced audit refusal",
+    );
 }
