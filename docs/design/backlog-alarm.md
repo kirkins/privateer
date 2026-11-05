@@ -2,6 +2,61 @@
 
 Status: approved by the Opus design review with eight changes, all folded in below (round 2), and implemented in `src/scheduling/backlog.rs`. Task `privateer-backlog-alarm`, from the captain's design finding 401ade1f (gap 2). Read with [automatic prepared work](../scheduling.md) and [a first mate's attention](first-mate-attention.md).
 
+## Task-scoped fault reminders (#750)
+
+Faulted schedules now use a separate branch in `src/scheduling/backlog/faults.rs`,
+not the idle-candidate/gating/backoff rules described below. The ordinary idle
+alarm (unscheduled tasks and stale remote waits) is unchanged.
+
+A fault on an open, running or blocked task is stranded when its own tree
+contains no live supervised job (`starting`, `queued`, `launching`, `running`,
+`orphaned`, `parked`), crew park (`parked`, `held`, `resuming`) or live schedule
+claim (`offered`, `claimed`, `executing`). Typed waits are live only in schedule
+state `waiting`, which is never a fault-reminder candidate. `fault()` retains
+the old wait as evidence, not as a condition that can resume work: this includes
+cancelled task dependencies, closed remote waits and lost authority while
+waiting. Such dead waits must not silence a stranded fault.
+A blocked task remains excluded while an outgoing request or decision in its
+tree is open; once that ask is denied, withdrawn or otherwise ended, a fault
+needs an owner decision even if its task status is still blocked. Duty tasks,
+offered handoffs, terminal tasks and tasks held by a scheduled ancestor remain
+excluded. On open/running tasks neither an open outgoing request nor a
+`waiting` pin suppresses a fault reminder; the notice names
+a bounded sample of both in the tree, including descendants, for review.
+
+This branch runs before ship-wide idle gates: unrelated work, an awake first
+mate, pending mail or route backoff cannot suppress the durable notice. It
+records ordinary decision mail on a ship-level thread, not a work offer or a
+task-focused coordinator. Existing mail activation enforces its normal route,
+stow, permission and wake-budget gates. The reminder never retries work or
+grants authority. `backlog_alarm_secs = 0` disables this branch too.
+
+The durable table is
+`schedule_fault_reminders(task_id, revision, owner, faults, fires, next_ms)`
+with a composite primary key on task, revision and owner. The recorded fault
+count resets the budget when the same revision faults again (including after
+a defer and resume, which do not change the revision). Due roots are selected
+in a MATERIALIZED CTE before any live-job inspection. The first read takes no
+write lock; only a nonempty set takes the lock and rechecks eligibility before
+recording counters, mail and audit atomically. Ancestor holds are excluded
+before the batch limit so large held subtrees cannot starve later faults.
+Live-job probes repeat the `jobs_live` partial-index predicate, so retained
+terminal job history is not scanned even when a due fault stays suppressed.
+When upgrading reminder rows that predate fault counts, the recorded budget is
+attributed to the current count. A re-fault before that upgrade may miss one
+generation's reminders; subsequent counts/revisions receive a fresh budget.
+Each fault generation gets one reminder after
+`backlog_alarm_secs` from its fault time, and **at most one repeat**, no sooner
+than `max(8 hours, backlog_alarm_secs)` later. Legacy records with no fault time
+start a durable grace on first observation. Restarts do not reset this budget.
+Each pass sends at most one digest notice per owner, listing up to ten due
+faults, including on hosted ships that have no wake row. Deferring, enqueueing,
+handing off or closing removes eligibility; blocking does so while an open
+ask holds the task. An explicit enqueue that faults again has a
+new revision and a fresh budget. Faults are no longer duplicated
+by the ordinary idle alarm. Tick reports include `fault_reminders` mail IDs;
+audit events use `scheduling.fault_reminder`.
+
 ## Problem
 
 A sleeping first mate is good: it frees memory. A ship asleep with work it could do and free resources is not. The captain's night is about 8 hours and should move queued and roadmap work without the captain.
