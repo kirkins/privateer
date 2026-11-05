@@ -287,8 +287,11 @@ mod kernel {
         procargs(&buffer).ok_or_else(|| std::io::Error::other("malformed kern.procargs2 reply"))
     }
 
+    /// A process's environment as raw `(name, value)` pairs.
+    pub(crate) type EnvPairs = Vec<(Vec<u8>, Vec<u8>)>;
+
     /// argv and the environment of `pid`, from one `kern.procargs2` read.
-    pub(crate) fn argv_env(pid: u32) -> std::io::Result<(Vec<String>, Vec<(Vec<u8>, Vec<u8>)>)> {
+    pub(crate) fn argv_env(pid: u32) -> std::io::Result<(Vec<String>, EnvPairs)> {
         let buffer = procargs2(pid)?;
         procargs_env(&buffer).ok_or_else(|| std::io::Error::other("malformed kern.procargs2 reply"))
     }

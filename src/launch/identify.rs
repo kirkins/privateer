@@ -1,7 +1,7 @@
 //! Finding a launch request's requester from outside its sandbox, and
 //! proving it is the process that wrote the request
 //! (docs/design/codex-sandboxed-launch.md, step 5).
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::ffi::OsString;
 use std::path::Path;
@@ -53,6 +53,7 @@ pub(super) fn bound(argv: &[String], home: &Path, id: &str) -> bool {
 
 /// The last pid on a `/proc/P/status` `NSpid:` line: the pid in the
 /// process's own, innermost PID namespace.
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn nspid_innermost(status: &str) -> Option<u32> {
     status
         .lines()
@@ -171,8 +172,10 @@ fn outer_pid(pid: u32, namespace: &str) -> Result<u32> {
     }
     match found.as_slice() {
         [one] => Ok(*one),
-        [] => bail!("no process {pid} in PID namespace {namespace} is visible from the dispatcher"),
-        _ => bail!("several processes claim pid {pid} in PID namespace {namespace}"),
+        [] => anyhow::bail!(
+            "no process {pid} in PID namespace {namespace} is visible from the dispatcher"
+        ),
+        _ => anyhow::bail!("several processes claim pid {pid} in PID namespace {namespace}"),
     }
 }
 
@@ -235,5 +238,5 @@ pub(super) fn requester(recorded: &Value, home: &Path, id: &str) -> Result<Found
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) fn requester(_recorded: &Value, _home: &Path, _id: &str) -> Result<Found> {
-    bail!("launches for sandboxed callers are supported on Linux and macOS only")
+    anyhow::bail!("launches for sandboxed callers are supported on Linux and macOS only")
 }
