@@ -215,14 +215,14 @@ fn legacy_child_times_are_recovered_once_without_inventing_missing_history() {
     dispatch(
         &mut s,
         "task.update",
-        json!({"id":"known","actor":"infra","status":"done"}),
+        json!({"id":"known","actor":"infra","status":"blocked"}),
     )
     .unwrap();
     // Include repeated same-status updates and unrelated audit traffic.
     dispatch(
         &mut s,
         "task.update",
-        json!({"id":"known","actor":"infra","status":"done"}),
+        json!({"id":"known","actor":"infra","status":"blocked"}),
     )
     .unwrap();
     s.connection().execute_batch(
@@ -256,7 +256,7 @@ fn legacy_child_times_are_recovered_once_without_inventing_missing_history() {
     let mut s = Store::open(&temp.path().join("home")).unwrap();
     assert_eq!(read_parent(&mut s), read);
     s.connection()
-        .execute("UPDATE tasks SET status='done' WHERE id='known'", [])
+        .execute("UPDATE tasks SET status='blocked' WHERE id='known'", [])
         .unwrap();
     assert_eq!(
         read_parent(&mut s)["child_status"]["children"][0]["status_changed_approx"],
