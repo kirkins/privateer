@@ -6,23 +6,25 @@ Status (2026-11-04): (a) and (c) implemented (`src/crew_scope/ancestry.rs`, `src
 
 A native Codex first mate runs its shell commands under Codex's `workspace-write` Seatbelt profile (`/usr/bin/sandbox-exec -p POLICY -- CMD`). Every Privateer CLI call it makes resolves its caller first (`crew_scope::resolve`). On macOS that resolution walks the process ancestry by running `/bin/ps -axww -o pid=,ppid=,args=` (`src/crew_scope.rs`, the non-Linux `ancestors`). Under the profile `ps` fails, so the CLI exits with "process ancestry inspection failed" before it does anything. The wake's job still exits 0, so the wake settles `succeeded`, covers its mail, and nothing was answered.
 
-The relevant rules of Codex's base profile (`codex-rs/sandboxing/src/seatbelt_base_policy.sbpl`, read 2026-11-04):
+The relevant rules of Codex's base profile (`codex-rs/sandboxing/src/seatbelt_base_policy.sbpl` at openai/codex `696b4502`, read 2026-11-04):
 
 | rule | effect on ancestry |
 |---|---|
 | `(deny default)` | anything not listed is denied |
 | `(allow process-exec)`, `(allow process-fork)` | children run, and inherit the sandbox |
 | `(allow process-info* (target same-sandbox))` | `proc_pidinfo`, `proc_pidpath` and `proc_pidinfo(PROC_PIDTBSDINFO)` work only on processes inside the same sandbox. The supervisor, the dispatcher and the Codex app-server are outside it |
-| `sysctl-read`: names `kern.argmax`, `kern.osversion` and others, prefixes `kern.proc.pid.`, `kern.proc.pgrp.` and others | `sysctl {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid}` is allowed for any pid. `kern.proc.all` (which `ps -ax` reads) and `kern.procargs2` (argv) are not listed, so both are denied |
+| `sysctl-read`: names `kern.argmax`, `kern.osversion` and others, prefixes `kern.proc.pid.`, `kern.proc.pgrp.` and others | `sysctl {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid}` is allowed for any pid. `kern.proc.all` (which `ps -ax` reads) is not listed and is denied. `kern.procargs2` (argv) is not listed either, but is **not** reliably denied: see below |
 | `(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))` | `getpwuid` works, so the real fleet registry can still be found |
 
-So, inside the sandbox, a caller can read each ancestor's parent pid, start time and state (`struct kinfo_proc`), but not its argv, path or other `proc_pidinfo` fields. The ship home is a writable root (`plugins/native.py` passes `--add-dir HOME`), so the store can be opened read-write.
+So, inside the sandbox, a caller can read each ancestor's parent pid, start time and state (`struct kinfo_proc`), but not its path or other `proc_pidinfo` fields.
+
+Its argv may or may not be readable. This document first assumed that an unlisted `kern.procargs2` is denied. The macOS CI probe disproved that: under `sandbox-exec` with the base profile's `deny default`, `process-info*` and `sysctl-read` rules copied verbatim (no network or preference layer of Codex's adds a `kern.procargs2` rule), CI run 41963181277 read the argv of every same-user ancestor outside the sandbox (the test process, `cargo`, the runner's `Python`). Why Seatbelt lets that `KERN_PROCARGS2` read through has not been established, and it may differ between macOS releases, profiles or users (another user's argv is hidden from any unprivileged caller). So the design does not depend on it: a visible argv is proved by today's rule, and a hidden one by the records. The ship home is a writable root (`plugins/native.py` passes `--add-dir HOME`), so the store can be opened read-write.
 
 ## (a) Establishing a sandboxed caller's identity on macOS
 
 ### Options
 
-1. **Direct-ancestor inspection the sandbox allows.** `proc_pidinfo` and `proc_pidpath` are `process-info*` and are denied for every ancestor that matters. `sysctl KERN_PROC_PID` is allowed and gives `e_ppid`, `p_starttime` and `p_stat`. Argv is denied.
+1. **Direct-ancestor inspection the sandbox allows.** `proc_pidinfo` and `proc_pidpath` are `process-info*` and are denied for every ancestor that matters. `sysctl KERN_PROC_PID` is allowed and gives `e_ppid`, `p_starttime` and `p_stat`. Argv cannot be relied on: it may be denied.
 2. **A launch-issued caller credential.** The supervisor creates a random secret per job, records its hash in the job record, and passes the secret to its payload in the environment. The CLI presents it.
 
 ### Choice: kernel ancestry, with the supervisor found from the records
@@ -37,8 +39,8 @@ The walk (`crew_scope::ancestry::walk`) starts at this process and follows paren
 
 The nearest ancestor that is the recorded supervisor of a job is the caller's supervisor. That ancestor is found in one of two ways:
 
-- **Argv readable** (no sandbox): as today. Take `--home H _job-supervise J` from the argv, load `J` from `H`, and require `J.supervisor` to have the same pid, the same start identity and no PID namespace. The only change is that the start time comes from the kernel rather than from `ps`.
-- **Argv hidden** (sandbox): every supervisor is a Privateer process, so only a hidden ancestor whose kernel command name is `privateer` or this CLI's own name (or is unknown) is looked up. Any other hidden ancestor, such as the root-owned `login` above every unsandboxed Terminal shell, is passed over, as the visible rule passes over any argv that is not `_job-supervise`. For a hidden Privateer ancestor, read the job records of the homes the caller can name: the target home and every home the real registry lists, which is the same set `world` already treats as `Home`. A job whose `supervisor` has this pid and this start identity is the match. If two records claim the same pid and start, the caller is refused. One unindexed query per home (`json_extract(record,'$.supervisor.pid') IN (pids)`) takes about 30 ms on a home with 6,000 jobs. It runs, and the registry is opened, only when some hidden ancestor is a Privateer process.
+- **Argv readable** (no sandbox, or a sandbox that lets `kern.procargs2` through): as today. Take `--home H _job-supervise J` from the argv, load `J` from `H`, and require `J.supervisor` to have the same pid, the same start identity and no PID namespace. The only change is that the start time comes from the kernel rather than from `ps`.
+- **Argv hidden** (a sandbox that denies `kern.procargs2`, or another user's process): every supervisor is a Privateer process, so only a hidden ancestor whose kernel command name is `privateer` or this CLI's own name (or is unknown) is looked up. Any other hidden ancestor, such as the root-owned `login` above every unsandboxed Terminal shell, is passed over, as the visible rule passes over any argv that is not `_job-supervise`. For a hidden Privateer ancestor, read the job records of the homes the caller can name: the target home and every home the real registry lists, which is the same set `world` already treats as `Home`. A job whose `supervisor` has this pid and this start identity is the match. If two records claim the same pid and start, the caller is refused. One unindexed query per home (`json_extract(record,'$.supervisor.pid') IN (pids)`) takes about 30 ms on a home with 6,000 jobs. It runs, and the registry is opened, only when some hidden ancestor is a Privateer process.
 
 **Failing closed.** A hidden ancestor that matches no record might still be a supervisor whose job is recorded in a home the caller cannot name. Every supervisor is a Privateer process, so a hidden ancestor whose kernel command name is `privateer` (or this CLI's own name) must be accounted for before the walk passes it. The two Privateer processes that legitimately sit above a first mate's harness record their identity:
 - an attended `privateer start` has a live presence lease `start:PID:...`;
@@ -156,7 +158,7 @@ Not covered: a first mate that runs one command and then fails every other one. 
   - the kernel read's parent is `getppid()`;
   - its start identity equals `jobs::process_identity` (from `ps`) for this process and its parent;
   - its argv equals `std::env::args`;
-  - a probe re-runs the test binary under `/usr/bin/sandbox-exec` with Codex's base rules. It checks that `/bin/ps -ax` fails there (reproducing #732), and that the walk still reaches the test process with its pid, start and command name while its argv is hidden.
+  - a probe re-runs the test binary under `/usr/bin/sandbox-exec` with Codex's base rules and reports on its own stderr line. It checks that `/bin/ps -ax` fails there (reproducing #732), and that the walk still reaches the test process with its pid, start and command name. It accepts either argv outcome but checks each: a visible argv must equal the test process's `std::env::args` and resolution must not error; a hidden one, whose ancestor carries this CLI's command name and no record, must be refused with the sandbox-limit refusal and no mention of `permissions.blocked`.
 - **Settlement for (c)** (`activation::tests`):
   - no contact gives `failed`, with the refusal in the error, the mail uncovered and the session kept;
   - contact gives `succeeded`;

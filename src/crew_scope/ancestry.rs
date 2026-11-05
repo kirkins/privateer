@@ -3,8 +3,9 @@
 //!
 //! Linux reads `/proc`. macOS reads `sysctl kern.proc.pid.<pid>` for each
 //! parent link and start time, and `sysctl kern.procargs2` for argv. Codex's
-//! Seatbelt profile allows the first and denies the second, so a sandboxed
-//! caller sees its ancestors' identities but not their command lines.
+//! Seatbelt profile allows the first. No rule of it allows the second, yet
+//! macOS CI read same-user argv under it, so a sandboxed caller may or may
+//! not see its ancestors' command lines; `crew_scope` handles both.
 // The kernel walk runs on macOS; elsewhere only its tests use it.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 use anyhow::{Result, bail};
@@ -598,8 +599,9 @@ mod tests {
         }
 
         /// The rules of Codex's `workspace-write` base profile that decide
-        /// ancestry (codex-rs/sandboxing/src/seatbelt_base_policy.sbpl, read
-        /// 2026-11-04), with its full-disk read access.
+        /// ancestry (codex-rs/sandboxing/src/seatbelt_base_policy.sbpl at
+        /// openai/codex 696b4502, read 2026-11-04; its `sysctl-read` list is
+        /// copied verbatim), with its full-disk read access.
         const CODEX_LIKE_PROFILE: &str = r#"(version 1)
 (deny default)
 (allow process-exec)
@@ -631,9 +633,10 @@ mod tests {
 (allow ipc-posix-sem)
 "#;
 
-        /// Run inside the sandbox by the test below; prints one PROBE line.
+        /// Run inside the sandbox by the test below; writes one PROBE line to
+        /// stderr (libtest's own `test ... ` has no newline on stdout).
         #[test]
-        #[ignore = "run under sandbox-exec by a_codex_like_sandbox_hides_argv_but_not_the_kernel_walk"]
+        #[ignore = "run under sandbox-exec by a_codex_like_sandbox_denies_ps_but_not_the_kernel_walk"]
         fn sandbox_probe() {
             if std::env::var_os("PRIVATEER_732_PROBE").is_none() {
                 return;
@@ -649,20 +652,30 @@ mod tests {
                         .iter()
                         .map(|a| serde_json::json!({
                             "pid": a.pid, "started": a.started, "comm": a.comm,
-                            "argv_hidden": a.argv.is_none(),
+                            "argv": a.argv,
                         }))
                         .collect::<Vec<_>>()
                 ),
                 Err(error) => serde_json::json!(format!("{error:#}")),
             };
-            println!(
-                "PROBE {}",
-                serde_json::json!({"ps_ok": ps, "ancestors": walked})
+            // The resolver's own ancestry step, as a sandboxed CLI runs it.
+            let resolved = match crate::crew_scope::supervising_job(None) {
+                Ok(found) => serde_json::json!({"job": found.map(|(_, job, _)| job)}),
+                Err(error) => serde_json::json!({"error": format!("{error:#}")}),
+            };
+            eprintln!(
+                "\nPROBE {}",
+                serde_json::json!({"ps_ok": ps, "ancestors": walked, "resolved": resolved})
             );
         }
 
+        /// Codex's profile denies `ps` (#732) but allows the kernel walk.
+        /// Its argv reads are not asserted either way: no rule allows
+        /// `kern.procargs2`, yet macOS CI (run 41963181277) read every
+        /// same-user ancestor's argv under it. Resolution must hold in both
+        /// cases (docs/design/codex-sandboxed-callers.md).
         #[test]
-        fn a_codex_like_sandbox_hides_argv_but_not_the_kernel_walk() {
+        fn a_codex_like_sandbox_denies_ps_but_not_the_kernel_walk() {
             let sandbox = std::path::Path::new("/usr/bin/sandbox-exec");
             assert!(sandbox.exists(), "macOS ships {}", sandbox.display());
             let output = std::process::Command::new(sandbox)
@@ -677,31 +690,52 @@ mod tests {
                     "--test-threads=1",
                 ])
                 .env("PRIVATEER_732_PROBE", "1")
+                .env_remove("PRIVATEER_JOB")
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let line = stdout
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let line = stderr
                 .lines()
-                .find_map(|l| l.strip_prefix("PROBE "))
+                .chain(stdout.lines())
+                .find_map(|l| l.find("PROBE {").map(|at| &l[at + "PROBE ".len()..]))
                 .unwrap_or_else(|| {
                     panic!(
-                        "the probe did not report: {:?}\nstdout: {stdout}\nstderr: {}",
-                        output.status,
-                        String::from_utf8_lossy(&output.stderr)
+                        "the probe did not report: {:?}\nstdout: {stdout}\nstderr: {stderr}",
+                        output.status
                     )
                 });
             let probe: serde_json::Value = serde_json::from_str(line).unwrap();
             // The profile reproduces #732: ps cannot read the process table.
             assert_eq!(probe["ps_ok"], false, "{probe}");
-            // sandbox-exec execs the probe, so this test process is its parent:
-            // outside the sandbox, read by pid and start, its argv hidden.
+            // sandbox-exec execs the probe, so this test process is its parent,
+            // outside the sandbox: read by pid, start and command name.
             let me = std::process::id();
             let own = kinfo(me).unwrap().unwrap();
             let parent = &probe["ancestors"][0];
             assert_eq!(parent["pid"], me, "{probe}");
             assert_eq!(parent["started"], own.started.as_str(), "{probe}");
             assert_eq!(parent["comm"], own.comm.as_str(), "{probe}");
-            assert_eq!(parent["argv_hidden"], true, "{probe}");
+            let resolved = &probe["resolved"];
+            if parent["argv"].is_null() {
+                // Hidden: the parent carries this CLI's command name and no
+                // record names it, so the caller is refused as a sandbox
+                // limit, never resolved as having no supervisor.
+                let error = resolved["error"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{probe}"));
+                assert!(
+                    error.contains("not a missing Privateer permission"),
+                    "{probe}"
+                );
+                assert!(!error.contains("permissions.blocked"), "{probe}");
+            } else {
+                // Visible: the exact argv, so today's rule applies. This test
+                // process is no supervisor, and resolution does not error.
+                let argv: Vec<String> = std::env::args().collect();
+                assert_eq!(parent["argv"], serde_json::json!(argv), "{probe}");
+                assert!(resolved.get("error").is_none(), "{probe}");
+            }
         }
     }
 }
