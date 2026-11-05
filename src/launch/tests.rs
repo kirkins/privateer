@@ -375,7 +375,9 @@ fn a_caller_that_is_a_review_errand_or_a_read_only_launch_stays_contained() {
     .unwrap();
     let job = |id: &str, extra: Value| {
         let mut record = json!({"id": id, "task_id": "harbor-duty", "incarnation": "alpha",
-            "status": "running", "created_ms": 0});
+            "command": ["true"], "cwd": "/ships/harbor", "action": "spawn", "heavy": false,
+            "timeout_secs": 60, "ledger": "/ships/ledger", "status": "running",
+            "created_ms": 0, "cancel_requested": false});
         for (key, value) in extra.as_object().unwrap() {
             record[key] = value.clone();
         }
@@ -384,6 +386,8 @@ fn a_caller_that_is_a_review_errand_or_a_read_only_launch_stays_contained() {
             params![id, record.to_string()],
         )
         .unwrap();
+        // `contained` reads a record it cannot load as no containment.
+        crate::jobs::record(&store, id).unwrap();
     };
     job("review-errand", json!({}));
     job("read-only-crew", json!({"codex_read_only_crew": true}));

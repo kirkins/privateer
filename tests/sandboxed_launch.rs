@@ -98,7 +98,8 @@ if kind == "forge":
 marker = root / ("parked-on-" + task)
 if not marker.exists():
     started = call("job.start", {"task_id": task, "heavy": True, "wait_for_capacity": True,
-        "command": ["sh", "-c", "echo crew-build-ok > %s" % (root / ("crew-build-" + task))]})
+        # Long enough that it is still running when the crew parks on it.
+        "command": ["sh", "-c", "sleep 2; echo crew-build-ok > %s" % (root / ("crew-build-" + task))]})
     marker.write_text(started["id"])
     call("crew.park", {"job_id": started["id"], "next": "read the build"})
     done()
