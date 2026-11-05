@@ -275,7 +275,7 @@ class RunnerTests(unittest.TestCase):
         new_session = str(uuid.uuid4())
         original = runner.control
         def control(record, command, args):
-            if command == "ship.presence":
+            if command == "ship.presence" and new_session not in self.loaded_sessions:
                 # Dispatch's first loaded-list fence already passed; /new has
                 # no callback until the user submits a turn in the new UUID.
                 self.loaded_sessions.append(new_session)
@@ -320,7 +320,9 @@ class RunnerTests(unittest.TestCase):
         restarted.publish(self.record, result)
         self.assertFalse(any(command == "wake.hosted" for command, _ in self.calls))
         with patch.object(runner.subprocess, "Popen") as spawn:
-            self.assertEqual(runner.tick(self.registry), {"tick": "idle"})
+            # A presented offer with its success wake deliberately withheld
+            # remains outstanding to tick; it must not manufacture that wake.
+            self.assertEqual(runner.tick(self.registry), {"tick": "mail wake unreported"})
             self.prepare(1)
             with self.assertRaisesRegex(ValueError, "runner paused"):
                 restarted.dispatch()
