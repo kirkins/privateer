@@ -393,15 +393,20 @@ pub(crate) fn run_argv_output(
     run_program_output(&program, &argv[1..], path, deadline, capture)
 }
 
-/// Probe an already resolved program without converting its OS path to UTF-8.
-/// Shares argv probes' environment, output limit and deadline semantics.
-pub(crate) fn run_program_output(
-    program: &Path,
-    args: &[String],
-    path: &str,
-    deadline: Instant,
-    capture: bool,
-) -> std::result::Result<String, String> {
+/// One probe about to run: its command, the name it is shown by, and when it
+/// must stop.
+struct Bounded {
+    command: Command,
+    /// The program named as the captain wrote it, without the directories.
+    shown: String,
+    /// Until `deadline` or the probe's own timeout, whichever is first.
+    until: Instant,
+    /// The check's budget, not the probe's own timeout, is the shorter one.
+    cut_short: bool,
+}
+
+/// The command one probe runs, with argv probes' environment, and until when.
+fn bounded(program: &Path, args: &[String], path: &str, deadline: Instant) -> Bounded {
     let mut command = Command::new(program);
     command
         .args(args)
@@ -411,20 +416,41 @@ pub(crate) fn run_program_output(
     if let Some(home) = std::env::var_os("HOME") {
         command.env("HOME", home);
     }
-    // Named as the captain wrote it, without the directories.
     let shown = program
         .file_name()
         .unwrap_or(program.as_os_str())
-        .to_string_lossy();
-    // Until `deadline` or the probe's own timeout, whichever is first.
+        .to_string_lossy()
+        .into_owned();
     let own = Instant::now() + PROBE_TIMEOUT;
-    match run_bounded(command, &shown, deadline.min(own), capture) {
-        Err(why) if why == TIMED_OUT => Err(if deadline < own {
-            CUT_SHORT
-        } else {
-            "probe timed out"
-        }
-        .to_owned()),
+    Bounded {
+        command,
+        shown,
+        until: deadline.min(own),
+        cut_short: deadline < own,
+    }
+}
+
+/// Why a probe stopped at its deadline: the check's time, or its own timeout.
+pub(crate) fn timeout_reason(cut_short: bool) -> &'static str {
+    if cut_short {
+        CUT_SHORT
+    } else {
+        "probe timed out"
+    }
+}
+
+/// Probe an already resolved program without converting its OS path to UTF-8.
+/// Shares argv probes' environment, output limit and deadline semantics.
+pub(crate) fn run_program_output(
+    program: &Path,
+    args: &[String],
+    path: &str,
+    deadline: Instant,
+    capture: bool,
+) -> std::result::Result<String, String> {
+    let probe = bounded(program, args, path, deadline);
+    match run_bounded(probe.command, &probe.shown, probe.until, capture) {
+        Err(why) if why == TIMED_OUT => Err(timeout_reason(probe.cut_short).to_owned()),
         other => other,
     }
 }
@@ -439,23 +465,16 @@ pub(crate) fn run_program_unmet(
     path: &str,
     deadline: Instant,
 ) -> std::result::Result<(), Unmet> {
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .env_clear()
-        .env("PATH", path)
-        .current_dir("/");
-    if let Some(home) = std::env::var_os("HOME") {
-        command.env("HOME", home);
-    }
-    // Named as the captain wrote it, without the directories.
-    let shown = program
-        .file_name()
-        .unwrap_or(program.as_os_str())
-        .to_string_lossy();
-    // Until `deadline` or the probe's own timeout, whichever is first.
-    let own = Instant::now() + PROBE_TIMEOUT;
-    run_bounded_unmet(command, &shown, deadline.min(own), false, true).map(|_| ())
+    let probe = bounded(program, args, path, deadline);
+    run_bounded_unmet(
+        probe.command,
+        &probe.shown,
+        probe.until,
+        probe.cut_short,
+        false,
+        true,
+    )
+    .map(|_| ())
 }
 
 /// Why `run_bounded` stopped a command: it was still running at its deadline.
@@ -468,10 +487,15 @@ const STDERR_LIMIT: u64 = 4_096;
 /// was and quote what the program printed.
 #[derive(Debug)]
 pub(crate) enum Unmet {
-    /// It could not be started; the text names it and the error.
-    NotStarted(String),
+    /// It could not be started: the error the OS gave, to be named by the
+    /// caller that knows how it is shown.
+    NotStarted(std::io::Error),
     /// It was still running at the deadline; its process group was killed.
-    TimedOut,
+    TimedOut {
+        /// The check's time, not the probe's own timeout, was the shorter
+        /// deadline: see `timeout_reason`.
+        cut_short: bool,
+    },
     /// It ran and failed: why, and its standard error, trimmed.
     Failed { why: String, stderr: String },
 }
@@ -486,20 +510,22 @@ pub(crate) fn run_bounded(
     deadline: Instant,
     capture: bool,
 ) -> std::result::Result<String, String> {
-    match run_bounded_unmet(command, shown, deadline, capture, false) {
+    match run_bounded_unmet(command, shown, deadline, false, capture, false) {
         Ok((stdout, _)) => Ok(stdout),
-        Err(Unmet::NotStarted(why)) => Err(why),
-        Err(Unmet::TimedOut) => Err(TIMED_OUT.to_owned()),
+        Err(Unmet::NotStarted(error)) => Err(format!("{shown} could not start: {error}")),
+        Err(Unmet::TimedOut { .. }) => Err(TIMED_OUT.to_owned()),
         Err(Unmet::Failed { why, .. }) => Err(why),
     }
 }
 
 /// `run_bounded`, keeping what the program printed on standard error when
 /// `stderr` is set, so a failure can be explained rather than guessed at.
+/// `cut_short` says the check's time, not the probe's own, is the deadline.
 fn run_bounded_unmet(
     mut command: Command,
     shown: &str,
-    deadline: Instant,
+    until: Instant,
+    cut_short: bool,
     capture: bool,
     stderr: bool,
 ) -> std::result::Result<(String, String), Unmet> {
@@ -516,16 +542,14 @@ fn run_bounded_unmet(
             Stdio::null()
         })
         .process_group(0);
-    let mut child = command
-        .spawn()
-        .map_err(|error| Unmet::NotStarted(format!("{shown} could not start: {error}")))?;
+    let mut child = command.spawn().map_err(Unmet::NotStarted)?;
     let output = keep(child.stdout.take(), OUTPUT_LIMIT);
     let kept_stderr = keep(child.stderr.take(), STDERR_LIMIT);
     let pid = child.id();
     let outcome = loop {
         match crate::jobs::exited_unreaped(pid) {
             Ok(Some(_)) => break None,
-            Ok(None) if Instant::now() >= deadline => break Some(Unmet::TimedOut),
+            Ok(None) if Instant::now() >= until => break Some(Unmet::TimedOut { cut_short }),
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(error) => {
                 break Some(Unmet::Failed {
@@ -1173,5 +1197,41 @@ mod tests {
                 .unwrap_err()
                 .contains("not on PATH")
         );
+    }
+
+    /// A probe that cannot start carries the OS error itself, so a caller
+    /// names it without parsing another module's wording; one stopped at its
+    /// deadline says which deadline it was.
+    #[test]
+    fn a_probe_that_cannot_start_or_runs_out_of_time_says_which() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("broken");
+        std::fs::write(&broken, "not an executable format\n").unwrap();
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = "/usr/bin:/bin";
+        let far = Instant::now() + CHECK_BUDGET;
+        match run_program_unmet(&broken, &[], path, far) {
+            // The OS's own error, not a message built and re-parsed.
+            Err(Unmet::NotStarted(error)) => {
+                assert!(error.to_string().contains("Exec format error"), "{error}")
+            }
+            other => panic!("a binary that cannot be executed: {other:?}"),
+        }
+        // The check's time is the shorter deadline, so it stops the probe.
+        let sleep = which_in("sleep", path).expect("sleep is on the test PATH");
+        let args = vec!["30".to_owned()];
+        assert!(matches!(
+            run_program_unmet(
+                &sleep,
+                &args,
+                path,
+                Instant::now() + Duration::from_millis(200)
+            ),
+            Err(Unmet::TimedOut { cut_short: true })
+        ));
+        // Each deadline reads as what it was, and never as the other.
+        assert_eq!(timeout_reason(true), CUT_SHORT);
+        assert_eq!(timeout_reason(false), "probe timed out");
     }
 }
