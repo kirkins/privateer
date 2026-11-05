@@ -1866,6 +1866,24 @@ fn launch_plan(
             route.extend(["--model".to_owned(), model.to_owned()]);
         }
     }
+    // A hosted Codex pane resumes its exact session, which Codex resets to the
+    // pane's own settings at attach: carry the ship's effort there. The
+    // binding sends it over an explicit --remote to the verified shared
+    // daemon (a bare -c would leave the daemon for an embedded server).
+    if own_harness
+        && harness == "codex"
+        && hosted
+        && profile["first_mate"]["codex_session"].is_string()
+        && let Some(effort) = crate::host::codex_delivery::effort(options)?
+        && !passthrough
+            .iter()
+            .any(|a| a.starts_with("model_reasoning_effort="))
+    {
+        route.extend([
+            "-c".to_owned(),
+            format!("model_reasoning_effort=\"{effort}\""),
+        ]);
+    }
     // A Claude ship's permission mode and effort, such as `auto` for a first
     // mate nobody is watching. Fleet YOLO still replaces the mode.
     if own_harness && harness == "claude" {

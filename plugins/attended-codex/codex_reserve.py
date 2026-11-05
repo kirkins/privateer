@@ -20,7 +20,7 @@ import uuid
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from codex_binding import atomic, locked
+from codex_binding import atomic, effort_word, locked
 from codex_receipts import encode, exact_uuid, open_rollout
 from codex_socket import Daemon, LIMIT, load, process_identity, safe
 
@@ -74,7 +74,8 @@ def claim(path, request):
         record = {"version": 1, "generation": str(uuid.uuid4()), "state": "reserving",
                   "pid": os.getpid(), "process_identity": process_identity(os.getpid()),
                   "started_ms": now_ms(), "ship": request["ship"], "cwd": request["cwd"],
-                  "codex_home": request["codex_home"], "model": request["model"], "kept": []}
+                  "codex_home": request["codex_home"], "model": request["model"],
+                  "effort": request.get("effort"), "kept": []}
         if old is not None:
             require(isinstance(old, dict) and old.get("version") == 1 and isinstance(old.get("kept"), list)
                     and all(old.get(k) == record[k] for k in ("ship", "cwd", "codex_home")),
@@ -129,6 +130,9 @@ def create(path, request):
             params = {"cwd": request["cwd"], "historyMode": "legacy", "ephemeral": False}
             if request["model"] is not None:
                 params["model"] = request["model"]
+            if request.get("effort") is not None:
+                # No effort parameter on thread/start; the config key is it.
+                params["config"] = {"model_reasoning_effort": request["effort"]}
             SENT.append(generation)
             result = daemon.call("thread/start", params)
             thread = result["thread"]
@@ -139,7 +143,8 @@ def create(path, request):
             require(thread.get("sessionId") == thread["id"] and thread.get("historyMode") == "legacy"
                     and thread.get("ephemeral") is False and thread.get("cwd") == request["cwd"]
                     and thread.get("turns") == []
-                    and (request["model"] is None or result.get("model") == request["model"]),
+                    and (request["model"] is None or result.get("model") == request["model"])
+                    and (request.get("effort") is None or result.get("reasoningEffort") == request["effort"]),
                     "native thread/start did not return a durable legacy zero-turn thread")
     session = record["session"]
     with Reserver(request["codex_home"], timeout=10) as daemon:
@@ -165,7 +170,8 @@ def create(path, request):
                              "size": info.st_size, "meta_hash": meta})
     return {"session": session, "state": "verified", "generation": generation,
             "adopted": record.get("adopted"), "daemon": record["daemon"], "rollout": record["rollout"],
-            "settings": {"requested_model": request["model"], **(record.get("start") or {})},
+            "settings": {"requested_model": request["model"], "requested_effort": request.get("effort"),
+                         **(record.get("start") or {})},
             "kept": len(record["kept"])}
 
 
@@ -183,6 +189,7 @@ def main(argv):
         if argv[1] == "create":
             require(isinstance(request.get("ship"), str) and isinstance(request.get("name"), str)
                     and (request.get("model") is None or isinstance(request["model"], str))
+                    and (request.get("effort") is None or effort_word(request["effort"]))
                     and (request.get("current") is None or exact_uuid(request["current"])),
                     "invalid reservation request")
             home = os.environ.get("CODEX_HOME") or str(Path(os.environ["HOME"]) / ".codex")
