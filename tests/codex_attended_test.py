@@ -181,10 +181,12 @@ class BindingTests(unittest.TestCase):
                 thread.update(model="ship-model", reasoningEffort="high")
                 thread[field] = bad
                 with patch.object(binding, "Daemon", return_value=self.daemon), \
-                        patch.object(binding, "control") as report, \
+                        patch.object(binding, "control", return_value={
+                            "attended": True, "lease": {"holder": "host:alpha"}}) as report, \
                         self.assertRaises(binding.SettingsError):
                     binding.bind(self.registry, self.event)
-                report.assert_not_called()
+                self.assertEqual([call.args[1:] for call in report.call_args_list],
+                                 [("ship.presence", {"ship": "alpha"})])
                 saved = codex_socket.load(self.registry)
                 self.assertEqual(saved["state"], "unbound")
                 self.assertFalse(saved["delivery_enabled"])
@@ -192,7 +194,7 @@ class BindingTests(unittest.TestCase):
         for key, value in [("pid", 99), ("socket_identity", [7, 10])]:
             changed = copy.deepcopy(record)
             changed["attach_daemon"][key] = value
-            with self.assertRaisesRegex(binding.SettingsError, "daemon changed"):
+            with self.assertRaisesRegex(ValueError, "daemon changed"):
                 binding.validate(changed, self.event, self.daemon)
 
     def test_model_only_keeps_implicit_route_and_requires_exact_read_back(self):
@@ -261,37 +263,103 @@ class BindingTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 binding.plan([*self.argv, "-c", "model_reasoning_effort=" + value], self.cwd)
 
-    def test_settings_mismatch_hook_stops_the_initial_turn(self):
+    def run_hook(self, event=None):
+        event = self.event if event is None else event
         with patch.object(binding.sys, "argv", ["hook", "--registry", str(self.registry)]), \
-                patch.object(binding, "bind", side_effect=binding.SettingsError("settings mismatch")), \
-                patch.object(binding.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b"{}"))), \
+                patch.object(binding.sys, "stdin", SimpleNamespace(
+                    buffer=io.BytesIO(json.dumps(event).encode()))), \
                 patch.object(binding.sys, "stdout", new_callable=io.StringIO) as output:
             binding.main()
-        result = json.loads(output.getvalue())
-        self.assertFalse(result["continue"])
-        self.assertIn("settings mismatch", result["stopReason"])
+        return json.loads(output.getvalue())
 
-    def test_any_callback_failure_stops_when_settings_were_requested(self):
+    def settings_launch(self):
+        self.record["requested_settings"] = {"model": "ship-model", "effort": "high"}
+        self.record["attach_daemon"] = binding.daemon_proof(self.daemon)
+        binding.atomic(self.registry, self.record)
+
+    def test_settings_mismatch_hook_stops_the_initial_turn(self):
+        self.settings_launch()
+        with patch.object(binding, "Daemon", return_value=self.daemon), \
+                patch.object(binding, "control", return_value={
+                    "attended": True, "lease": {"holder": "host:alpha"}}) as report:
+            result = self.run_hook()
+        self.assertIs(result["continue"], False)
+        self.assertIn("does not match the requested setting", result["stopReason"])
+        self.assertEqual([call.args[1] for call in report.call_args_list], ["ship.presence"])
+        self.assertEqual(codex_socket.load(self.registry)["state"], "unbound")
+
+    def test_foreign_uuid_settings_callback_is_unbound_without_stopping(self):
+        self.settings_launch()
+        with patch.object(binding, "Daemon", return_value=self.daemon), \
+                patch.object(binding, "control") as report:
+            result = self.run_hook({**self.event, "session_id": str(uuid.uuid4())})
+        self.assertNotIn("continue", result)
+        self.assertNotIn("stopReason", result)
+        self.assertIn("UNBOUND", result["systemMessage"])
+        report.assert_not_called()
+        self.assertEqual(codex_socket.load(self.registry)["state"], "unbound")
+
+    def test_exited_pane_settings_callback_is_unbound_without_stopping(self):
+        # Use a real exited holder PID rather than only a stale mocked identity.
+        with subprocess.Popen([sys.executable, "-c", "pass"]) as pane:
+            pane.wait(timeout=SUBPROCESS_TIMEOUT)
+        self.record["pid"] = pane.pid
+        self.settings_launch()
+        with patch.object(binding, "Daemon", return_value=self.daemon), \
+                patch.object(binding, "control") as report:
+            result = self.run_hook()
+        self.assertNotIn("continue", result)
+        self.assertNotIn("stopReason", result)
+        self.assertIn("identity is stale", result["systemMessage"])
+        report.assert_not_called()
+        self.assertEqual(codex_socket.load(self.registry)["state"], "unbound")
+
+    def test_wrong_daemon_or_presence_settings_callback_does_not_stop(self):
+        self.settings_launch()
+        for changed in ["daemon", "holder", "unattended"]:
+            self.record["attach_daemon"] = binding.daemon_proof(self.daemon)
+            if changed == "daemon":
+                self.record["attach_daemon"]["pid"] += 1
+            binding.atomic(self.registry, self.record)
+            presence = {"attended": changed != "unattended", "lease": {
+                "holder": "other-holder" if changed == "holder" else "host:alpha"}}
+            with self.subTest(changed=changed), \
+                    patch.object(binding, "Daemon", return_value=self.daemon), \
+                    patch.object(binding, "control", return_value=presence):
+                result = self.run_hook()
+                self.assertNotIn("continue", result)
+                self.assertNotIn("stopReason", result)
+                self.assertIn("UNBOUND", result["systemMessage"])
+
+    def test_callback_failure_stops_only_after_settings_launch_custody_is_proven(self):
         for settings in [{"model": "ship-model"}, {"effort": "high"}, {}]:
             self.record["requested_settings"] = settings
-            binding.atomic(self.registry, self.record)
             for error in [ValueError("unsupported schema"), TimeoutError("daemon timed out"),
                           OSError("daemon unreachable"), KeyError("schema field")]:
                 self.record.update(state="bound", delivery_enabled=False)
                 binding.atomic(self.registry, self.record)
                 with self.subTest(settings=settings, error=error), \
-                        patch.object(binding.sys, "argv", ["hook", "--registry", str(self.registry)]), \
-                        patch.object(binding, "Daemon", side_effect=error), \
-                        patch.object(binding.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b"{}"))), \
-                        patch.object(binding.sys, "stdout", new_callable=io.StringIO) as output:
-                    binding.main()
-                result = json.loads(output.getvalue())
+                        patch.object(binding, "Daemon", return_value=self.daemon), \
+                        patch.object(binding, "control", return_value={
+                            "attended": True, "lease": {"holder": "host:alpha"}}), \
+                        patch.object(self.daemon, "call", side_effect=error):
+                    result = self.run_hook()
                 if settings:
                     self.assertIs(result["continue"], False)
                     self.assertTrue(result["stopReason"])
                 else:
                     self.assertNotIn("continue", result)
                 self.assertEqual(codex_socket.load(self.registry)["state"], "unbound")
+
+    def test_unverified_callback_failure_never_stops_a_turn(self):
+        self.settings_launch()
+        for error in [ValueError("daemon unavailable"), OSError("daemon unreachable")]:
+            with self.subTest(error=error), \
+                    patch.object(binding, "Daemon", side_effect=error):
+                result = self.run_hook()
+            self.assertNotIn("continue", result)
+            self.assertNotIn("stopReason", result)
+            self.assertEqual(codex_socket.load(self.registry)["state"], "unbound")
 
     def test_resume_is_exact_and_prompt_is_not_parsed_as_flags(self):
         session = str(uuid.uuid4())

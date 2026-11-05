@@ -598,7 +598,8 @@ def control(record, command, args):
             child.wait()
 
 
-def validate(record, event, daemon):
+def validate_launch(record, event, daemon):
+    """Prove callback custody before settings failures can stop a TUI turn."""
     if not live(record) or Path(f"/proc/{record['pid']}/exe").resolve() != Path(record["executable"]):
         raise ValueError("Codex launch identity is stale")
     session = str(uuid.UUID(event["session_id"]))
@@ -617,7 +618,12 @@ def validate(record, event, daemon):
     if event["source"] == "compact" and session != record.get("binding", record.get("last_binding", {})).get("session"):
         raise ValueError("Codex compact callback has no matching binding")
     if record.get("attach_daemon") is not None and record["attach_daemon"] != daemon_proof(daemon):
-        raise SettingsError("Codex attach daemon changed; requested settings are unverified")
+        raise ValueError("Codex attach daemon changed; callback does not match launch")
+    return session
+
+
+def validate(record, event, daemon):
+    session = validate_launch(record, event, daemon)
     loaded = daemon.call("thread/loaded/list", {"limit": 32})
     if (not isinstance(loaded.get("data"), list) or "nextCursor" not in loaded
             or session not in loaded["data"] or loaded["nextCursor"] or len(loaded["data"]) > 32):
@@ -667,7 +673,7 @@ def validate(record, event, daemon):
                          (("model", "model"), ("effort", "reasoningEffort")) if key in settings}}
 
 
-def bind(registry, event, context=None):
+def bind(registry, event, context=None, on_launch_verified=None):
     registry = Path(registry)
     # The dispatcher has already invalidated before loading this handler. Direct
     # calls must do the same. last_binding retains compact continuity across
@@ -681,14 +687,17 @@ def bind(registry, event, context=None):
     if event.get("session_id") != record["session"]:
         publish_request(registry, "custody-poison.json", reason="callback_uuid_changed")
     with Daemon(record["codex_home"]) as daemon:
+        validate_launch(previous, event, daemon)
+        presence = control(record, "ship.presence", {"ship": record["ship"]})
+        if presence.get("attended") is not True or presence.get("lease", {}).get("holder") != record["holder"]:
+            raise ValueError("Codex binding does not own current presence")
+        if on_launch_verified is not None:
+            on_launch_verified(record)
         binding = validate(previous, event, daemon)
     old = previous.get("binding", previous.get("last_binding", {}))
     if old and any(old.get(key) != binding.get(key) for key in
                    ("daemon_pid", "daemon_identity", "socket", "rendezvous")):
         publish_request(registry, "custody-poison.json", reason="daemon_changed")
-    presence = control(record, "ship.presence", {"ship": record["ship"]})
-    if presence.get("attended") is not True or presence.get("lease", {}).get("holder") != record["holder"]:
-        raise ValueError("Codex binding does not own current presence")
     # A failed/uncertain report remains unbound and may safely be repeated:
     # delivery_bind neither presents mail nor records a wake.
     if record["hosted"]:
@@ -708,8 +717,14 @@ def bind(registry, event, context=None):
 
 
 def main():
-    # An unreadable launch record cannot prove settings were unspecified.
-    stop_turn = True
+    # The project hook also runs for unrelated TUIs, even after our pane exits.
+    # Settings in a persisted record alone never authorize stopping their turn.
+    stop_turn = False
+
+    def launch_verified(record):
+        nonlocal stop_turn
+        stop_turn = bool(record.get("requested_settings"))
+
     try:
         if len(sys.argv) != 3 or sys.argv[1] != "--registry":
             raise ValueError("invalid Codex binding hook invocation")
@@ -717,14 +732,14 @@ def main():
         if data is None:
             data = sys.stdin.buffer.read(LIMIT + 1)
         context = globals().get("_DISPATCH_CONTEXT")
-        record = context[0] if context is not None else load(Path(sys.argv[2]))
-        stop_turn = bool(record.get("requested_settings"))
-        bind(sys.argv[2], data, context)
+        bind(sys.argv[2], data, context, on_launch_verified=launch_verified)
         print("{}")
     except Exception as error:
         # Only our local validation diagnostics, never daemon/provider values.
         reason = str(error)[:200] if isinstance(error, (ValueError, TimeoutError)) else type(error).__name__
         result = {"systemMessage": "Privateer Codex binding UNBOUND (" + reason + "): inspect the launch, trusted project hook, presence and shared daemon; automatic mail remains disabled."}
+        # SettingsError is defensive: bind checks live UUID/daemon/presence
+        # custody before settings validation, which already arms stop_turn.
         if stop_turn or isinstance(error, SettingsError):
             result.update({"continue": False, "stopReason": reason})
         print(json.dumps(result))
