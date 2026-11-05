@@ -229,6 +229,7 @@ impl Ship {
 
     fn serve_with(&mut self, env: &[(&str, &Path)]) {
         let mut command = self.fleet.command();
+        remove_mise_and_codex_environment(&mut command);
         command.args(["serve", "--json", r#"{"interval_secs":1}"#]);
         for (name, value) in env {
             command.env(name, value);
@@ -515,6 +516,7 @@ fn assert_clean_forwarded_environment(ship: &Ship, dispatcher_env: &[(&str, &str
     let arg0 = root.join("user/.codex/tmp/arg0-linux/codex-arg0fixture");
     fs::create_dir_all(&arg0).unwrap();
     let mut baseline = ship.fleet.command();
+    remove_mise_and_codex_environment(&mut baseline);
     baseline.envs(dispatcher_env.iter().copied());
     let baseline_path = baseline
         .get_envs()
@@ -603,6 +605,15 @@ fn assert_clean_forwarded_environment(ship: &Ship, dispatcher_env: &[(&str, &str
         environment(&direct_probe),
         "a forwarded payload has a direct launch's environment"
     );
+}
+
+fn remove_mise_and_codex_environment(command: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy();
+        if name.starts_with("__MISE_") || name.starts_with("CODEX_") {
+            command.env_remove(name.as_ref());
+        }
+    }
 }
 
 #[test]

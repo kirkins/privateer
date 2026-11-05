@@ -724,6 +724,9 @@ fn init_turns_a_folder_into_a_ship_any_harness_can_crew() {
         "{agents}"
     );
     assert!(agents.contains(&format!("{BIN} --home ")));
+    assert!(agents.contains(
+        "A job gets the dispatcher's environment, not your shell's; pass any variable it needs in its command"
+    ));
     // Issue 101: a ship that may publish owns its pull requests to merge.
     assert!(agents.contains("you own your pull requests end to end"));
     assert!(agents.contains("leave the merge to the captain"));
