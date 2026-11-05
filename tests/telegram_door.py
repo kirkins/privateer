@@ -155,8 +155,8 @@ class FakeTelegram:
 
     def edit(self, message_id: int, text: str, reply_to: int | None = None,
              entities: list | None = None, chat: int = CHAT, user: int = CAPTAIN,
-             text_key: str = "text") -> None:
-        """The captain edited a message they had sent."""
+             text_key: str = "text") -> int:
+        """The captain edited a message they had sent; return its update id."""
         message = {"message_id": message_id, "chat": {"id": chat}, "from": {"id": user},
                    text_key: text, "edit_date": 1}
         if reply_to:
@@ -167,6 +167,7 @@ class FakeTelegram:
             update = {"update_id": self.next_update, "edited_message": message}
             self.next_update += 1
             self.updates.append(update)
+            return update["update_id"]
 
     def sent(self) -> list[dict]:
         with self.lock:
@@ -687,12 +688,12 @@ def edit(msg_id, text, reply_to=9, user=7, chat=42, entities=None, text_key="tex
     d.on_update({"edited_message": msg})
 # The answer edited to a no names the reply the door sent.
 edit(55, "no, wait")
-# A stranger's edit, an edit from another chat and one that replies to
-# nothing are not even heard.
+# Unauthorized edits are not heard; unrelated edits get a visible notice.
 edit(55, "no", user=666); edit(55, "no", chat=99); edit(56, "no", reply_to=None)
 # An edit of a reply to a notice follows nothing up, and an edit whose
 # original message the door no longer maps re-checks without the reply id.
 edit(57, "no", reply_to=10)
+edit(60, "caption changed", reply_to=None, text_key="caption")
 tg.write_state(door.OUTGOING, {})
 edit(55, "wait")
 # A struck-through yes carries its strike into the re-check.
@@ -724,7 +725,7 @@ print(json.dumps({"calls": runtime.calls, "said": said}))
 def check_edited_replies() -> None:
     """An edited answer to an ask is re-checked where it was judged: the door
     names the reply it sent when it still remembers it, sends the struck-
-    through words as struck, and ignores edits that answer nothing. Each
+    through words as struck, and explains edits that answer nothing. Each
     outcome reaches the captain, and a runtime without the command says so."""
     out = subprocess.run([sys.executable, "-c", EDIT_PROBE, str(ROOT / "plugins/telegram")],
                          capture_output=True, text=True, cwd=ROOT)
@@ -742,6 +743,10 @@ def check_edited_replies() -> None:
     assert calls[3:] == [["reply.edit", {"ship": "ops", "id": "m1", "body": body}]
                          for body in ("yes", "no", "~yes~", "")], calls
     said = got["said"]
+    not_forwarded = [s for s in said if "edit was not sent" in s]
+    assert len(not_forwarded) == 3, said
+    assert all("send it as a new message" in s for s in not_forwarded), said
+    said = [s for s in said if s not in not_forwarded]
     # The probe's runtime answers each re-check with a withdrawal.
     for notice in said[:7]:
         assert "no longer approves" in notice and "Submit build 55" in notice, said
@@ -756,6 +761,174 @@ def check_edited_replies() -> None:
     # old runtime's refusal is the last word.
     assert said[10:] == ['⚠️ could not re-check your edited answer: unknown door command '
                         '"reply.edit"'], said
+
+
+SPOOL_PROBE = r'''
+import json, os, pathlib, sqlite3, subprocess, sys, tempfile, threading
+sys.path.insert(0, sys.argv[1])
+import door, inbound, tg
+root = pathlib.Path(tempfile.mkdtemp())
+tg.STATE_DIR = str(root)
+secret = "fictional private message /hidden/fictional-name.txt"
+logs = []
+tg.log = logs.append
+sent = []
+fail_notice = False
+def api(cfg, method, params, **kwargs):
+    if method == "sendMessage":
+        if fail_notice:
+            return None, "failure containing " + secret
+        sent.append(params)
+        return {"message_id": 500 + len(sent)}, ""
+    return {}, ""
+tg.api = api
+class Runtime:
+    def __init__(self): self.calls = []; self.mail = {}; self.refuse = False
+    def call(self, command, args=None, **kwargs):
+        self.calls.append((command, args))
+        if self.refuse: raise RuntimeError("refusal containing " + secret)
+        assert command == "send"
+        ident = args["id"]
+        if ident in self.mail: assert self.mail[ident] == args
+        self.mail[ident] = args.copy()
+        return {"ship": "liaison", "mail": {"id": ident}}
+runtime = Runtime()
+cfg = {"chat_id": "42", "allowed_user_ids": [7], "confirm_with_reaction": False}
+def adapter(): return door.Door({"door": "phone", "recipient": "liaison"}, cfg, runtime)
+def update(ident, **extra):
+    return dict(update_id=ident, message=dict(message_id=ident, chat={"id": 42},
+        **{"from": {"id": 7}}, text=secret, **extra))
+def hurry(spool):
+    with spool.db() as db:
+        db.execute("UPDATE pending SET next_at=0")
+        db.execute("UPDATE notices SET next_at=0")
+
+# Fetched updates survive a restart before handling, even if the offset mirror
+# failed. The durable checkpoint and pending entry commit in one transaction.
+spool = inbound.Spool()
+tg.write_state(door.OFFSET, {"offset": 0})
+stop = threading.Event()
+original_write = tg.write_state
+writes = []
+def mirror(name, value):
+    writes.append(value["offset"])
+    if value["offset"] == 2:
+        stop.set()
+        raise OSError(secret)
+    original_write(name, value)
+def poll_api(cfg, method, params, **kwargs):
+    assert method == "getUpdates" and params["offset"] == 0
+    return [update(1)], ""
+tg.api, tg.write_state = poll_api, mirror
+door.poll_telegram(cfg, None, stop)
+tg.api, tg.write_state = api, original_write
+assert writes == [0, 2] and spool.offset() == 2
+assert tg.read_state(door.OFFSET, {}) == {"offset": 0}
+d = adapter(); d.process_inbound()
+assert len(runtime.mail) == 1 and d.spool.ready() is None
+# Intentional setup-backlog skipping is retained, with a recorded outcome.
+assert spool.admit([update(0)], initial_skip=True)
+adapter().process_inbound()
+assert len(runtime.calls) == 1
+with spool.db() as db:
+    assert db.execute("SELECT outcome FROM receipts WHERE id=0").fetchone()[0] == "terminal_initial_backlog"
+# An old fetch cannot revive a completed update.
+assert d.spool.admit([update(1)])
+d.process_inbound(); assert len(runtime.calls) == 1
+
+# A handler exception is content-free and leaves custody for replay.
+spool.admit([update(2)])
+d = adapter()
+def broken(u): raise ValueError(secret)
+d.on_update = broken
+d.process_inbound()
+assert d.spool.ready()["attempts"] == 1
+hurry(spool); adapter().process_inbound()
+assert len(runtime.mail) == 2
+# Poison updates have bounded attempts, followed by a durable terminal outcome.
+spool.admit([update(3)])
+for _ in range(inbound.ATTEMPTS):
+    d = adapter(); d.on_update = broken; hurry(spool); d.process_inbound()
+hurry(spool); adapter().process_inbound()
+assert spool.ready() is None
+with spool.db() as db:
+    assert db.execute("SELECT outcome FROM receipts WHERE id=3").fetchone()[0] == "terminal_handler_error"
+
+# Runtime refusal + failed sendMessage is durable and survives another restart.
+spool.admit([update(4)])
+runtime.refuse, fail_notice = True, True
+d = adapter(); d.process_inbound()
+assert any("outcome=terminal_refused" in s for s in logs)
+assert any("outcome=notice_retry" in s for s in logs)
+with spool.db() as db:
+    assert db.execute("SELECT count(*) FROM pending WHERE id=4").fetchone()[0] == 1
+runtime.refuse, fail_notice = False, False
+hurry(spool); adapter().retry_notices()
+assert "not sent" in sent[-1]["text"]
+with spool.db() as db: assert db.execute("SELECT count(*) FROM pending").fetchone()[0] == 0
+
+# Missing reply target refusal also survives notice exhaustion, which is logged.
+spool.admit([update(5, reply_to_message={"message_id": 999})])
+fail_notice = True
+d = adapter(); d.process_inbound()
+for _ in range(inbound.ATTEMPTS):
+    hurry(spool); adapter().retry_notices()
+assert any("outcome=notice_exhausted" in s for s in logs)
+with spool.db() as db: assert db.execute("SELECT count(*) FROM pending").fetchone()[0] == 0
+fail_notice = False
+
+# Admission is bounded and cannot advance the checkpoint on capacity refusal.
+old_limit = inbound.LIMIT
+inbound.LIMIT = 0
+assert not spool.admit([update(6)]) and spool.offset() == 6
+inbound.LIMIT = old_limit
+assert all(secret not in line and "fictional-name" not in line and "/hidden" not in line for line in logs), logs
+outcomes = [line for line in logs if line.startswith("inbound ")]
+assert outcomes and all("update_id=" in line and "type=" in line and "length=" in line and "outcome=" in line for line in outcomes), logs
+
+# Real process death after the fake mail store commits, before the adapter sees
+# a response/ack. The next process must reuse the exact submitted id and args.
+crash_state = root / "crash"
+crash_state.mkdir()
+tg.STATE_DIR = str(crash_state)
+inbound.Spool().admit([update(20)])
+child = r"""
+import json, os, sqlite3, sys
+sys.path.insert(0, sys.argv[1])
+import door, tg
+tg.STATE_DIR = sys.argv[2]
+tg.log = lambda *a: None
+tg.api = lambda *a, **k: ({"message_id": 99}, "")
+class Runtime:
+    def call(self, command, args, **kwargs):
+        assert command == "send" and args["to"] == "liaison"
+        with sqlite3.connect(tg.state_path("fake-mail.sqlite3")) as db:
+            db.execute("CREATE TABLE IF NOT EXISTS mail(id TEXT PRIMARY KEY, args TEXT)")
+            encoded = json.dumps(args, sort_keys=True)
+            old = db.execute("SELECT args FROM mail WHERE id=?", (args["id"],)).fetchone()
+            if old: assert old[0] == encoded
+            db.execute("INSERT OR IGNORE INTO mail VALUES(?,?)", (args["id"], encoded))
+        if sys.argv[3] == "crash": os._exit(73)
+        return {"ship": "liaison", "mail": {"id": args["id"]}}
+d = door.Door({"door": "phone", "recipient": "liaison" if sys.argv[3] == "crash" else "other"},
+              {"chat_id": "42", "allowed_user_ids": [7]}, Runtime())
+with d.spool.db() as db: db.execute("UPDATE pending SET next_at=0")
+d.process_inbound()
+"""
+for phase, expected in (("crash", 73), ("recover", 0)):
+    result = subprocess.run([sys.executable, "-c", child, sys.argv[1], str(crash_state), phase], capture_output=True, text=True)
+    assert result.returncode == expected, result.stderr
+with sqlite3.connect(crash_state / "fake-mail.sqlite3") as db:
+    assert db.execute("SELECT count(*) FROM mail").fetchone()[0] == 1
+assert inbound.Spool().ready() is None
+print("durable inbound spool, crash recovery, bounded retries and content-free outcomes passed")
+'''
+
+
+def check_inbound_spool() -> None:
+    out = subprocess.run([sys.executable, "-c", SPOOL_PROBE, str(ROOT / "plugins/telegram")],
+                         capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
 
 
 def check_struck_text() -> None:
@@ -845,9 +1018,13 @@ def main() -> int:
     check_privileged_text()
     check_struck_text()
     check_edited_replies()
+    check_inbound_spool()
     check_voice_transcripts()
     check_attachment_put_and_fallback()
     check_group_chat_guard(telegram)
+    if sys.argv[1] == "--unit":
+        print("telegram adapter unit probes passed")
+        return 0
     with tempfile.TemporaryDirectory() as temp:
         root = pathlib.Path(temp).resolve()
         fleet = Fleet(binary, root)
@@ -887,11 +1064,8 @@ def main() -> int:
             early_tg = pushed[0]["_message_id"]
             assert telegram.called("setMyCommands"), "command menu published"
 
-            # On its first run the door records an update offset that skips
-            # whatever the bot already had queued. An early request reaching
-            # the phone does not prove that happened, and a message sent
-            # before it can be mistaken for backlog and dropped. Speak only
-            # once the offset exists, so the question is newer than the skip.
+            # Wait for the intentional first-run backlog checkpoint before
+            # sending fresh mail. Fetched setup chatter now has a terminal receipt.
             wait_for("the door's first poll offset", lambda: (state / "offset.json").exists())
 
             # A plain message goes to the liaison as a request from the captain.
@@ -1261,13 +1435,17 @@ def main() -> int:
             approval2 = wait_for("the second approval recorded", lambda: [
                 r for r in approvals_of(step2["id"]) if r["state"] == "live"])[0]
             before = len(telegram.sent())
-            telegram.edit(yes2, "yes, ship it", reply_to=card2["_message_id"])
+            edit_id = telegram.edit(yes2, "yes, ship it", reply_to=card2["_message_id"])
+            # Wait for this update's terminal receipt, not the old log of the
+            # serialized runtime result (which included approval content).
+            receipt = (f"inbound update_id={edit_id} type=edited_message "
+                       "length=12 outcome=edit_rechecked")
             wait_for("the unchanged edit re-checked", lambda: any(
-                'edit re-checked:' in line and '"outcome": "unchanged"' in line
-                and approval2["id"] in line
+                line.endswith(receipt)
                 for line in (state / "telegram.log").read_text().splitlines()))
+            assert approval2["id"] not in (state / "telegram.log").read_text()
             assert not [m for m in telegram.sent()[before:] if "no longer approves" in m["text"]]
-            assert [r for r in approvals_of(step2["id"]) if r["state"] == "live"]
+            assert [r["id"] for r in approvals_of(step2["id"]) if r["state"] == "live"] == [approval2["id"]]
             telegram.edit(yes2, "yes", reply_to=card2["_message_id"],
                           entities=[{"type": "strikethrough", "offset": 0, "length": 3}])
             wait_for("the struck yes withdrawn", lambda: [

@@ -22,8 +22,8 @@ How is the API refactor going?
 This is a [front door](../../docs/architecture.md#front-doors): Privateer runs
 it under `privateer door run telegram`, hands it the captain's mail from every
 ship, and routes what you send to the right ship's home. The door keeps only
-Telegram bookkeeping (which chat message carries which mail); the fleet's record
-stays in Privateer.
+Telegram bookkeeping (which chat message carries which mail) and a durable
+pending-inbound spool; the fleet's record stays in Privateer.
 
 ## Set up
 
@@ -57,6 +57,19 @@ Telegram delivers each update to only one poller.
 `~/.local/state/privateer/doors/telegram/` (`door.log` from the supervisor and
 the adapter's stderr, `state/telegram.log` from the adapter).
 
+Fetched updates and their poll offset commit together in `state/inbound.sqlite3`
+before Telegram can confirm them. Restarts replay pending updates with stable
+mail IDs, so a lost response cannot create a second mail. The spool holds at
+most 1,000 pending updates and stops advancing the poll offset when full.
+Handler failures get three attempts, spaced 15 seconds apart, then a recorded
+terminal outcome and a notice when authorized. Refusal/error notices are also
+persisted and attempted at most three times across restarts; exhaustion is
+logged, not presented as successful delivery. Telegram does not deduplicate
+`sendMessage`, so a crash after it accepts a notice can show that notice twice.
+The last 5,000 terminal receipts keep only update ID, type, text/caption length,
+and outcome code; per-update logs contain no message text, filenames or paths.
+The intentional first-start setup-backlog skip is retained and recorded.
+
 ## Using it
 
 - **A plain message** goes to the liaison as a request, so its answer comes back
@@ -74,7 +87,8 @@ the adapter's stderr, `state/telegram.log` from the adapter).
   approval ended (expired, revoked, or its task closed) is reported, not
   silently ignored; an approval whose approved command already ran is never
   pretended undone. An edit that still approves changes nothing, and edits of
-  anything but a typed answer to an ask are ignored.
+  anything but a typed answer to an ask are not forwarded: the door visibly
+  asks you to send the changed text or caption as a new message.
 - **Decisions** whose payload lists `options` show buttons; tapping one answers.
 - **Privileged commands** a ship staged show the exact command, one argument
   per line, with **Approve** and **Deny**. Approve grants it, but nothing runs

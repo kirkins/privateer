@@ -24,6 +24,7 @@ Telegram is the trust boundary: only the configured chat, and when set only
 allowed_user_ids within it, is heard. Everything else is logged and dropped.
 """
 
+import hashlib
 import json
 import os
 import queue
@@ -34,6 +35,7 @@ import time
 
 sys.dont_write_bytecode = True  # a release holds only its own files
 import tg
+import inbound
 
 POLL_SECONDS = 50
 TEXT_LIMIT = 3500           # Telegram caps a message at 4096; leave room for the header
@@ -110,7 +112,7 @@ class Runtime:
             try:
                 message = json.loads(line)
             except ValueError:
-                tg.log(f"runtime sent invalid JSON: {line[:200]!r}")
+                tg.log("runtime outcome=invalid_json")
                 continue
             if message.get("type") == "response":
                 waiter = self.waiters.pop(str(message.get("id")), None)
@@ -179,6 +181,70 @@ class Door:
         # update that says so; and who sent the update being handled.
         self.group = False
         self.sender = None
+        self.spool = inbound.Spool()
+        self.update_id = None
+        self.notice_slot = 0
+        self.outcome = "terminal_ignored"
+
+    def process_inbound(self) -> None:
+        """Own one durable update until handling or bounded terminal refusal."""
+        row = self.spool.ready()
+        if row is None or row["next_at"] > time.time():
+            return
+        update = json.loads(row["data"])
+        self.update_id = row["id"]
+        self.notice_slot = 0
+        self.outcome = "terminal_ignored"
+        try:
+            if row["initial_skip"]:
+                self.outcome = "terminal_initial_backlog"
+            elif row["attempts"] >= inbound.ATTEMPTS:
+                self.outcome = "terminal_handler_error"
+                msg = update.get("message") or update.get("edited_message") or {}
+                if self.authorized((msg.get("chat") or {}).get("id"),
+                                   (msg.get("from") or {}).get("id")):
+                    self.say("⚠️ Could not complete this update. It was not confirmed sent; "
+                             "please check with the ship before sending it again.",
+                             reply_to=msg.get("message_id"))
+            else:
+                self.spool.begin(self.update_id)
+                if row["submission"]:
+                    # The exact recipient/body/files were frozen before send.
+                    self.send(*json.loads(row["submission"]))
+                else:
+                    self.on_update(update)
+            self.spool.finish(self.update_id, self.outcome)
+        except BrokenPipeError:
+            raise
+        except Exception:
+            kind, length = inbound.metadata(update)
+            tg.log(f"inbound update_id={self.update_id} type={kind} length={length} outcome=handler_retry")
+        finally:
+            self.update_id = None
+
+    def retry_notices(self) -> None:
+        for row in self.spool.notices_ready():
+            self.deliver_notice(row)
+        self.spool.collect()
+
+    def deliver_notice(self, row):
+        if row["done"]:
+            return row["message_id"], ""
+        if row["attempts"] >= inbound.ATTEMPTS:
+            self.spool.notice_result(row, None, "attempts exhausted")
+            return None, "notice attempts exhausted"
+        self.spool.notice_attempt(row)
+        params = json.loads(row["params"])
+        try:
+            result, err = tg.api(self.cfg, "sendMessage", params)
+            if err and params.get("parse_mode") == "HTML" and "parse" in err:
+                params.pop("parse_mode")
+                params["text"] = _plain(params["text"])
+                result, err = tg.api(self.cfg, "sendMessage", params)
+        except Exception:
+            result, err = None, "send exception"
+        self.spool.notice_result(row, (result or {}).get("message_id"), err)
+        return (result or {}).get("message_id"), err
 
     # --- sending to Telegram ---------------------------------------------
 
@@ -195,12 +261,19 @@ class Door:
             params["reply_markup"] = json.dumps(markup)
         if quiet:
             params["disable_notification"] = "true"
+        if self.update_id is not None:
+            slot = self.notice_slot
+            self.notice_slot += 1
+            row = self.spool.notice(self.update_id, slot, params)
+            return self.deliver_notice(row)
         result, err = tg.api(self.cfg, "sendMessage", params)
         if err and html and "parse" in err:
             # Telegram refused the rendered HTML: send the text plainly.
             params.pop("parse_mode")
             params["text"] = text if not html else _plain(text)
             result, err = tg.api(self.cfg, "sendMessage", params)
+        if err:
+            tg.log("telegram outcome=send_failed")
         return (result or {}).get("message_id"), err
 
     def recipient(self) -> str:
@@ -441,9 +514,20 @@ class Door:
         """Mail from the captain, with what the chat sees about it."""
         if self.cfg.get("send_kind") in ("request", "notice") and args.get("kind") is None:
             args["kind"] = self.cfg["send_kind"]
+        if self.update_id is not None:
+            args = dict(args)
+            if not args.get("to") and self.recipient():
+                args["to"] = self.recipient()
+            identity = json.dumps([self.hello.get("door"), tg.chat_id(self.cfg), self.update_id])
+            args = dict(args, id="telegram-" + hashlib.sha256(identity.encode()).hexdigest()[:32])
+            args, msg_id, label = self.spool.submission(self.update_id, args, msg_id, label)
         try:
-            result = self.runtime.call("send", args)
+            result = self.spool.result(self.update_id) if self.update_id is not None else None
+            if result is None:
+                result = self.runtime.call("send", args)
         except RuntimeError as e:
+            if "Privateer did not answer" in str(e):
+                raise  # Uncertain commit: recover with the same mail id.
             if "already answered" in str(e) and args.get("kind") == "reply":
                 # Answered elsewhere already: follow up instead of failing. A
                 # typed answer cannot go to a request, so it goes as plain words.
@@ -460,14 +544,23 @@ class Door:
                         args.pop("payload", None)
                 else:
                     args.pop("payload", None)
+                if self.update_id is not None:
+                    self.spool.replace_submission(self.update_id, args, msg_id, label)
                 try:
                     result = self.runtime.call("send", args)
                 except RuntimeError as again:
+                    if "Privateer did not answer" in str(again):
+                        raise
+                    self.outcome = "terminal_refused"
                     self.say(f"⚠️ not sent: {again}", reply_to=msg_id)
                     return
             else:
+                self.outcome = "terminal_refused"
                 self.say(f"⚠️ not sent: {e}", reply_to=msg_id)
                 return
+        if self.update_id is not None:
+            self.spool.result(self.update_id, result)
+        self.outcome = "mail_committed"
         self.welcome(result.get("returned"))
         ship = result.get("ship", "")
         mail_id = (result.get("mail") or {}).get("id")
@@ -479,7 +572,7 @@ class Door:
             tg.write_state(OUTGOING, outgoing)
             # Replying to your own message follows up with the same ship.
             tg.remember_target(msg_id, {"ship": ship, "mail": mail_id, "kind": "sent", "from": ship})
-        tg.log(f"captain -> {ship}: {label} ({args.get('kind', 'request')})")
+        tg.log("captain outcome=mail_committed")
         if not self.react(msg_id):
             self.say(f"➡️ {ship}", reply_to=msg_id, quiet=True)
 
@@ -496,6 +589,7 @@ class Door:
         if reply_to:
             target = tg.target_for_reply(reply_to)
             if not target:
+                self.outcome = "terminal_unknown_reply"
                 self.say("⚠️ I don't know which message that answers (it may be older than I "
                          "remember). Send it without replying, or use /to SHIP.", reply_to=msg_id)
                 return None
@@ -521,7 +615,8 @@ class Door:
         chat = (msg.get("chat") or {}).get("id")
         user = (msg.get("from") or {}).get("id")
         if not self.authorized(chat, user):
-            tg.log(f"ignoring a message from chat={chat} user={user}")
+            self.outcome = "terminal_unauthorized"
+            tg.log("telegram outcome=unauthorized_message")
             return
         kind = (msg.get("chat") or {}).get("type")
         if isinstance(kind, str) and kind != "private":
@@ -538,6 +633,7 @@ class Door:
         if attachment(msg)[0]:
             return self.handle_attachment(msg, msg_id, reply_to)
         if not text:
+            self.outcome = "terminal_unsupported"
             return
         args = self.route(text, msg_id, reply_to)
         if args:
@@ -547,19 +643,21 @@ class Door:
         """The captain edited a message they had sent. Only a typed answer to an
         ask can have approved anything, so only that is re-checked: the words
         the phone now shows are judged again, and a yes turned anywhere else
-        withdraws the approval it recorded. Every other edit is ignored."""
+        withdraws the approval it recorded. Other edits get a visible notice."""
         chat = (msg.get("chat") or {}).get("id")
         user = (msg.get("from") or {}).get("id")
         if not self.authorized(chat, user):
-            tg.log(f"ignoring an edit from chat={chat} user={user}")
+            self.outcome = "terminal_unauthorized"
+            tg.log("telegram outcome=unauthorized_edit")
             return
         msg_id = msg.get("message_id")
         reply_to = (msg.get("reply_to_message") or {}).get("message_id")
-        if not msg_id or not reply_to:
+        target = tg.target_for_reply(reply_to) if reply_to else {}
+        if not msg_id or target.get("kind") not in ("request", "decision"):
+            self.outcome = "terminal_edit_not_forwarded"
+            self.say("✏️ This edit was not sent to the ship. Please send it as a new message.",
+                     reply_to=msg_id)
             return
-        target = tg.target_for_reply(reply_to)
-        if target.get("kind") not in ("request", "decision"):
-            return  # not an answer to an ask: the edit changes nothing
         # A stored file's caption is its reply body. Re-check its formatting
         # just like text; missing words (including a voice transcript we no
         # longer have) fail closed instead of leaving an old yes standing.
@@ -581,6 +679,7 @@ class Door:
         except RuntimeError as e:
             self.say(f"⚠️ could not re-check your edited answer: {e}", reply_to=msg_id)
             return
+        self.outcome = "edit_rechecked"
         self.report_edit(result, msg_id)
 
     def report_edit(self, result: dict, msg_id) -> None:
@@ -611,7 +710,7 @@ class Door:
                      "This door has not withdrawn it.", reply_to=msg_id)
         else:
             # Still a plain yes, or an edit that approved nothing: nothing changed.
-            tg.log(f"edit re-checked: {json.dumps(result)}")
+            tg.log("telegram outcome=edit_rechecked")
 
     def authorized(self, chat, user) -> bool:
         if not tg.chat_id(self.cfg) or str(chat) != tg.chat_id(self.cfg):
@@ -1003,7 +1102,7 @@ class Door:
         dest = os.path.join(tg.inbox_dir(), f"{time.strftime('%Y%m%d-%H%M%S')}-{msg_id}-{saved}")
         err = tg.download(self.cfg, remote, dest)
         if err:
-            tg.log(f"download failed: {err}")
+            tg.log("telegram outcome=download_failed")
             self.say(f"⚠️ download failed: {err}", reply_to=msg_id)
             return ""
         return dest
@@ -1046,7 +1145,7 @@ class Door:
                 if "unknown door command" not in str(e):
                     self.say(f"⚠️ couldn't hand {saved} to {ship}: {e}; kept at {dest}",
                              reply_to=msg_id)
-                tg.log(f"file.put failed for {saved}: {e}; keeping {dest} in the inbox")
+                tg.log("telegram outcome=file_put_failed")
         if stored and stored.get("file_id"):
             # The runtime fills the path when the mail lands, and the mail must
             # go to the ship that owns the file, not a default chosen later.
@@ -1059,8 +1158,8 @@ class Door:
             args["body"] = caption or f"The captain sent a file: {saved}"
             try:
                 os.unlink(dest)
-            except OSError as e:
-                tg.log(f"could not remove the inbox copy {dest}: {e}")
+            except OSError:
+                tg.log("telegram outcome=inbox_cleanup_failed")
         else:
             # No file.put (an older runtime, an unknown command or a refusal):
             # the ship on this machine can still be told where the file is.
@@ -1087,7 +1186,7 @@ class Door:
             return
         transcript, err = stt.transcribe(self.cfg, dest)
         if err:
-            tg.log(f"stt failed for message {msg_id} ({stt.duration_note(voice)}): {err}")
+            tg.log("telegram outcome=transcription_failed")
             self.say(f"🎙️ transcription failed — {stt.error_class(err)}. The audio is kept at {dest}",
                      reply_to=msg_id)
             return
@@ -1258,35 +1357,43 @@ def _plain(html: str) -> str:
 
 
 def poll_telegram(cfg: dict, events: queue.Queue, stop: threading.Event) -> None:
-    """Long-poll getUpdates and hand each update to the main loop. The offset is
-    saved before handling, so a poisonous update is never replayed forever."""
-    offset = tg.read_state(OFFSET, {}).get("offset")
+    """Commit fetched updates and the offset together before confirming either.
+
+    The main loop drains the spool, not this thread's volatile event queue.
+    Preserve the intentional first-run backlog skip, recording that outcome
+    for fetched setup chatter rather than forwarding it as fresh captain mail.
+    """
+    spool = inbound.Spool()
     failures = 0
     while not stop.is_set():
-        if offset is None:
-            # First run: skip what is already queued (setup chatter, old bots).
-            updates, err = tg.api(cfg, "getUpdates", {"offset": -1, "timeout": 0}, retries=2)
-            if err:
-                tg.log(f"could not read the backlog ({err}); retrying")
-                stop.wait(5)
+        try:
+            offset = spool.offset()
+            if offset is None:
+                updates, err = tg.api(cfg, "getUpdates", {"offset": -1, "timeout": 0}, retries=2)
+                if err:
+                    raise RuntimeError("initial poll failed")
+                if spool.admit(updates or [], initial_skip=True):
+                    tg.write_state(OFFSET, {"offset": spool.offset()})
+                else:
+                    stop.wait(RETRY_SECONDS)
                 continue
-            offset = (updates[-1]["update_id"] + 1) if updates else 0
             tg.write_state(OFFSET, {"offset": offset})
-            continue
-        updates, err = tg.api(cfg, "getUpdates", {
-            "offset": offset, "timeout": POLL_SECONDS,
-            "allowed_updates": '["message","edited_message","callback_query"]'},
-            timeout=POLL_SECONDS + 15, retries=1)
-        if err:
+            updates, err = tg.api(cfg, "getUpdates", {
+                "offset": offset, "timeout": POLL_SECONDS,
+                "allowed_updates": '["message","edited_message","callback_query"]'},
+                timeout=POLL_SECONDS + 15, retries=1)
+            if err:
+                raise RuntimeError("poll failed")
+            if not spool.admit(updates or []):
+                tg.log("telegram outcome=spool_full")
+                stop.wait(RETRY_SECONDS)
+                continue
+            tg.write_state(OFFSET, {"offset": spool.offset()})
+            failures = 0
+        except Exception:
             failures += 1
-            tg.log(f"getUpdates failed ({err}); backing off")
+            tg.log("telegram outcome=poll_retry")
             stop.wait(min(60, 5 * failures))
-            continue
-        failures = 0
-        for update in updates or []:
-            offset = update.get("update_id", 0) + 1
-            tg.write_state(OFFSET, {"offset": offset})
-            events.put(("telegram", update))
 
 
 def main() -> int:
@@ -1343,12 +1450,12 @@ def main() -> int:
                 door.on_mail(item)
             elif source == "runtime":
                 tg.log(f"ignoring runtime message {item.get('type')!r}")
-            elif source == "telegram":
-                door.on_update(item)
+            door.process_inbound()
+            door.retry_notices()
         except BrokenPipeError:
             break
-        except Exception as e:
-            tg.log(f"handler error: {e!r}")
+        except Exception:
+            tg.log("telegram outcome=handler_error")
         if door.pending and time.monotonic() >= door.retry_at:
             door.flush()
         if time.monotonic() >= next_sweep:
