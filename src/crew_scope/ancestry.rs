@@ -224,7 +224,10 @@ pub(crate) fn procargs(buffer: &[u8]) -> Option<Vec<String>> {
 /// is the NUL-terminated `NAME=value` strings after the arguments, up to the
 /// first empty one. A string without `=` there is not environment and ends
 /// the list.
-pub(crate) fn procargs_env(buffer: &[u8]) -> Option<(Vec<String>, Vec<(Vec<u8>, Vec<u8>)>)> {
+/// `(NAME, value)` pairs, as raw bytes.
+pub(crate) type Environment = Vec<(Vec<u8>, Vec<u8>)>;
+
+pub(crate) fn procargs_env(buffer: &[u8]) -> Option<(Vec<String>, Environment)> {
     let argv = procargs(buffer)?;
     let argc = usize::try_from(i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?)).ok()?;
     let rest = &buffer[4..];

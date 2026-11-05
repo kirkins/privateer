@@ -1629,6 +1629,9 @@ fn a_sandboxed_first_mate_starts_a_review_errand_that_runs_and_reports() {
         ("errand.start", "done"),
         "the dispatcher carried it out"
     );
+    // Settled while the dispatcher still runs: stopping it ends every
+    // process of this fixture, the errand's supervisor included.
+    f.settled(started["errand"].as_str().unwrap());
     dispatcher.stop();
     let row = f.finish(&started);
     assert_eq!(row["kind"], "errand", "{row}");
