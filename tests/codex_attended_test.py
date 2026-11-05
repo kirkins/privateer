@@ -24,6 +24,10 @@ from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+# Hook, dispatcher and runner processes are real interpreter starts; a loaded
+# shared runner can exceed 5 s before the child returns. These are liveness
+# bounds, not latency assertions.
+SUBPROCESS_TIMEOUT = 30
 sys.path.insert(0, str(ROOT / "plugins/attended-codex"))
 import codex_binding as binding
 import codex_socket
@@ -291,14 +295,14 @@ class BindingTests(unittest.TestCase):
         self.record["handler"] = str(handler)
         binding.atomic(self.registry, self.record)
         result = subprocess.run(shlex.split(self.record["hook_command"]),
-                                input=json.dumps(self.event), text=True, capture_output=True, timeout=5)
+                                input=json.dumps(self.event), text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
         self.assertEqual(result.returncode, 0, result.stderr)
         value = json.loads(result.stdout)
         self.assertEqual(value["callback"], self.event)
         self.assertEqual(value["argv"], ["--registry", str(self.registry)])
         self.registry.chmod(0o644)
         result = subprocess.run(shlex.split(self.record["hook_command"]),
-                                input="{}", text=True, capture_output=True, timeout=5)
+                                input="{}", text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("callback", result.stdout)
 
@@ -320,7 +324,7 @@ class BindingTests(unittest.TestCase):
         env = {**os.environ, "PYTHONPATH": str(poison), "PYTHONHOME": str(poison)}
         self.assertEqual(shlex.split(self.record["hook_command"])[1:3], ["-I", "-B"])
         result = subprocess.run(shlex.split(self.record["hook_command"]), env=env,
-                                input="{}", text=True, capture_output=True, timeout=5)
+                                input="{}", text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
         self.assertEqual(result.returncode, 0, result.stderr)
         value = json.loads(result.stdout)
         self.assertEqual(value["isolated"], 1)
@@ -355,7 +359,7 @@ class BindingTests(unittest.TestCase):
                 binding.atomic(self.registry, {**self.record, "state": "bound", "delivery_enabled": True,
                     "binding": {"session": self.session}, "handler": str(target)})
                 result = subprocess.run(shlex.split(self.record["hook_command"]),
-                                        input="{}", text=True, capture_output=True, timeout=5)
+                                        input="{}", text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn("unsafe handler was run", result.stderr)
                 saved = codex_socket.load(self.registry)
@@ -366,7 +370,7 @@ class BindingTests(unittest.TestCase):
                 # A second dispatcher invocation must not erase continuity even
                 # though its predecessor already removed the active binding.
                 result = subprocess.run(shlex.split(self.record["hook_command"]),
-                                        input="{}", text=True, capture_output=True, timeout=5)
+                                        input="{}", text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(codex_socket.load(self.registry)["last_binding"], saved["last_binding"])
                 if kind == "directory":
@@ -391,7 +395,7 @@ class BindingTests(unittest.TestCase):
         env = {**os.environ, **self.env, "PRIVATEER_CODEX_ATTENDED": "1"}
         result = subprocess.run([sys.executable, "-B", str(ROOT / "plugins/native_launch.py"),
             "--attended-policy", '{"mode":"standard"}', "codex", "codex", "resume", self.session],
-            env=env, text=True, capture_output=True, timeout=5)
+            env=env, text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
         self.assertEqual(result.returncode, 2)
         self.assertIn("Codex attended launch refused: legacy codex_binding.py hook", result.stderr)
         self.assertEqual(hooks.read_bytes(), before)
@@ -411,7 +415,7 @@ class BindingTests(unittest.TestCase):
         env = {**os.environ, **self.env, "PRIVATEER_CODEX_ATTENDED": "1"}
         result = subprocess.run([sys.executable, "-B", str(ROOT / "plugins/native_launch.py"),
             "--attended-policy", '{"mode":"standard"}', "codex", "codex", "resume", self.session],
-            env=env, text=True, capture_output=True, timeout=5)
+            env=env, text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
         self.assertEqual(result.returncode, 2)
         self.assertIn("Codex attended launch refused: invalid Codex project hook", result.stderr)
 
@@ -539,7 +543,7 @@ class BindingTests(unittest.TestCase):
                 with binding.locked(self.registry.parent):
                     if native_dispatcher:
                         result = subprocess.run(shlex.split(bound["hook_command"]), input=json.dumps(event),
-                                                text=True, capture_output=True, timeout=5)
+                                                text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
                         self.assertNotEqual(result.returncode, 0)
                         self.assertIn("state lock timed out", result.stderr)
                     else:
@@ -587,7 +591,7 @@ class BindingTests(unittest.TestCase):
         original = self.registry.read_bytes()
         with binding.locked(self.registry.parent):
             result = subprocess.run(shlex.split(bound["hook_command"]), input="{}",
-                                    text=True, capture_output=True, timeout=5)
+                                    text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("state lock timed out", result.stderr)
             self.assertEqual(self.registry.read_bytes(), original)
@@ -599,7 +603,7 @@ class BindingTests(unittest.TestCase):
         def control(record, command, args):
             if command == "ship.presence":
                 entered.set()
-                if not release.wait(5):
+                if not release.wait(SUBPROCESS_TIMEOUT):
                     raise TimeoutError("test did not release callback")
                 return {"attended": True, "lease": {"holder": record["holder"]}}
             return {"recorded": True}
@@ -647,7 +651,7 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
 """
                 result = subprocess.run(["/usr/bin/python3", "-I", "-B", "-c", harness,
                     str(self.registry.with_name("hook.py")), stage],
-                    input="{}", text=True, capture_output=True, timeout=5)
+                    input="{}", text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
                 self.assertEqual(result.returncode, 73, result.stderr)
                 self.assertEqual(self.registry.read_bytes(), original)
                 with self.assertRaises((ValueError, FileNotFoundError)):
@@ -676,7 +680,7 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
 """
                 result = subprocess.run(["/usr/bin/python3", "-I", "-B", "-c", harness,
                     str(self.registry.with_name("hook.py")), stage],
-                    input="{}", text=True, capture_output=True, timeout=5)
+                    input="{}", text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("fixture", result.stderr)
                 with self.assertRaises(FileNotFoundError):
@@ -689,7 +693,7 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
         original = self.registry.read_bytes()
         path.chmod(0o644)
         result = subprocess.run(shlex.split(bound["hook_command"]), input="{}",
-                                text=True, capture_output=True, timeout=5)
+                                text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unsafe Codex invalidation request", result.stderr)
         self.assertEqual(self.registry.read_bytes(), original)
@@ -793,7 +797,7 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
 """
                 result = subprocess.run(["/usr/bin/python3", "-I", "-B", "-c", harness,
                     str(self.registry.with_name("hook.py")), stage],
-                    input="{}", text=True, capture_output=True, timeout=5)
+                    input="{}", text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("missing/codex_binding.py", result.stderr)
                 self.assertNotEqual(binding.request_token(self.registry), bound["binding"]["invalidation_token"])
@@ -836,7 +840,7 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
         env = {**os.environ, **self.env, "PRIVATEER_CODEX_ATTENDED": "1"}
         result = subprocess.run([sys.executable, "-B", str(ROOT / "plugins/native_launch.py"),
             "--attended-policy", '{"mode":"standard"}', "codex", "codex", "--no-daemon"],
-            env=env, text=True, capture_output=True, timeout=5)
+            env=env, text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
         self.assertEqual(result.returncode, 2)
         self.assertIn("Codex attended launch refused:", result.stderr)
         self.assertIn("requires the shared daemon", result.stderr)
@@ -973,7 +977,7 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
                 def control(record, command, args):
                     if command == "ship.presence":
                         entered.set()
-                        if not release.wait(5):
+                        if not release.wait(SUBPROCESS_TIMEOUT):
                             raise TimeoutError("test did not release report")
                         return {"attended": True, "lease": {"holder": record["holder"]}}
                     return {"recorded": True}
@@ -990,7 +994,7 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
                             record["handler"] = str(self.root / "missing/codex_binding.py")
                             binding.atomic(self.registry, record)
                             result = subprocess.run(shlex.split(self.record["hook_command"]),
-                                input="{}", text=True, capture_output=True, timeout=5)
+                                input="{}", text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
                             self.assertNotEqual(result.returncode, 0)
                         invalidated = codex_socket.load(self.registry)
                     finally:
@@ -1051,7 +1055,7 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
                 self.assertEqual(saved["last_binding"], good)
                 if threading.get_ident() == first_thread[0]:
                     entered.set()
-                    if not release.wait(5):
+                    if not release.wait(SUBPROCESS_TIMEOUT):
                         raise TimeoutError("test did not release earlier callback")
                 return {"attended": True, "lease": {"holder": record["holder"]}}
             return {"recorded": True}
