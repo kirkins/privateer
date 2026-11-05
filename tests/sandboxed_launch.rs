@@ -614,6 +614,12 @@ fn remove_mise_and_codex_environment(command: &mut Command) {
             command.env_remove(name.as_ref());
         }
     }
+    if let Some((_, Some(path))) = command.get_envs().find(|(name, _)| *name == "PATH") {
+        let entries: Vec<_> = std::env::split_paths(path)
+            .filter(|entry| !entry.to_string_lossy().contains("/.codex/tmp/arg0-"))
+            .collect();
+        command.env("PATH", std::env::join_paths(entries).unwrap());
+    }
 }
 
 #[test]
