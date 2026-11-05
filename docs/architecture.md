@@ -303,6 +303,20 @@ and verify host keys beforehand. Privateer always passes
 configuration cannot turn strict host-key checking off. Neither writable
 `~/.ssh` nor disabled OpenSSH ownership checks is required.
 
+**Keep the file out of every agent-writable folder.** An SSH config is
+executable configuration: `ProxyCommand`, `LocalCommand`, `Match exec` and
+`KnownHostsCommand` run commands. A host-side call that uses the file runs
+those commands outside any sandbox, and the same-uid ownership check cannot
+tell whether a sandboxed agent can write it. Put the file and every parent
+directory outside workspaces, ship folders, project checkouts, `/tmp`,
+`/var/tmp` and any other folder a first mate or crew can write. Otherwise a
+workspace-write agent could gain unsandboxed execution through it.
+
+Strict host-key checking now applies to **every** SSH link, including links
+without `ssh_config`. It overrides a user setting such as
+`StrictHostKeyChecking accept-new`, so a link whose host key was never recorded
+in known_hosts now fails until the key is provisioned and verified.
+
 Native Codex's Linux user-namespace sandbox can show host-root-owned files as
 an unmapped uid (often 65534). OpenSSH checks ownership of every `Include` and
 of the default user config, so otherwise-correct host permissions can produce
