@@ -7707,6 +7707,7 @@ fn the_gateway_reports_its_machines_readiness_to_the_operator_only() {
     // Rows its dispatcher stored a moment ago: codex missing, the rest found.
     {
         let conn = rusqlite::Connection::open(&database).unwrap();
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut rows = vec![
             ("git", true, None),
             ("python3", true, None),
