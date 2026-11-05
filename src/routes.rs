@@ -73,11 +73,12 @@
 //! releases as the window's reset approaches: by default it shrinks in
 //! proportion to the time left, reaching zero at the reset, so the end of an
 //! allowance is used rather than lost. A route may set `reserve_release` to
-//! `"fixed"` to keep the configured share until the reset. The crew share
-//! always stops `first_mate_margin_pct` (3 by default) below the first mate's
-//! own released limit on the same window, so a crew can never spend into the
-//! last of the plan and lock its first mate out until the reset. Running work is
-//! never stopped: what is already in flight is what spends the plan.
+//! `"fixed"` to keep the configured share until the reset. The crew share, and
+//! the first-mate share errands run on, always stop `first_mate_margin_pct` (3
+//! by default) below the first mate's own released limit on the same window, so
+//! a crew or errand can never spend into the last of the plan and lock its first
+//! mate out until the reset. Running work is never stopped: what is already in
+//! flight is what spends the plan.
 use crate::crew_routes::{Allowance, Limits, Release, Shape};
 use crate::store::Store;
 use anyhow::Result;
@@ -1029,9 +1030,9 @@ pub(crate) enum ReserveReason {
     BeyondWindow,
     /// The reset is now or already past, so the configured share stands.
     ResetNotAhead,
-    /// The crew share released far enough to reach into the margin kept below
-    /// the first mate's limit, so that margin holds it back (the percentage
-    /// points of the window kept).
+    /// A crew or errand share released far enough to reach into the margin kept
+    /// below the first mate's limit, so that margin holds it back (the
+    /// percentage points of the window kept).
     FirstMateMargin(u8),
 }
 
@@ -1094,6 +1095,30 @@ pub(crate) fn reserve(
 /// configured, or a route that keeps no first-mate share, nothing is kept back.
 pub(crate) fn crew_reserve(limits: &Limits, reading: &Spent, now: i64) -> (f64, ReserveReason) {
     let (kept, reason) = reserve(limits, 1.0 - limits.crew, reading, now);
+    margin_below_first_mate(limits, reading, now, kept, reason)
+}
+
+/// The kept share at `now` for an errand, and why: errands do a first mate's
+/// thinking on the first mate's share, but they must stop `first_mate_margin`
+/// below the first mate's own released limit, so an errand cannot spend the
+/// account down and lock the first mate out for the rest of the window. The
+/// base curve is the first mate's, so the margin is what always binds; with no
+/// margin configured, or a route that keeps no first-mate share, the first
+/// mate's released share stands.
+pub(crate) fn errand_reserve(limits: &Limits, reading: &Spent, now: i64) -> (f64, ReserveReason) {
+    let (kept, reason) = reserve(limits, 1.0 - limits.first_mate, reading, now);
+    margin_below_first_mate(limits, reading, now, kept, reason)
+}
+
+/// `kept`, raised so it keeps a margin below the first mate's own released
+/// share unless no margin is configured or the route keeps no first-mate share.
+fn margin_below_first_mate(
+    limits: &Limits,
+    reading: &Spent,
+    now: i64,
+    kept: f64,
+    reason: ReserveReason,
+) -> (f64, ReserveReason) {
     if limits.first_mate_margin <= 0.0 || limits.first_mate >= 1.0 {
         return (kept, reason);
     }
@@ -1143,7 +1168,8 @@ pub(crate) fn binding(
         .map(|reading| {
             let (kept, reason) = match who {
                 Who::Crew => crew_reserve(limits, &reading, now),
-                Who::FirstMate | Who::Errand => reserve(limits, configured, &reading, now),
+                Who::Errand => errand_reserve(limits, &reading, now),
+                Who::FirstMate => reserve(limits, configured, &reading, now),
             };
             let over = reading.share - (1.0 - kept);
             Binding {
@@ -2881,6 +2907,98 @@ mod allowance_tests {
         assert_eq!(
             crew_reserve(&limits, &reading, now),
             reserve(&limits, 1.0 - limits.crew, &reading, now)
+        );
+    }
+
+    /// Errands are judged on the first mate's share, so their margin always
+    /// binds: near a five-hour or a weekly reset an errand stops three points
+    /// below the first mate's released limit while the first mate's own wake
+    /// may still take the route.
+    #[test]
+    fn errands_stop_a_margin_below_the_first_mates_limit_near_every_reset() {
+        let now = Store::now_ms();
+        let limits = Limits::default();
+        let limits_at = |reset: i64, window: i64| {
+            let reading = Spent {
+                share: 0.9,
+                what: "window".into(),
+                reset_ms: Some(reset),
+                window_ms: Some(window),
+            };
+            let (kept, reason) = errand_reserve(&limits, &reading, now);
+            let (mate, _) = reserve(&limits, 1.0 - limits.first_mate, &reading, now);
+            ((1.0 - kept) * 100.0, (1.0 - mate) * 100.0, reason)
+        };
+        for window in [5 * HOUR, 7 * 24 * HOUR] {
+            let (errand, mate, reason) = limits_at(now + 60_000, window);
+            assert!((errand - (mate - 3.0)).abs() < 0.01, "{errand} vs {mate}");
+            assert!(mate > 99.9, "{errand} vs {mate}");
+            assert_eq!(reason, ReserveReason::FirstMateMargin(3));
+        }
+    }
+
+    /// An errand mid-window still stops at the first mate's configured share
+    /// less the margin: with the default 95 and 3 that is 92%, not 95%.
+    #[test]
+    fn errands_keep_the_margin_mid_window_too() {
+        let now = Store::now_ms();
+        let reading = Spent {
+            share: 0.9,
+            what: "window".into(),
+            reset_ms: Some(now + 5 * HOUR / 2),
+            window_ms: Some(5 * HOUR),
+        };
+        let (kept, reason) = errand_reserve(&Limits::default(), &reading, now);
+        assert!((kept - 0.08).abs() < 1e-9, "{kept}");
+        assert_eq!(reason, ReserveReason::FirstMateMargin(3));
+    }
+
+    /// A margin of zero restores the errand release as it was before the
+    /// margin existed, at every point of the window.
+    #[test]
+    fn a_zero_margin_keeps_the_errand_release_as_it_was() {
+        let now = Store::now_ms();
+        let window = 5 * HOUR;
+        let limits = Limits {
+            first_mate_margin: 0.0,
+            ..Limits::default()
+        };
+        for left in [0, 1, window / 4, window / 2, window - 1, window] {
+            let reading = Spent {
+                share: 0.9,
+                what: "window".into(),
+                reset_ms: Some(now + left),
+                window_ms: Some(window),
+            };
+            assert_eq!(
+                errand_reserve(&limits, &reading, now),
+                reserve(&limits, 1.0 - limits.first_mate, &reading, now)
+            );
+            assert!(!matches!(
+                errand_reserve(&limits, &reading, now).1,
+                ReserveReason::FirstMateMargin(_)
+            ));
+        }
+    }
+
+    /// A route that keeps no first-mate share has nothing to protect, so the
+    /// margin does not apply to its errands either.
+    #[test]
+    fn a_route_with_no_first_mate_share_keeps_no_errand_margin() {
+        let now = Store::now_ms();
+        let reading = Spent {
+            share: 0.9,
+            what: "window".into(),
+            reset_ms: Some(now + 60_000),
+            window_ms: Some(5 * HOUR),
+        };
+        let limits = Limits {
+            first_mate: 1.0,
+            ..Limits::default()
+        };
+        assert_eq!(
+            errand_reserve(&limits, &reading, now),
+            reserve(&limits, 1.0 - limits.first_mate, &reading, now)
         );
     }
 

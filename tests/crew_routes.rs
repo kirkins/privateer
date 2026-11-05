@@ -1458,6 +1458,18 @@ fn crews_stop_below_the_first_mates_limit_near_the_reset() {
         refused.contains("kept 3% below the first mate's limit"),
         "{refused}"
     );
+    // An errand, which runs on the first mate's share through the first_mate
+    // list, keeps the same margin: it is refused below the first mate's limit.
+    let refused = f.refused(
+        Some("engineering"),
+        "errand.start",
+        json!({"focus":"task:fix","brief":"Review the fix."}),
+    );
+    assert!(
+        refused.contains("kept 3% below the first mate's limit"),
+        "{refused}"
+    );
+    assert!(refused.contains("nothing is queued"), "{refused}");
     // The first mate's own wake is admitted on the same route, same reading.
     f.in_process(|store| {
         store
