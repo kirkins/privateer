@@ -314,12 +314,47 @@ class BindingTests(unittest.TestCase):
         report.assert_not_called()
         self.assertEqual(codex_socket.load(self.registry)["state"], "unbound")
 
-    def test_wrong_daemon_or_presence_settings_callback_does_not_stop(self):
+    def test_replaced_attach_daemon_stops_verified_settings_launch(self):
         self.settings_launch()
-        for changed in ["daemon", "holder", "unattended"]:
+        self.record["attach_daemon"]["pid"] += 1
+        binding.atomic(self.registry, self.record)
+        with patch.object(binding, "Daemon", return_value=self.daemon), \
+                patch.object(binding, "control", return_value={
+                    "attended": True, "lease": {"holder": "host:alpha"}}) as report:
+            result = self.run_hook()
+        self.assertIs(result["continue"], False)
+        self.assertIn("attach daemon changed", result["stopReason"])
+        self.assertEqual([call.args[1] for call in report.call_args_list], ["ship.presence"])
+        self.assertEqual(codex_socket.load(self.registry)["state"], "unbound")
+
+    def test_superseded_settings_callback_does_not_stop_newer_turn(self):
+        self.settings_launch()
+        self.daemon.responses["thread/read"]["thread"].update(model="ship-model", reasoningEffort="high")
+        for newer in ["callback", "launch", "poison"]:
+            def report(record, command, args):
+                if command == "ship.presence":
+                    return {"attended": True, "lease": {"holder": "host:alpha"}}
+                current = codex_socket.load(self.registry)
+                if newer == "poison":
+                    binding.publish_request(self.registry)
+                elif newer == "launch":
+                    current["generation"] = str(uuid.uuid4())
+                else:
+                    current["callback_generation"] = str(uuid.uuid4())
+                binding.atomic(self.registry, current)
+                return {"recorded": True}
+            with self.subTest(newer=newer), patch.object(binding, "Daemon", return_value=self.daemon), \
+                    patch.object(binding, "control", side_effect=report):
+                result = self.run_hook()
+            self.assertIn("superseded", result["systemMessage"])
+            self.assertNotIn("continue", result)
+            self.assertNotIn("stopReason", result)
+            self.assertEqual(codex_socket.load(self.registry)["state"], "unbound")
+
+    def test_wrong_presence_settings_callback_does_not_stop(self):
+        self.settings_launch()
+        for changed in ["holder", "unattended"]:
             self.record["attach_daemon"] = binding.daemon_proof(self.daemon)
-            if changed == "daemon":
-                self.record["attach_daemon"]["pid"] += 1
             binding.atomic(self.registry, self.record)
             presence = {"attended": changed != "unattended", "lease": {
                 "holder": "other-holder" if changed == "holder" else "host:alpha"}}

@@ -598,7 +598,11 @@ def control(record, command, args):
             child.wait()
 
 
-def validate_launch(record, event, daemon):
+class Superseded(ValueError):
+    """A newer callback/launch owns the result; do not stop its native turn."""
+
+
+def validate_launch(record, event):
     """Prove callback custody before settings failures can stop a TUI turn."""
     if not live(record) or Path(f"/proc/{record['pid']}/exe").resolve() != Path(record["executable"]):
         raise ValueError("Codex launch identity is stale")
@@ -617,13 +621,13 @@ def validate_launch(record, event, daemon):
         raise ValueError("Codex resume UUID does not match launch")
     if event["source"] == "compact" and session != record.get("binding", record.get("last_binding", {})).get("session"):
         raise ValueError("Codex compact callback has no matching binding")
-    if record.get("attach_daemon") is not None and record["attach_daemon"] != daemon_proof(daemon):
-        raise ValueError("Codex attach daemon changed; callback does not match launch")
     return session
 
 
 def validate(record, event, daemon):
-    session = validate_launch(record, event, daemon)
+    session = validate_launch(record, event)
+    if record.get("attach_daemon") is not None and record["attach_daemon"] != daemon_proof(daemon):
+        raise ValueError("Codex attach daemon changed; callback does not match launch")
     loaded = daemon.call("thread/loaded/list", {"limit": 32})
     if (not isinstance(loaded.get("data"), list) or "nextCursor" not in loaded
             or session not in loaded["data"] or loaded["nextCursor"] or len(loaded["data"]) > 32):
@@ -687,7 +691,7 @@ def bind(registry, event, context=None, on_launch_verified=None):
     if event.get("session_id") != record["session"]:
         publish_request(registry, "custody-poison.json", reason="callback_uuid_changed")
     with Daemon(record["codex_home"]) as daemon:
-        validate_launch(previous, event, daemon)
+        validate_launch(previous, event)
         presence = control(record, "ship.presence", {"ship": record["ship"]})
         if presence.get("attended") is not True or presence.get("lease", {}).get("holder") != record["holder"]:
             raise ValueError("Codex binding does not own current presence")
@@ -709,7 +713,7 @@ def bind(registry, event, context=None, on_launch_verified=None):
         current = load(registry)
         if (current.get("callback_generation") != token or current["generation"] != record["generation"]
                 or request_token(registry) != request):
-            raise ValueError("Codex binding superseded by a newer callback or launch")
+            raise Superseded("Codex binding superseded by a newer callback or launch")
         binding.update(fence_version=1, invalidation_token=request)
         current.update(binding=binding, last_binding=binding, state="bound", delivery_enabled=False)
         atomic(registry, current)
@@ -740,7 +744,7 @@ def main():
         result = {"systemMessage": "Privateer Codex binding UNBOUND (" + reason + "): inspect the launch, trusted project hook, presence and shared daemon; automatic mail remains disabled."}
         # SettingsError is defensive: bind checks live UUID/daemon/presence
         # custody before settings validation, which already arms stop_turn.
-        if stop_turn or isinstance(error, SettingsError):
+        if not isinstance(error, Superseded) and (stop_turn or isinstance(error, SettingsError)):
             result.update({"continue": False, "stopReason": reason})
         print(json.dumps(result))
 
