@@ -224,17 +224,17 @@ fn settle(store: &Store, command: &str, args: &Value) -> Result<Value> {
 /// 0.166 drops a thread's effort at `codex resume`; the pane sets it again
 /// with `-c model_reasoning_effort`, which the binding pairs with an explicit
 /// `--remote` to the verified shared daemon (a bare `-c` leaves the daemon).
-/// The value becomes a TOML string in argv, so only a short lowercase word is
-/// accepted; anything else is refused, never quoted or dropped.
+/// Only Codex's supported effort values become TOML strings in argv;
+/// anything else is refused, never quoted or dropped.
 pub(crate) fn effort(options: &Value) -> Result<Option<&str>> {
     let Some(value) = options.get("effort").filter(|v| !v.is_null()) else {
         return Ok(None);
     };
     let effort = value
         .as_str()
-        .filter(|e| (1..=32).contains(&e.len()) && e.bytes().all(|b| b.is_ascii_lowercase()))
+        .filter(|e| matches!(*e, "minimal" | "low" | "medium" | "high" | "xhigh" | "none"))
         .context(
-            "first_mate.options.effort for a hosted Codex pane must be one lowercase word (such as high)",
+            "first_mate.options.effort for a hosted Codex pane must be minimal, low, medium, high, xhigh or none",
         )?;
     Ok(Some(effort))
 }

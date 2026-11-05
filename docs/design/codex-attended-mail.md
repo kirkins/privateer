@@ -1312,20 +1312,30 @@ Evidence / mechanism comparison:
   production keeps the existing `--model` route flag. This explicit remote path
   bypasses only Codex's *implicit* daemon-selection exclusion, with no embedded
   fallback or provider/permission change.
+- Model-only implicit discovery: `codex resume --model implicit-model <UUID>`
+  (no effort, config override or explicit remote) read back `model:"implicit-model"`
+  on the same owned daemon, replacing `updated-model`. Provider remained the
+  fixture provider, idle with zero turns and zero provider requests. The fixture
+  PID record includes native legacy timestamp and boot/start identity observation
+  fields; no managed installation or package copy is created. Thus model-only
+  read-back is qualified too, and its mismatch remains a stopping error.
 - (c) `thread/start {model, config:{model_reasoning_effort:"high"}, ...}` returned
   the requested settings. Its retention under implicit resume is still not a
   contract; no speculative alternative field or private database is used.
 
-Implementation: Rust validates effort as a bounded lowercase word, passes it to
+Implementation: Rust and Python allowlist effort to `minimal`, `low`, `medium`,
+`high`, `xhigh`, `none` (with a clear control error for other values), passing it to
 reservation config and includes it in hosted exact-session launch argv. Prepare
 accepts only that effort override in addition to the existing feature/fullscreen
 allowlist. It refuses caller-supplied remote/provider/web-search overrides,
 non-hosted effort and ambiguous duplicates. For effort it discovers and verifies
-the home-derived shared endpoint **before exec**, inserts its own `--remote`, and
-records PID/boot/start/socket identity. The callback checks the same proof, then
+the home-derived shared endpoint **before exec**, inserts its own `--remote`
+immediately after `resume` (also preserving flags before the UUID), and records
+PID/boot/start/socket identity. Value flags cannot consume flag-like values. The callback checks the same proof, then
 reads the loaded exact UUID's configured model/effort before publishing a binding.
-Missing/mismatched requested settings stop the initial turn and leave UNBOUND;
-no callback/runner settings mutation is introduced. Unsupported schema/daemon
+When settings were requested, every callback failure stops the initial turn and
+leaves UNBOUND, including settings mismatch, unreachable daemon, timeout and
+unsupported schema; no callback/runner settings mutation is introduced. These
 paths remain refusals, never silent defaults. Explicit model without effort is
 also read back; unspecified settings remain native defaults.
 

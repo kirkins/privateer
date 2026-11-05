@@ -164,8 +164,7 @@ class BindingTests(unittest.TestCase):
         argv = [*self.argv, "--model", "ship-model", "-c", 'model_reasoning_effort="high"']
         with patch.object(binding, "Daemon", return_value=self.daemon):
             planned = binding.prepare(argv, self.env)
-        self.assertEqual(planned[1:3], ["resume", self.session])
-        self.assertEqual(planned[3:5], ["--remote", "unix:///alpha/socket"])
+        self.assertEqual(planned[1:5], ["resume", "--remote", "unix:///alpha/socket", self.session])
         record = codex_socket.load(self.registry)
         self.assertEqual(record["requested_settings"], {"model": "ship-model", "effort": "high"})
         self.assertEqual(record["attach_daemon"], binding.daemon_proof(self.daemon))
@@ -196,6 +195,55 @@ class BindingTests(unittest.TestCase):
             with self.assertRaisesRegex(binding.SettingsError, "daemon changed"):
                 binding.validate(changed, self.event, self.daemon)
 
+    def test_model_only_keeps_implicit_route_and_requires_exact_read_back(self):
+        self.record["process_identity"]["bootId"] = "stale"
+        binding.atomic(self.registry, self.record)
+        argv = [*self.argv, "--model", "ship-model"]
+        planned = binding.prepare(argv, self.env)
+        self.assertEqual(planned[:len(argv)], argv)
+        self.assertNotIn("--remote", planned)
+        record = codex_socket.load(self.registry)
+        self.assertIsNone(record["attach_daemon"])
+        self.assertEqual(record["requested_settings"], {"model": "ship-model"})
+        thread = self.daemon.responses["thread/read"]["thread"]
+        thread["model"] = "ship-model"
+        self.assertEqual(binding.validate(record, self.event, self.daemon)["settings"],
+                         {"model": "ship-model"})
+        for model in ["wrong-model", None]:
+            thread["model"] = model
+            with self.subTest(model=model), self.assertRaises(binding.SettingsError):
+                binding.validate(record, self.event, self.daemon)
+
+    def test_remote_insertion_preserves_flags_before_resume_uuid(self):
+        self.record["process_identity"]["bootId"] = "stale"
+        binding.atomic(self.registry, self.record)
+        argv = [sys.executable, "resume", "--model", "ship-model", self.session,
+                "-c", 'model_reasoning_effort="high"']
+        with patch.object(binding, "Daemon", return_value=self.daemon):
+            planned = binding.prepare(argv, self.env)
+        self.assertEqual(planned[:len(argv) + 2],
+                         argv[:2] + ["--remote", "unix:///alpha/socket"] + argv[2:])
+        self.assertEqual(codex_socket.load(self.registry)["requested_settings"],
+                         {"model": "ship-model", "effort": "high"})
+
+    def test_value_flags_cannot_consume_another_flag(self):
+        for flag in ["-C", "--cd", "--sandbox", "-s", "--add-dir", "--model", "-m",
+                     "--ask-for-approval", "-a", "--enable", "--disable"]:
+            for value in ["--model", "-m", ""]:
+                with self.subTest(flag=flag, value=value), \
+                        self.assertRaisesRegex(ValueError, "option value"):
+                    binding.plan([*self.argv, flag, value], self.cwd)
+
+    def test_effort_accepts_only_supported_values(self):
+        for value in ["minimal", "low", "medium", "high", "xhigh", "none"]:
+            self.assertEqual(binding.parse_plan(
+                [*self.argv, "-c", "model_reasoning_effort=" + json.dumps(value)], self.cwd)[2],
+                {"effort": value})
+        for value in ["unsupported", "auto", "High", True, None, []]:
+            self.assertFalse(binding.effort_word(value))
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                binding.plan([*self.argv, "-c", "model_reasoning_effort=" + json.dumps(value)], self.cwd)
+
     def test_unproven_effort_paths_refuse_before_prepare_modifies_state(self):
         argv = [*self.argv, "-c", 'model_reasoning_effort="high"']
         before = self.registry.read_bytes()
@@ -222,6 +270,28 @@ class BindingTests(unittest.TestCase):
         result = json.loads(output.getvalue())
         self.assertFalse(result["continue"])
         self.assertIn("settings mismatch", result["stopReason"])
+
+    def test_any_callback_failure_stops_when_settings_were_requested(self):
+        for settings in [{"model": "ship-model"}, {"effort": "high"}, {}]:
+            self.record["requested_settings"] = settings
+            binding.atomic(self.registry, self.record)
+            for error in [ValueError("unsupported schema"), TimeoutError("daemon timed out"),
+                          OSError("daemon unreachable"), KeyError("schema field")]:
+                self.record.update(state="bound", delivery_enabled=False)
+                binding.atomic(self.registry, self.record)
+                with self.subTest(settings=settings, error=error), \
+                        patch.object(binding.sys, "argv", ["hook", "--registry", str(self.registry)]), \
+                        patch.object(binding, "Daemon", side_effect=error), \
+                        patch.object(binding.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b"{}"))), \
+                        patch.object(binding.sys, "stdout", new_callable=io.StringIO) as output:
+                    binding.main()
+                result = json.loads(output.getvalue())
+                if settings:
+                    self.assertIs(result["continue"], False)
+                    self.assertTrue(result["stopReason"])
+                else:
+                    self.assertNotIn("continue", result)
+                self.assertEqual(codex_socket.load(self.registry)["state"], "unbound")
 
     def test_resume_is_exact_and_prompt_is_not_parsed_as_flags(self):
         session = str(uuid.uuid4())

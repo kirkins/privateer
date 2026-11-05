@@ -408,7 +408,7 @@ def live(record):
 
 
 def effort_word(value):
-    return isinstance(value, str) and 1 <= len(value) <= 32 and all('a' <= c <= 'z' for c in value)
+    return isinstance(value, str) and value in {"minimal", "low", "medium", "high", "xhigh", "none"}
 
 
 class SettingsError(ValueError):
@@ -453,8 +453,8 @@ def parse_plan(argv, cwd):
                 raise ValueError("Codex -c override excludes the shared daemon (including web_search)")
         elif arg in value_flags:
             i += 1
-            if i >= len(args):
-                raise ValueError("missing Codex option value")
+            if i >= len(args) or not args[i] or args[i].startswith("-"):
+                raise ValueError("missing or flag-like Codex option value")
             if arg in ("-C", "--cd") and Path(args[i]).resolve() != cwd:
                 raise ValueError("Codex binding cwd override refused")
             if arg in ("--model", "-m"):
@@ -512,7 +512,9 @@ def prepare(argv, env):
     if "effort" in settings:
         with Daemon(codex_home) as daemon:
             attach_daemon = daemon_proof(daemon)
-        planned[3:3] = ["--remote", "unix://" + attach_daemon["socket"]]
+        # parse_plan permits value flags before the UUID; insert after resume,
+        # never between a flag and its value.
+        planned[2:2] = ["--remote", "unix://" + attach_daemon["socket"]]
     check_system_python()
     project = cwd / ".codex"
     project.mkdir(mode=0o700, exist_ok=True)
@@ -706,19 +708,24 @@ def bind(registry, event, context=None):
 
 
 def main():
+    # An unreadable launch record cannot prove settings were unspecified.
+    stop_turn = True
     try:
         if len(sys.argv) != 3 or sys.argv[1] != "--registry":
             raise ValueError("invalid Codex binding hook invocation")
         data = globals().get("_DISPATCH_EVENT")
         if data is None:
             data = sys.stdin.buffer.read(LIMIT + 1)
-        bind(sys.argv[2], data, globals().get("_DISPATCH_CONTEXT"))
+        context = globals().get("_DISPATCH_CONTEXT")
+        record = context[0] if context is not None else load(Path(sys.argv[2]))
+        stop_turn = bool(record.get("requested_settings"))
+        bind(sys.argv[2], data, context)
         print("{}")
     except Exception as error:
         # Only our local validation diagnostics, never daemon/provider values.
         reason = str(error)[:200] if isinstance(error, (ValueError, TimeoutError)) else type(error).__name__
         result = {"systemMessage": "Privateer Codex binding UNBOUND (" + reason + "): inspect the launch, trusted project hook, presence and shared daemon; automatic mail remains disabled."}
-        if isinstance(error, SettingsError):
+        if stop_turn or isinstance(error, SettingsError):
             result.update({"continue": False, "stopReason": reason})
         print(json.dumps(result))
 

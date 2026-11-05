@@ -4,7 +4,8 @@
 Uses the installed executable directly (no package/cache copies), one reusable
 /var/tmp root, loopback mock only, and exact UUIDs. No credentials or model turn.
 The small daemon.pid is fixture observation metadata, not a managed-daemon
-installation; all TUI attaches therefore explicitly use the verified --remote.
+installation. It includes native PID observation fields for model-only implicit
+discovery; effort attaches explicitly use the verified --remote.
 This is not a live hosted pane, hook-trust or attended-mail qualification.
 """
 import argparse
@@ -106,7 +107,12 @@ trust_level = "trusted"
             daemon = subprocess.Popen(argv, env=env, cwd=root, stdout=log, stderr=log)
         identity = process_identity(daemon.pid)
         pidfile = home / "app-server-daemon/daemon.pid"
-        pidfile.write_text(json.dumps({"pid": daemon.pid, "processIdentity": identity}))
+        # Native implicit discovery requires the legacy field even when it
+        # verifies the stronger boot/start-tick processIdentity instead.
+        legacy_start = subprocess.check_output(
+            ["ps", "-o", "lstart=", "-p", str(daemon.pid)], env=env, text=True).strip()
+        pidfile.write_text(json.dumps({"pid": daemon.pid, "processStartTime": legacy_start,
+                                       "processIdentity": identity}))
         pidfile.chmod(0o600)
         deadline = time.monotonic() + 10
         while not rendezvous.is_symlink():
@@ -182,13 +188,22 @@ trust_level = "trusted"
         assert evidence["settings_update"]["read"]["model"] == "updated-model"
         assert evidence["settings_update"]["read"]["reasoningEffort"] == "medium"
         stop(baseline)
+        # No effort/-c/--remote: qualify the existing model-only implicit route
+        # independently, with a distinct model so stale metadata cannot pass.
+        implicit = tui("implicit_model_only", [codex, "resume", "--model", "implicit-model",
+                       session, "-C", str(folder), "--no-alt-screen"])
+        effective_model = evidence["implicit_model_only"]["read"]
+        evidence["implicit_model_only"]["model_verified"] = effective_model.get("model") == "implicit-model"
+        assert evidence["implicit_model_only"]["model_verified"], "implicit --model read-back mismatch"
+        assert effective_model["modelProvider"] == "fixture", "provider changed"
+        stop(implicit)
         # Mechanism (b), using production prepare's peer verification/insertion.
         os.chdir(folder)
         context = {**env, "PRIVATEER_HOME": env["HOME"], "PRIVATEER_CONTROL_CLI": "/fixture/privateer",
                    "PRIVATEER_ROLE": "agent", "PRIVATEER_ACTOR": "alpha",
                    "PRIVATEER_PRESENCE_HOLDER": "host:alpha", "PRIVATEER_HOSTED": "1"}
-        argv = prepare([codex, "resume", session, "-C", str(folder), "--no-alt-screen",
-                        "--model", "ship-model", "-c", 'model_reasoning_effort="high"'], context)
+        argv = prepare([codex, "resume", "--model", "ship-model", session, "-C", str(folder),
+                        "--no-alt-screen", "-c", 'model_reasoning_effort="high"'], context)
         # This is deliberately a zero-turn settings probe, not a binding/mail
         # fixture: do NOT submit the hosted bearings prompt or trust any hook.
         assert argv[-2] == "--" and "first mate of alpha" in argv[-1]
@@ -226,6 +241,10 @@ trust_level = "trusted"
                     evidence["daemon_exited_confirmed"] = True
                 else:
                     raise AssertionError("owned app-server still alive")
+                if pidfile.exists():
+                    saved = json.loads(pidfile.read_text())
+                    assert saved["pid"] == daemon.pid and saved["processIdentity"] == identity
+                    pidfile.unlink()
                 for path in (rendezvous, physical, physical.with_suffix(".lock")):
                     if path.exists() or path.is_symlink():
                         assert path.lstat().st_uid == os.getuid()
@@ -237,6 +256,8 @@ trust_level = "trusted"
             (root / "evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
     print(json.dumps({"version": evidence["version"], "model": effective["model"],
                       "effort": effective["reasoningEffort"], "provider_requests": len(calls),
+                      "implicit_model_verified": evidence["implicit_model_only"]["model_verified"],
+                      "implicit_model_read": effective_model.get("model"),
                       "daemon_exited_confirmed": evidence["daemon_exited_confirmed"],
                       "evidence": str(root / "evidence.json")}))
 

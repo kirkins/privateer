@@ -41,15 +41,17 @@ JSON valid and the file private; the next reservation then has room.
 
 **ACT3a: per-ship model and effort at attach.** The hosted launch carries
 `first_mate.options.model` as `--model` and effort as
-`-c model_reasoning_effort="VALUE"` (a 1..32-character lowercase word). For effort,
+`-c model_reasoning_effort="VALUE"` (`minimal`, `low`, `medium`, `high`, `xhigh`
+or `none`; other values refuse with an explicit error). For effort,
 prepare connects to the home-derived, peer/process-verified shared app-server and
 inserts its own `--remote unix://<verified socket>` into the exact-UUID resume
 argv. Explicit remote avoids Codex 0.166's *implicit* daemon exclusion for `-c`;
 it does not change the provider, permissions, hook trust or global config.
 Prepare records that daemon/socket identity. The trusted callback must see that
 same daemon and read back every explicitly requested model/effort from the loaded
-UUID's `thread/read` before binding. Missing/mismatched settings leave UNBOUND
-and stop the initial turn, rather than infer with defaults. No model/effort
+UUID's `thread/read` before binding. When settings were requested, any callback
+failure (including timeout, unreachable daemon or unsupported schema) leaves
+UNBOUND and stops the initial turn, rather than infer with defaults. No model/effort
 mutation occurs in the callback or mail runner. Grants, budgets and custody
 poison are unchanged.
 
@@ -68,13 +70,17 @@ python3 -B scripts/codex-effort-spike.py --codex /absolute/path/to/codex \
 
 The one reusable, private root retains `evidence.json` and PTY/daemon logs. The
 fixture starts the installed app-server directly, verifies its peer, attaches a
-zero-turn exact-UUID TUI, tests idle `thread/settings/update`, then attaches with
-the production prepare-generated model/effort/remote flags and reads both back.
+zero-turn exact-UUID TUI, tests idle `thread/settings/update`, checks model-only
+`--model` on the implicit-daemon route, then attaches with the production
+prepare-generated model/effort/remote flags (including flags before the UUID)
+and reads both back.
 It deliberately strips the bearings prompt (no turn or hook trust is exercised),
 requires zero loopback provider requests, and always waits for owned process exit.
 On CLI/app-server **0.166.0**, `--model ship-model` plus effort `high` read back
 exactly after changing the loaded thread to `updated-model` / `medium`; provider
-remained the fixture provider. Idle settings/update also worked, but is not used
+remained the fixture provider. Model-only implicit attach also read back exactly
+(`implicit-model`, distinct from the prior thread model), so model-only mismatch
+continues to stop the initial turn. Idle settings/update also worked, but is not used
 as a potentially racy first-turn update. `thread/start` config effort alone is
 not relied on across attach. No credentials, real inference or live pane is used.
 
