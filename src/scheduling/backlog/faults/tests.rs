@@ -20,6 +20,12 @@ fn child(store: &mut Store) {
         "charter_id":"project","owner":"infra","title":"Child"}),
     )
     .unwrap();
+    crate::dispatch(
+        store,
+        "task.create",
+        json!({"id":"unrelated","charter_id":"project","owner":"infra","title":"Other tree"}),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -61,7 +67,7 @@ fn supervised_work_in_the_tree_suppresses_reminders_but_unrelated_work_does_not(
         store
             .connection()
             .execute(
-                "UPDATE jobs SET record=json_set(record,'$.task_id','infra-duty')",
+                "UPDATE jobs SET record=json_set(record,'$.task_id','unrelated')",
                 [],
             )
             .unwrap();
@@ -89,7 +95,7 @@ fn descendant_parks_are_live_even_without_a_live_job_record() {
         );
         store
             .connection()
-            .execute("UPDATE crew_parks SET task_id='infra-duty'", [])
+            .execute("UPDATE crew_parks SET task_id='unrelated'", [])
             .unwrap();
         assert_eq!(
             consider(&store, "infra", &json!({})).unwrap().len(),

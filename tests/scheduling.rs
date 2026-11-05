@@ -1842,6 +1842,52 @@ fn stranded_faults_name_requests_and_pins_without_replaying_work() {
     );
 }
 
+#[test]
+fn unrelated_supervised_work_does_not_suppress_a_stranded_fault_reminder() {
+    let mut fleet = Fleet::new(support::now_settings());
+    attend(&mut fleet);
+    fleet.tick(); // Initialize the ordinary idle alarm before the fault.
+    stranded(&mut fleet);
+    task(&mut fleet, "infra-other");
+    let ready = fleet.root.join("other-ready");
+    let release = fleet.root.join("other-release");
+    let job = fleet.ok("job.start", json!({"task_id":"infra-other","heavy":false,
+        "timeout_secs":20,"command":[support::python(),"-c",
+            "import pathlib,sys,time\npathlib.Path(sys.argv[1]).touch()\nwhile not pathlib.Path(sys.argv[2]).exists(): time.sleep(.02)",
+            ready,release]}), None);
+    for _ in 0..200 {
+        if ready.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(ready.exists(), "supervised fixture payload never started");
+    let report = fleet.tick();
+    // Release the real subprocess before checking results or removing its home.
+    std::fs::write(&release, "done").unwrap();
+    let mut settled = false;
+    for _ in 0..200 {
+        let state = fleet.ok("job.status", json!({"id":job["id"]}), None);
+        if state["status"] == "succeeded" {
+            settled = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(settled, "supervised fixture payload did not settle");
+    assert_eq!(backlog(&report)["skipped"], "work is live", "{report}");
+    assert_eq!(
+        backlog(&report)["fault_reminders"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{report}"
+    );
+    assert_eq!(fault_reminders(&fleet).len(), 1);
+    assert_eq!(status(&mut fleet, "infra-repair")["state"], "fault");
+}
+
 /// Each tick is a new dispatcher process: counters and spacing must survive.
 #[test]
 fn stranded_fault_reminders_survive_restarts_with_only_one_bounded_repeat() {
