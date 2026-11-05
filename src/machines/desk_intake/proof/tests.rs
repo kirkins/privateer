@@ -723,6 +723,7 @@ fn explicit_copy_requires_authoritative_content_and_never_changes_origin_lifecyc
 
 #[test]
 fn revalidation_work_does_not_scan_retained_mail_and_expiration_is_fail_closed() {
+    let mut small_work = None;
     for count in [10, 3000] {
         let (_dir, r, mut h, m) = setup();
         for i in 0..count {
@@ -739,10 +740,17 @@ fn revalidation_work_does_not_scan_retained_mail_and_expiration_is_fail_closed()
         reconcile::REVALIDATE_VM.with(|n| n.set(0));
         assert!(reconcile::revalidate(&r, &m, ALPHA, &p, deadline()).unwrap());
         let work = reconcile::REVALIDATE_VM.with(|n| n.get());
-        assert!(
-            work < 1500,
-            "{count} retained rows used {work} VM instructions"
-        );
+        // Each revalidation opens a fresh home connection, so this includes
+        // SQLite's schema loading. Compare equal schemas instead of pinning a
+        // whole-home schema-size budget: retained mail must add no scan work.
+        if let Some(baseline) = small_work {
+            assert!(
+                work <= baseline + 100,
+                "{count} retained rows used {work} VM instructions vs {baseline} for 10"
+            );
+        } else {
+            small_work = Some(work);
+        }
         assert!(!reconcile::revalidate(&r, &m, ALPHA, &p, Instant::now()).unwrap_or(false));
         assert_eq!(
             h.connection()

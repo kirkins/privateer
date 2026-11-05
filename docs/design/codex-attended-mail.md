@@ -1347,6 +1347,109 @@ behavior, ongoing settings enforcement after another native client changes a
 thread, or live model/mail behavior (PR C). Exact-UUID selection, grants,
 possibly-unattended budgets, custody poison and provider routes are unchanged.
 
+### ACT3b: real-PTY draft, race, reconnect and negative second-client evidence
+
+`scripts/codex-attended-pty-spike.py` runs the installed CLI directly against an
+owned app-server, with private HOME/CODEX_HOME/Privateer/XDG state and a new
+`/var/tmp` root. It never connects to the captain's daemon or reads credentials.
+Only its initially absent home-derived physical socket/lock are outside that
+root; cleanup waits for the owned processes to exit. A fixture-only control
+protocol double answers presence/binding reports: **this is not a hosted Rust
+supervisor, live lease, grant, runner tick or Herdr session**. Queue admission
+uses the real native CLI with explicit verified `--remote`, not terminal input.
+PTY keystrokes represent only the fixture captain.
+
+The checked-in `tests/fixtures/codex-attended-pty.json` records native 0.166.0
+observations, hooks and rollout payloads. The hermetic attended suite replays the
+captured queue/user race through a fresh receipt reducer, verifying that only
+the exact mail input belongs to the queue-triggered turn. Native barriers are
+hook-log publication, daemon status/queue snapshots and rendered PTY state, not
+fixed sleeps. All inputs stop at trusted fixture hooks except one nonce-selected
+mail allowed exactly once to the fixture's loopback mock (`/v1/responses`). No
+real provider request/login or route change is involved.
+
+- **Draft:** type an unsent draft, deliver a hook-stopped mail turn, then press
+  Enter explicitly. The draft never reaches UserPromptSubmit during delivery;
+  after Enter its exact full text arrives once. Mail does not clobber or submit it.
+- **Mail wins the race:** hold mail at UserPromptSubmit with native status
+  `{"type":"active","activeFlags":[]}`, type the rest of a captain draft and
+  use the native busy composer's Tab to queue that follow-up. Release mail only
+  after the TUI renders `Queued follow-up inputs`. Both exact prompts arrive
+  once. Only mail is allowed to the mock; rollout order is queue-triggered start,
+  exact native mail user_message, completion, then a hook-stopped user turn.
+  A new ledger instance recovers the queue turn/client ID, accepted 1, ack 0;
+  the captain's turn never acquires that receipt.
+- **Captain wins the race:** hold the captain's submitted turn at its hook,
+  then deliver mail. Read-only queue/list contains exactly one pending exact
+  mail; it has not reached its hook yet. Releasing the captain yields exactly
+  one mail hook and native trigger order `user`, `queue`, with neither stopped
+  input counted as a receipt. This proves native serialization, not a second
+  accepted model turn.
+- **Second client (negative qualification):** attaching an idle same-UUID TUI
+  emits **no SessionStart**. Its first submit emits **only UserPromptSubmit**,
+  whose payload has no per-client/attachment identity. Status remains ordinary
+  idle between turns, the original binding remains bound, and **custody is not
+  fenced by this attach or submit**. No PID/cwd/loaded-list heuristic is added.
+  This known upstream gap does not block the separately authorized PR C pilot,
+  but prevents claiming exclusive/current TUI attachment or second-client
+  detection. It also means another client can change shared thread settings;
+  attach-time model/effort verification is not ongoing settings enforcement.
+- **Exit/reconnect:** after both clients exit, the old pane process identity is
+  dead. A new production `prepare` generation resumes the same UUID on the
+  same daemon, fires a new trusted resume callback and binds with its generated
+  `--remote`, explicit `ship-model` and effort `high` read back. Stopping that
+  pane and restarting only the owned daemon permits another explicit new launch
+  and bind, retaining accepted 1/ack 0 without requeue/replay. This proves fresh
+  relaunch recovery, not restoration of wait custody from a persisted PID.
+- **Navigation:** idle `/new` loads another UUID without a callback, so the old
+  binding still says bound until first turn entry. That new UUID's SessionStart
+  invalidates binding and poisons custody with `callback_uuid_changed`. There
+  is no instantaneous UI-continuity or cancellation guarantee.
+
+Conservative hardening: a same-UUID `source:resume` callback **when current-
+launch custody is already owned** publishes sticky custody poison *before* the
+project lock, reason `resume_callback_requires_relaunch`. A reconnect callback
+and a second-client callback cannot be distinguished; if either actually occurs,
+require an explicit hosted relaunch rather than mint renewed wait custody.
+Native second attach above does not emit this callback, so this is only a
+callback fence, **not a fix for silent second clients**. Direct-handler and real
+dispatcher tests hold the lock through timeout and verify poison first; later
+compact/rebind and runner restart cannot clear it. The runner reports `custody
+poisoned: resume callback requires explicit hosted relaunch` and does not spawn.
+Only prepare for a new launch generation can reset custody poison. Stale custody
+from another generation does not fence the new launch. The exact ACT3a dispatcher
+body is pinned/migrated, leaving command text and native trust unchanged; near
+matches still refuse.
+
+The two ACT3a review fixes are separate: after live pane/UUID/holder proof,
+attach-daemon replacement stops a requested-settings turn instead of permitting
+unverified defaults; a final-commit supersession by a newer callback, launch or
+poison token does not send `continue:false` to that newer turn. Both have
+deterministic tests. Existing runner tests retain exit-before/after-spawn,
+supervisor death, daemon replacement and sticky custody/receipt recovery checks.
+
+Native evidence: admitted job `5302a698-e909-44ec-8d65-89d8b6b9f73e`
+(run7) exited 0; admitted serial job `6c854070-75b0-49d8-bf3d-76f568fd47f5`
+(run8 plus the attended Python suite) exited 0 with **184 tests passing**.
+Both native runs used the installed CLI/owned daemon 0.166.0, exactly one
+loopback mock request and confirmed daemon exit. Raw evidence/logs remain in
+`/var/tmp/act3b-pty-run{7,8}`; the checked-in run8 capture omits only token-count
+and thread-settings-applied payloads, as its metadata states. No Rust source
+changed in ACT3b, and these jobs did not run Rust tests. The suite exposed an
+existing test-only mocked cleanup failure leaving its real child unreaped;
+the final test retains that child and runs actual cleanup after removing the
+mock. Commit-bound verification is recorded separately by the task gate.
+
+**Remaining boundary / upstream ask:** authenticated per-TUI client identity,
+attach epoch and ordered attach/detach/navigation events (also in SessionStart
+and a reconnect snapshot), plus conditional queue admission for that epoch.
+Neither UserPromptSubmit's turn ID nor project hook trust identifies a client.
+Without upstream support, an already admitted old-UUID turn may occur after
+navigation/exit; count it as possibly unattended, preserve its durable facts and
+never migrate/replay it. No live model/file/reply/ack pilot, current attachment,
+full native autonomy or production deployment is qualified here. PR C remains
+separate; paginated installs still get no idle mail.
+
 ### B4: Privateer-owned attended-pane proof (reviewed design; implementation split above)
 
 0.166 loaded/idle is not ATTACHED. A future alternative can restrict attended
