@@ -83,6 +83,9 @@ Upstream `tui/src/daemon_startup.rs::config_exclusion` excludes the shared daemo
 for **any `-c` override except `features.*` and `tui.fullscreen_transcript`**, a
 custom config loader, `--profile`, `--strict-config`, or
 `--dangerously-bypass-hook-trust`. `--no-daemon` also refuses automatic mail.
+**ACT3a exception:** hosted exact-UUID effort launches now use an adapter-generated,
+peer-verified explicit `--remote` endpoint, not implicit daemon selection; see the
+ACT3a section below. No caller-selected remote or general config override is allowed.
 In particular the existing route `web_search` option emits `-c web_search=…`;
 reject that attended plan with a diagnostic, never remove the option or change
 the route silently. Do not inject hook configuration through `-c`.
@@ -1244,7 +1247,7 @@ pane (`host::upgrade::relaunch`) onto `codex resume <UUID>`, or leaves it for th
 next launch. Only the trusted resume callback can bind, as for any session; a
 new grant is still the captain's.
 
-**Model and effort.** `thread/start` takes `model`; effort only through
+**Model and effort (ACT2 historical limitation; superseded by ACT3a below).** `thread/start` takes `model`; effort only through
 `config.model_reasoning_effort` (there is no effort parameter, though
 `thread/settings/update` has one). Both show on `thread/read`, but at attach the
 TUI appends `event_msg/thread_settings_applied` with its own config: the
@@ -1283,6 +1286,66 @@ preservation, idle-to-busy race, same-UUID second client and idle navigation
 remain ACT3. Sticky runner diagnostics still have no clear path. The control
 uses the CODEX_HOME of the runtime invoking it; a pane with another home fails
 closed at binding. macOS stays refused.
+
+### ACT3a: model and effort at hosted exact-UUID attach
+
+Mechanism (b) is qualified on installed CLI/app-server **0.166.0** without a
+provider turn. `scripts/codex-effort-spike.py` uses one reusable private
+`/var/tmp/act3a-probe`, the installed binary directly as an owned app-server
+(no package/cache copies), a loopback-only mock and no auth. Every connection
+verifies the owned peer/process/home-derived socket; finally waits for both TUI
+and daemon exit and removes only its initially absent socket/symlink/lock.
+Read-back JSON and logs remain in that root. It is not the managed-daemon
+installer or a live Herdr/hosted pane.
+
+Evidence / mechanism comparison:
+
+- (a) After an idle zero-turn exact-UUID TUI attach, public
+  `thread/settings/update {threadId, model:"updated-model", effort:"medium"}`
+  returned `{}`; a separate `thread/read` reported that model and
+  `reasoningEffort:"medium"`, idle, zero turns. This proves idle updates, **not**
+  hook-time ordering before the initial bearings turn; production does not use it.
+- (b) `codex resume <UUID> --remote unix://<verified socket> --model ship-model
+  -c model_reasoning_effort="high"` then read back `model:"ship-model"`,
+  `reasoningEffort:"high"`, same fixture `modelProvider`, idle, zero turns and
+  zero provider requests. A separate step-1 probe also proved `-c model="ship-model"`;
+  production keeps the existing `--model` route flag. This explicit remote path
+  bypasses only Codex's *implicit* daemon-selection exclusion, with no embedded
+  fallback or provider/permission change.
+- Model-only implicit discovery: `codex resume --model implicit-model <UUID>`
+  (no effort, config override or explicit remote) read back `model:"implicit-model"`
+  on the same owned daemon, replacing `updated-model`. Provider remained the
+  fixture provider, idle with zero turns and zero provider requests. The fixture
+  PID record includes native legacy timestamp and boot/start identity observation
+  fields; no managed installation or package copy is created. Thus model-only
+  read-back is qualified too, and its mismatch remains a stopping error.
+- (c) `thread/start {model, config:{model_reasoning_effort:"high"}, ...}` returned
+  the requested settings. Its retention under implicit resume is still not a
+  contract; no speculative alternative field or private database is used.
+
+Implementation: Rust and Python allowlist effort to `minimal`, `low`, `medium`,
+`high`, `xhigh`, `none` (with a clear control error for other values), passing it to
+reservation config and includes it in hosted exact-session launch argv. Prepare
+accepts only that effort override in addition to the existing feature/fullscreen
+allowlist. It refuses caller-supplied remote/provider/web-search overrides,
+non-hosted effort and ambiguous duplicates. For effort it discovers and verifies
+the home-derived shared endpoint **before exec**, inserts its own `--remote`
+immediately after `resume` (also preserving flags before the UUID), and records
+PID/boot/start/socket identity. Value flags cannot consume flag-like values. The callback checks the same proof, then
+reads the loaded exact UUID's configured model/effort before publishing a binding.
+When settings were requested, every callback failure stops the initial turn and
+leaves UNBOUND, including settings mismatch, unreachable daemon, timeout and
+unsupported schema; no callback/runner settings mutation is introduced. These
+paths remain refusals, never silent defaults. Explicit model without effort is
+also read back; unspecified settings remain native defaults.
+
+The fixture deliberately removes the bearings prompt to prove settings with
+zero turns and no hook trust; deterministic tests separately cover prepare,
+callback read-back, settings/daemon mismatch, initial-turn stop and refusal of
+unsupported combinations. This does **not** qualify draft/race/second-client
+behavior, ongoing settings enforcement after another native client changes a
+thread, or live model/mail behavior (PR C). Exact-UUID selection, grants,
+possibly-unattended budgets, custody poison and provider routes are unchanged.
 
 ### B4: Privateer-owned attended-pane proof (reviewed design; implementation split above)
 

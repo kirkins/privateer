@@ -421,14 +421,14 @@ fn codex_delivery_reconcile_runs_the_real_runner_and_reports_its_refusal() {
 // Hosted Codex delivery is Linux-only: on macOS these controls refuse first.
 #[cfg(target_os = "linux")]
 #[test]
-fn codex_delivery_session_refuses_without_bundled_codex_or_with_effort() {
+fn codex_delivery_session_refuses_without_bundled_codex_or_with_invalid_effort() {
     let mut f = Fixture::new();
     let error = f
         .operator("attended.codex.session", json!({"ship": "alpha"}))
         .unwrap_err();
     assert!(format!("{error:#}").contains("bundled:codex"), "{error:#}");
     let record = json!({"location": "here", "first_mate": {"manifest": "bundled:codex",
-        "options": {"effort": "high"}, "codex_session": SESSION, "duty_task": "duty"}});
+        "options": {"effort": "unsupported"}, "codex_session": SESSION, "duty_task": "duty"}});
     f.store
         .connection()
         .execute(
@@ -439,9 +439,33 @@ fn codex_delivery_session_refuses_without_bundled_codex_or_with_effort() {
     let error = f
         .operator("attended.codex.session", json!({"ship": "alpha"}))
         .unwrap_err();
-    assert!(format!("{error:#}").contains("effort"), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("must be minimal, low, medium, high, xhigh or none"),
+        "{error:#}"
+    );
     // Refused before any reservation: no adapter child ran.
     assert!(!f.dir.join("reservation.json").exists());
+}
+
+#[test]
+fn codex_delivery_effort_is_an_optional_supported_value_not_toml() {
+    assert_eq!(effort(&json!({})).unwrap(), None);
+    assert_eq!(effort(&json!({"effort": null})).unwrap(), None);
+    for value in ["minimal", "low", "medium", "high", "xhigh", "none"] {
+        assert_eq!(effort(&json!({"effort": value})).unwrap(), Some(value));
+    }
+    for value in [
+        json!(true),
+        json!(3),
+        json!(""),
+        json!("High"),
+        json!("unsupported"),
+        json!("high\"\nmodel_provider=\"other"),
+        json!("high low"),
+        json!("h".repeat(33)),
+    ] {
+        assert!(effort(&json!({"effort": value})).is_err());
+    }
 }
 
 #[test]

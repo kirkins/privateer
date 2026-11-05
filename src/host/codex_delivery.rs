@@ -220,6 +220,25 @@ fn settle(store: &Store, command: &str, args: &Value) -> Result<Value> {
     Ok(answer)
 }
 
+/// A hosted Codex first mate's `first_mate.options.effort`, if any. Codex
+/// 0.166 drops a thread's effort at `codex resume`; the pane sets it again
+/// with `-c model_reasoning_effort`, which the binding pairs with an explicit
+/// `--remote` to the verified shared daemon (a bare `-c` leaves the daemon).
+/// Only Codex's supported effort values become TOML strings in argv;
+/// anything else is refused, never quoted or dropped.
+pub(crate) fn effort(options: &Value) -> Result<Option<&str>> {
+    let Some(value) = options.get("effort").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let effort = value
+        .as_str()
+        .filter(|e| matches!(*e, "minimal" | "low" | "medium" | "high" | "xhigh" | "none"))
+        .context(
+            "first_mate.options.effort for a hosted Codex pane must be minimal, low, medium, high, xhigh or none",
+        )?;
+    Ok(Some(effort))
+}
+
 /// Captain-only: create the ship's exact native session on the verified
 /// shared daemon (durable, zero-turn), make it first_mate.codex_session and
 /// relaunch the hosted pane onto `codex resume <UUID>`. A grant naming the
@@ -238,15 +257,13 @@ fn session(store: &mut Store, args: &Value) -> Result<Value> {
             == Some("codex"),
         "{ship}'s first mate is not bundled:codex"
     );
-    // thread/start takes an effort, but `codex resume` re-applies the pane's
-    // own config, and its only effort flag (-c) excludes the shared daemon.
-    ensure!(
-        profile["options"]["effort"].is_null(),
-        "first_mate.options.effort cannot reach a hosted attended Codex pane: only -c sets it, which excludes the shared daemon"
-    );
+    // The pane applies its own --model and effort at attach (`codex resume`
+    // re-applies them); thread/start records them too, for the read-back.
+    let effort = effort(&profile["options"])?;
     let model = profile["options"]["model"].clone();
     let request = json!({"ship": ship, "cwd": folder.to_str().context("ship folder path")?,
-        "model": model, "name": format!("{ship} first mate"), "current": profile["codex_session"]});
+        "model": model, "effort": effort, "name": format!("{ship} first mate"),
+        "current": profile["codex_session"]});
     let target = folder.join(".codex/privateer-attended/reservation.json");
     let reserved = adapter(&folder, ["codex_reserve.py", "create"], &target, &request)?;
     let (session, record) = assign(store, &ship, &folder, &profile["manifest"], &reserved)?;
@@ -260,7 +277,7 @@ fn session(store: &mut Store, args: &Value) -> Result<Value> {
     };
     Ok(
         json!({"ship": ship, "session": session, "reservation": reserved, "launch": launch,
-        "settings_gap": "Codex 0.166 keeps neither thread/start model nor effort at `codex resume`: the pane's own --model/config apply at attach"}),
+        "settings": "the hosted pane applies first_mate.options model (--model) and effort (-c model_reasoning_effort over an explicit --remote to the verified shared daemon) at attach; the resume binding reads both back"}),
     )
 }
 

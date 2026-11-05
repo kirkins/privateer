@@ -34,7 +34,8 @@ class ReserveTests(unittest.TestCase):
         (self.codex / "sessions").mkdir(parents=True)
         self.request = {"ship": "alpha", "cwd": str(self.cwd), "codex_home": str(self.codex),
                         "model": None, "name": "alpha first mate", "current": None}
-        self.calls, self.threads = [], {}
+        self.calls, self.threads, self.starts = [], {}, []
+        self.start_effort = "requested"
         self.daemon = {"pid": 7, "identity": {"bootId": "alpha", "startTicks": 7}}
         self.turns, self.extra_record, self.history = [], None, "legacy"
         fixture = self
@@ -49,13 +50,16 @@ class ReserveTests(unittest.TestCase):
             def call(self, method, params):
                 fixture.calls.append(method)
                 if method == "thread/start":
+                    fixture.starts.append(params)
                     session = str(uuid.uuid4())
                     path = fixture.codex / f"sessions/rollout-{session}.jsonl"
                     fixture.threads[session] = path
                     thread = {"id": session, "sessionId": session, "historyMode": fixture.history,
                               "ephemeral": False, "cwd": params["cwd"], "turns": [], "path": str(path)}
                     return {"thread": thread, "model": params.get("model", "alpha-default"),
-                            "modelProvider": "fixture", "reasoningEffort": None}
+                            "modelProvider": "fixture", "reasoningEffort": (
+                                params.get("config", {}).get("model_reasoning_effort")
+                                if fixture.start_effort == "requested" else fixture.start_effort)}
                 if method == "thread/name/set":
                     path = fixture.threads[params["threadId"]]
                     with path.open("w") as out:
@@ -107,6 +111,24 @@ class ReserveTests(unittest.TestCase):
         self.assertEqual(result["settings"]["model"], "alpha-model")
         self.assertEqual(result["rollout"]["path"], str(self.threads[result["session"]]))
         self.assertIsNone(result["adopted"])
+
+    def test_effort_is_sent_via_config_and_read_back_without_a_turn(self):
+        result = reserve.create(self.path, {**self.request, "model": "ship-model", "effort": "high"})
+        self.assertEqual(self.starts[0]["model"], "ship-model")
+        self.assertEqual(self.starts[0]["config"], {"model_reasoning_effort": "high"})
+        self.assertEqual(result["settings"]["requested_effort"], "high")
+        self.assertEqual(result["settings"]["reasoningEffort"], "high")
+        self.assertEqual(self.saved()["effort"], "high")
+        self.assertEqual(self.calls, ["thread/start", "thread/name/set", "thread/read"])
+
+    def test_unproven_start_effort_refuses_but_preserves_the_reserved_uuid(self):
+        self.start_effort = None
+        with self.assertRaisesRegex(ValueError, "durable legacy"):
+            reserve.create(self.path, {**self.request, "effort": "high"})
+        saved = self.saved()
+        self.assertEqual(saved["state"], "reserved")
+        self.assertIn(saved["session"], self.threads)
+        self.assertEqual(self.calls, ["thread/start"])
 
     def test_lost_create_response_is_kept_as_an_orphan_never_found_by_cwd(self):
         old = self.dead_owner(state="reserving")

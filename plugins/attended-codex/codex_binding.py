@@ -407,7 +407,20 @@ def live(record):
         return False
 
 
-def plan(argv, cwd):
+def effort_word(value):
+    return isinstance(value, str) and value in {"minimal", "low", "medium", "high", "xhigh", "none"}
+
+
+class SettingsError(ValueError):
+    """Stop the initial turn rather than run with unverified requested settings."""
+
+
+def daemon_proof(daemon):
+    return {"pid": daemon.pid, "identity": daemon.identity, "socket": str(daemon.target),
+            "rendezvous": str(daemon.rendezvous), "socket_identity": list(daemon.socket_identity)}
+
+
+def parse_plan(argv, cwd):
     """A deliberately narrow attended argv grammar; unknown plans fail closed."""
     value_flags = {"-C", "--cd", "--sandbox", "-s", "--add-dir", "--model", "-m",
                    "--ask-for-approval", "-a", "--enable", "--disable"}
@@ -415,6 +428,7 @@ def plan(argv, cwd):
     args = argv[1:]
     positional = []
     resume = False
+    settings = {}
     i = 0
     while i < len(args):
         arg = args[i]
@@ -427,15 +441,26 @@ def plan(argv, cwd):
             i += 1
             if i >= len(args):
                 raise ValueError("missing Codex config override")
-            key = args[i].split("=", 1)[0]
-            if not (key.startswith("features.") or key == "tui.fullscreen_transcript"):
-                raise ValueError("Codex -c override excludes the shared daemon (including effort/web_search)")
+            key, separator, value = args[i].partition("=")
+            if key == "model_reasoning_effort" and separator:
+                # Only a quoted string: bare true/false are TOML booleans,
+                # not the string we would otherwise record as requested.
+                value = json.loads(value)
+                if not effort_word(value) or "effort" in settings:
+                    raise ValueError("invalid or duplicate Codex effort override")
+                settings["effort"] = value
+            elif not (key.startswith("features.") or key == "tui.fullscreen_transcript"):
+                raise ValueError("Codex -c override excludes the shared daemon (including web_search)")
         elif arg in value_flags:
             i += 1
-            if i >= len(args):
-                raise ValueError("missing Codex option value")
+            if i >= len(args) or not args[i] or args[i].startswith("-"):
+                raise ValueError("missing or flag-like Codex option value")
             if arg in ("-C", "--cd") and Path(args[i]).resolve() != cwd:
                 raise ValueError("Codex binding cwd override refused")
+            if arg in ("--model", "-m"):
+                if not args[i] or "model" in settings:
+                    raise ValueError("invalid or duplicate Codex model override")
+                settings["model"] = args[i]
         elif arg in bare_flags:
             pass
         elif arg.startswith("-"):
@@ -450,7 +475,13 @@ def plan(argv, cwd):
         session = str(uuid.UUID(positional.pop(0)))
     if len(positional) > 1:
         raise ValueError("ambiguous Codex positional prompt")
-    return session, bool(positional)
+    if "effort" in settings and session is None:
+        raise ValueError("Codex effort requires hosted exact-UUID resume over a verified remote daemon")
+    return session, bool(positional), settings
+
+
+def plan(argv, cwd):
+    return parse_plan(argv, cwd)[:2]
 
 
 def prepare(argv, env):
@@ -461,7 +492,9 @@ def prepare(argv, env):
     if env.get("PRIVATEER_ROLE") != "agent":
         raise ValueError("Codex binding requires the first-mate launch context")
     cwd = Path.cwd().resolve()
-    session, prompt = plan(argv, cwd)
+    session, prompt, settings = parse_plan(argv, cwd)
+    if "effort" in settings and env.get("PRIVATEER_HOSTED") != "1":
+        raise ValueError("Codex effort requires hosted exact-UUID resume over a verified remote daemon")
     if session is None:
         raise ValueError("Codex attended binding requires explicit codex resume <UUID>; fresh pane identity is unproven")
     for key in ("PRIVATEER_HOME", "PRIVATEER_CONTROL_CLI", "PRIVATEER_ACTOR", "PRIVATEER_PRESENCE_HOLDER"):
@@ -472,6 +505,16 @@ def prepare(argv, env):
     if not control.is_absolute():
         raise ValueError("Codex binding control CLI must be absolute")
     codex_home = Path(env.get("CODEX_HOME", str(Path(env["HOME"]) / ".codex"))).resolve(strict=True)
+    # Only our own peer-verified endpoint may bypass Codex's implicit-daemon
+    # -c exclusion. Caller-supplied --remote/config/provider flags still refuse.
+    attach_daemon = None
+    planned = list(argv)
+    if "effort" in settings:
+        with Daemon(codex_home) as daemon:
+            attach_daemon = daemon_proof(daemon)
+        # parse_plan permits value flags before the UUID; insert after resume,
+        # never between a flag and its value.
+        planned[2:2] = ["--remote", "unix://" + attach_daemon["socket"]]
     check_system_python()
     project = cwd / ".codex"
     project.mkdir(mode=0o700, exist_ok=True)
@@ -490,7 +533,6 @@ def prepare(argv, env):
         if not any(h.get("command") == command for group in groups for h in group["hooks"]):
             groups.append({"hooks": [{"type": "command", "command": command, "timeout": 10}]})
         atomic(hook_path, hooks)
-        planned = list(argv)
         if env.get("PRIVATEER_HOSTED") == "1" and not prompt:
             if "--" not in planned:
                 planned.append("--")
@@ -504,6 +546,7 @@ def prepare(argv, env):
                   "control": str(control), "hosted": env.get("PRIVATEER_HOSTED") == "1",
                   "path_env": {key: env[key] for key in PATH_ENV if key in env},
                   "argv": planned, "hook_command": command,
+                  "requested_settings": settings, "attach_daemon": attach_daemon,
                   "handler": str(Path(__file__).resolve()), "state": "unbound",
                   "experimental": True, "delivery_enabled": False}
         # Fence stale in-memory snapshots even if registry replacement fails.
@@ -555,7 +598,8 @@ def control(record, command, args):
             child.wait()
 
 
-def validate(record, event, daemon):
+def validate_launch(record, event, daemon):
+    """Prove callback custody before settings failures can stop a TUI turn."""
     if not live(record) or Path(f"/proc/{record['pid']}/exe").resolve() != Path(record["executable"]):
         raise ValueError("Codex launch identity is stale")
     session = str(uuid.UUID(event["session_id"]))
@@ -573,6 +617,13 @@ def validate(record, event, daemon):
         raise ValueError("Codex resume UUID does not match launch")
     if event["source"] == "compact" and session != record.get("binding", record.get("last_binding", {})).get("session"):
         raise ValueError("Codex compact callback has no matching binding")
+    if record.get("attach_daemon") is not None and record["attach_daemon"] != daemon_proof(daemon):
+        raise ValueError("Codex attach daemon changed; callback does not match launch")
+    return session
+
+
+def validate(record, event, daemon):
+    session = validate_launch(record, event, daemon)
     loaded = daemon.call("thread/loaded/list", {"limit": 32})
     if (not isinstance(loaded.get("data"), list) or "nextCursor" not in loaded
             or session not in loaded["data"] or loaded["nextCursor"] or len(loaded["data"]) > 32):
@@ -586,6 +637,10 @@ def validate(record, event, daemon):
             or thread["cwd"] != record["cwd"] or thread.get("ephemeral")
             or thread.get("path") != event.get("transcript_path")):
         raise ValueError("Codex native session metadata mismatch")
+    settings = record.get("requested_settings", {})
+    for key, field in (("model", "model"), ("effort", "reasoningEffort")):
+        if key in settings and thread.get(field) != settings[key]:
+            raise SettingsError("Codex attached " + key + " does not match the requested setting")
     transcript = Path(event["transcript_path"])
     if not transcript.is_relative_to(Path(record["codex_home"]) / "sessions") or transcript.resolve() != transcript:
         raise ValueError("Codex transcript provenance mismatch")
@@ -613,10 +668,12 @@ def validate(record, event, daemon):
     return {"session": session, "transcript": str(transcript), "history_mode": thread.get("historyMode"),
             "daemon_pid": daemon.pid, "daemon_identity": daemon.identity, "socket": str(daemon.target),
             "rendezvous": str(daemon.rendezvous), "metadata_source": "daemon_thread_read",
-            "transcript_identity": transcript_identity}
+            "transcript_identity": transcript_identity,
+            "settings": {key: thread.get(field) for key, field in
+                         (("model", "model"), ("effort", "reasoningEffort")) if key in settings}}
 
 
-def bind(registry, event, context=None):
+def bind(registry, event, context=None, on_launch_verified=None):
     registry = Path(registry)
     # The dispatcher has already invalidated before loading this handler. Direct
     # calls must do the same. last_binding retains compact continuity across
@@ -630,14 +687,17 @@ def bind(registry, event, context=None):
     if event.get("session_id") != record["session"]:
         publish_request(registry, "custody-poison.json", reason="callback_uuid_changed")
     with Daemon(record["codex_home"]) as daemon:
+        validate_launch(previous, event, daemon)
+        presence = control(record, "ship.presence", {"ship": record["ship"]})
+        if presence.get("attended") is not True or presence.get("lease", {}).get("holder") != record["holder"]:
+            raise ValueError("Codex binding does not own current presence")
+        if on_launch_verified is not None:
+            on_launch_verified(record)
         binding = validate(previous, event, daemon)
     old = previous.get("binding", previous.get("last_binding", {}))
     if old and any(old.get(key) != binding.get(key) for key in
                    ("daemon_pid", "daemon_identity", "socket", "rendezvous")):
         publish_request(registry, "custody-poison.json", reason="daemon_changed")
-    presence = control(record, "ship.presence", {"ship": record["ship"]})
-    if presence.get("attended") is not True or presence.get("lease", {}).get("holder") != record["holder"]:
-        raise ValueError("Codex binding does not own current presence")
     # A failed/uncertain report remains unbound and may safely be repeated:
     # delivery_bind neither presents mail nor records a wake.
     if record["hosted"]:
@@ -657,18 +717,32 @@ def bind(registry, event, context=None):
 
 
 def main():
+    # The project hook also runs for unrelated TUIs, even after our pane exits.
+    # Settings in a persisted record alone never authorize stopping their turn.
+    stop_turn = False
+
+    def launch_verified(record):
+        nonlocal stop_turn
+        stop_turn = bool(record.get("requested_settings"))
+
     try:
         if len(sys.argv) != 3 or sys.argv[1] != "--registry":
             raise ValueError("invalid Codex binding hook invocation")
         data = globals().get("_DISPATCH_EVENT")
         if data is None:
             data = sys.stdin.buffer.read(LIMIT + 1)
-        bind(sys.argv[2], data, globals().get("_DISPATCH_CONTEXT"))
+        context = globals().get("_DISPATCH_CONTEXT")
+        bind(sys.argv[2], data, context, on_launch_verified=launch_verified)
         print("{}")
     except Exception as error:
         # Only our local validation diagnostics, never daemon/provider values.
-        reason = str(error)[:200] if type(error) in (ValueError, TimeoutError) else type(error).__name__
-        print(json.dumps({"systemMessage": "Privateer Codex binding UNBOUND (" + reason + "): inspect the launch, trusted project hook, presence and shared daemon; automatic mail remains disabled."}))
+        reason = str(error)[:200] if isinstance(error, (ValueError, TimeoutError)) else type(error).__name__
+        result = {"systemMessage": "Privateer Codex binding UNBOUND (" + reason + "): inspect the launch, trusted project hook, presence and shared daemon; automatic mail remains disabled."}
+        # SettingsError is defensive: bind checks live UUID/daemon/presence
+        # custody before settings validation, which already arms stop_turn.
+        if stop_turn or isinstance(error, SettingsError):
+            result.update({"continue": False, "stopReason": reason})
+        print(json.dumps(result))
 
 
 if __name__ == "__main__":
