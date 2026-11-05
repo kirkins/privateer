@@ -213,12 +213,13 @@ fn cancelled_task_and_closed_remote_waits_are_evidence_not_live_waits_after_faul
         assert!(consider(&store, "infra", &json!({})).unwrap().is_empty());
         let mut work = load(&store, "work-1").unwrap().unwrap();
         crate::scheduling::advance(&store, &mut work, Store::now_ms() - 3_600_001).unwrap();
-        assert_eq!(work.state, "fault", "{work:?}");
+        assert_eq!(work.state, "fault", "reason: {:?}", work.reason);
         assert_eq!(work.wait, Some(wait), "fault preserves the old wait");
         assert!(
             work.reason.as_deref().unwrap().contains("cancelled")
                 || work.reason.as_deref().unwrap().contains("was closed"),
-            "{work:?}"
+            "reason: {:?}",
+            work.reason
         );
         save(&store, &work).unwrap();
         assert_eq!(consider(&store, "infra", &json!({})).unwrap().len(), 1);
