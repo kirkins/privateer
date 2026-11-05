@@ -21,6 +21,9 @@ pub(super) fn init(store: &Store) -> Result<()> {
         |r| r.get(0),
     )?;
     if !has_faults {
+        // An old spent budget is attributed to the current fault count. A
+        // re-fault before this upgrade may therefore miss one generation's
+        // reminders; later fault counts and revisions get a fresh budget.
         tx.execute_batch(
             "ALTER TABLE schedule_fault_reminders ADD COLUMN faults INTEGER NOT NULL DEFAULT 0;
              UPDATE schedule_fault_reminders SET faults=COALESCE((
@@ -114,7 +117,7 @@ pub(super) fn consider(store: &Store, ship: &str, profile: &Value) -> Result<Vec
             crate::core::hash(&json!(listed))
         );
         let body = format!(
-            "Stranded schedule faults: no live supervised job, claim or park in these task trees and no unresolved typed wait.\n{}\nReview the faults and these possibly stale facts. Explicitly task.enqueue an assignment to retry, task.defer with a real wait, hand off, or close with evidence. Nothing was replayed and no authority was granted. This reminder does not need the captain.",
+            "Stranded schedule faults: no live supervised job, claim or park in these task trees. Retained waits on faulted schedules are evidence, not live resume conditions.\n{}\nReview the faults and these possibly stale facts. Explicitly task.enqueue an assignment to retry, task.defer with a real wait, hand off, or close with evidence. Nothing was replayed and no authority was granted. This reminder does not need the captain.",
             lines.join("\n"),
         );
         // Keep the single-task fields for existing readers; all digest items
@@ -141,8 +144,10 @@ pub(super) fn consider(store: &Store, ship: &str, profile: &Value) -> Result<Vec
     Ok(sent)
 }
 
-/// Materialization is intentional: SQLite must apply the cheap fault/due/wait
-/// filters before evaluating correlated live-work checks. Holds are excluded
+/// Materialization is intentional: SQLite must apply the cheap fault/due
+/// filters before evaluating correlated live-work checks. A fault's retained
+/// wait is evidence only: the scheduler honours waits only in state waiting.
+/// Holds are excluded
 /// before LIMIT, so a large stopped subtree cannot monopolize every batch.
 fn due_sql() -> String {
     format!(
@@ -155,10 +160,6 @@ fn due_sql() -> String {
            WHERE t.owner=?1 AND t.status IN ('open','running','blocked')
              AND t.handoff_to IS NULL AND t.id<>?1||'-duty' AND t.id<>?2
              AND json_extract(s.record,'$.state')='fault'
-             AND (json_extract(s.record,'$.wait.kind') IS NULL
-               OR (t.status='blocked' AND json_extract(s.record,'$.wait.kind')='request'
-                 AND EXISTS(SELECT 1 FROM mail m WHERE m.id=json_extract(s.record,'$.wait.ref')
-                   AND m.state IN ('denied','withdrawn','closed'))))
              AND ((r.task_id IS NULL AND COALESCE(json_extract(s.record,'$.faulted_ms'),0)<=?3-?6)
                OR (r.task_id IS NOT NULL AND r.fires<?4 AND r.next_ms<=?3))),
          ancestors(root,id,depth) AS (
@@ -176,10 +177,12 @@ fn due_sql() -> String {
            AND NOT EXISTS(SELECT 1 FROM tree JOIN task_schedule s ON s.task_id=tree.id
              WHERE tree.root=d.id AND json_extract(s.record,'$.state') IN ('offered','claimed','executing'))
            AND NOT EXISTS(SELECT 1 FROM tree JOIN jobs j ON json_extract(j.record,'$.task_id')=tree.id
-             WHERE tree.root=d.id AND json_extract(j.record,'$.status') IN ({LIVE}))
+             WHERE tree.root=d.id AND json_extract(j.record,'$.status') IN ({LIVE})
+               AND json_extract(j.record,'$.status') NOT IN {terminal})
            AND NOT EXISTS(SELECT 1 FROM tree JOIN crew_parks p ON p.task_id=tree.id
              WHERE tree.root=d.id AND p.state IN ('parked','held','resuming'))
-         ORDER BY d.rank IS NULL,d.rank,d.ord LIMIT ?5"
+         ORDER BY d.rank IS NULL,d.rank,d.ord LIMIT ?5",
+        terminal = crate::jobs::TERMINAL_SQL,
     )
 }
 

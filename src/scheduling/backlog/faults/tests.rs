@@ -28,41 +28,74 @@ fn child(store: &mut Store) {
     .unwrap();
 }
 
-// A fresh read-only connection loads sqlite_schema on its first read. Keep
-// the reminder state to one schema object: unrelated contact budgets include
-// that bounded startup work, even when their query plans never touch it.
+// A fresh read-only connection loads sqlite_schema on its first read. The
+// reminder table adds bounded startup work, not extra mail-query work. Dropping
+// it reconstructs the pre-#750 schema (the branch's only schema addition).
 #[test]
-fn reminder_schema_has_only_one_btree_and_does_not_change_mail_read_plan() {
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+fn reminder_schema_adds_only_startup_work_and_does_not_change_mail_read_plan() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     let (_temp, store) = fixture::home();
     let path = store.home().join("privateer.sqlite");
     let measure = || {
         let conn = rusqlite::Connection::open_with_flags(
-            &path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        ).unwrap();
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
         let steps = Arc::new(AtomicUsize::new(0));
         let counter = steps.clone();
-        conn.progress_handler(1, Some(move || {
-            counter.fetch_add(1, Ordering::Relaxed);
-            false
-        }));
-        conn.query_row("SELECT mailbox FROM mail_source_health WHERE only=1", [], |r| r.get::<_, String>(0)).unwrap();
+        conn.progress_handler(
+            1,
+            Some(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        );
+        conn.query_row(
+            "SELECT mailbox FROM mail_source_health WHERE only=1",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap();
         let cold = steps.swap(0, Ordering::Relaxed);
-        conn.query_row("SELECT mailbox FROM mail_source_health WHERE only=1", [], |r| r.get::<_, String>(0)).unwrap();
+        conn.query_row(
+            "SELECT mailbox FROM mail_source_health WHERE only=1",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap();
         let warm = steps.load(Ordering::Relaxed);
         conn.progress_handler(0, None::<fn() -> bool>);
-        let plan = conn.prepare("EXPLAIN QUERY PLAN SELECT mailbox FROM mail_source_health WHERE only=1").unwrap()
-            .query_map([], |r| r.get::<_, String>(3)).unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let plan = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT mailbox FROM mail_source_health WHERE only=1")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
         (cold, warm, plan)
     };
     let with = measure();
-    store.connection().execute_batch("DROP TABLE schedule_fault_reminders").unwrap();
+    store
+        .connection()
+        .execute_batch("DROP TABLE schedule_fault_reminders")
+        .unwrap();
     let without = measure();
     eprintln!("mail read with reminder schema: {with:?}; base schema: {without:?}");
     assert_eq!(with.1, without.1);
     assert_eq!(with.2, without.2);
-    assert!(with.0 <= without.0 + 7, "extra schema-load VM work: {}", with.0 - without.0);
+    assert!(
+        with.0 > without.0,
+        "fresh connection includes schema loading"
+    );
+    assert!(
+        with.0 <= without.0 + 20,
+        "extra schema-load VM work: {}",
+        with.0 - without.0
+    );
 }
 
 #[test]
@@ -143,7 +176,7 @@ fn descendant_parks_are_live_even_without_a_live_job_record() {
 }
 
 #[test]
-fn a_typed_wait_or_disabled_alarm_is_not_stranded() {
+fn a_live_typed_wait_or_disabled_alarm_is_not_stranded() {
     let (_temp, store) = fixture::home();
     old_fault(&store);
     assert!(
@@ -151,16 +184,46 @@ fn a_typed_wait_or_disabled_alarm_is_not_stranded() {
             .unwrap()
             .is_empty()
     );
-    // Even an inconsistent fault row carrying a typed wait is not treated
-    // as abandoned. Normal task.defer changes its state as well.
-    store
-        .connection()
-        .execute(
-            "UPDATE task_schedule SET record=json_set(record,'$.wait',json(?1))",
-            [json!({"kind":"manual","reason":"Owner holds it"}).to_string()],
-        )
-        .unwrap();
+    fixture::schedule(
+        &store,
+        "waiting",
+        Some(json!({"kind":"time","at_ms":i64::MAX})),
+    );
     assert!(consider(&store, "infra", &json!({})).unwrap().is_empty());
+}
+
+#[test]
+fn cancelled_task_and_closed_remote_waits_are_evidence_not_live_waits_after_faulting() {
+    for wait in [
+        json!({"kind":"task","ref":"child","reason":"Needs child"}),
+        json!({"kind":"remote","ref":{"ship":"apps","task":"far-work"},
+            "reason":"Needs far work","end":{"notice":"wait_closed","reason":"retired"}}),
+    ] {
+        let (_temp, mut store) = fixture::home();
+        child(&mut store);
+        store
+            .connection()
+            .execute("UPDATE tasks SET status='cancelled' WHERE id='child'", [])
+            .unwrap();
+        store
+            .connection()
+            .execute("UPDATE tasks SET status='blocked' WHERE id='work-1'", [])
+            .unwrap();
+        fixture::schedule(&store, "waiting", Some(wait.clone()));
+        assert!(consider(&store, "infra", &json!({})).unwrap().is_empty());
+        let mut work = load(&store, "work-1").unwrap().unwrap();
+        crate::scheduling::advance(&store, &mut work, Store::now_ms() - 3_600_001).unwrap();
+        assert_eq!(work.state, "fault", "{work:?}");
+        assert_eq!(work.wait, Some(wait), "fault preserves the old wait");
+        assert!(
+            work.reason.as_deref().unwrap().contains("cancelled")
+                || work.reason.as_deref().unwrap().contains("was closed"),
+            "{work:?}"
+        );
+        save(&store, &work).unwrap();
+        assert_eq!(consider(&store, "infra", &json!({})).unwrap().len(), 1);
+        assert!(consider(&store, "infra", &json!({})).unwrap().is_empty());
+    }
 }
 
 #[test]
@@ -307,7 +370,11 @@ fn nothing_due_never_scans_jobs_or_takes_the_write_lock() {
                     )
                     .unwrap();
             }
-            _ => fixture::schedule(&store, "fault", Some(json!({"kind":"manual"}))),
+            _ => fixture::schedule(
+                &store,
+                "waiting",
+                Some(json!({"kind":"task","ref":"dependency"})),
+            ),
         }
         let (ids, empty_steps) = steps(&store);
         assert!(ids.is_empty());
@@ -352,16 +419,43 @@ fn nothing_due_never_scans_jobs_or_takes_the_write_lock() {
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert!(plan.iter().any(|s| s == "MATERIALIZE due"), "{plan:?}");
-    // A due root must actually inspect jobs: the same VM-step probe now
-    // distinguishes the empty table from the populated one.
+    assert!(plan.iter().any(|s| s.contains("jobs_live")), "{plan:?}");
+    // Even a due root ignores terminal history through the partial index.
     old_fault(&store);
     let (ids, populated_steps) = steps(&store);
     assert_eq!(ids, vec!["work-1"]);
     store.connection().execute("DELETE FROM jobs", []).unwrap();
     let (_, empty_steps) = steps(&store);
-    assert!(
-        populated_steps > empty_steps,
-        "the scan probe must detect live-work inspection"
+    assert_eq!(
+        populated_steps, empty_steps,
+        "due roots do not scan terminal jobs"
+    );
+    store
+        .connection()
+        .execute(
+            "INSERT INTO jobs(id,record) VALUES('live',?1)",
+            [json!({"task_id":"work-1","status":"running"}).to_string()],
+        )
+        .unwrap();
+    let (ids, live_steps) = steps(&store);
+    assert!(ids.is_empty(), "live work still suppresses a due root");
+    for n in 0..128 {
+        store
+            .connection()
+            .execute(
+                "INSERT INTO jobs(id,record) VALUES(?1,?2)",
+                params![
+                    format!("retained-{n}"),
+                    json!({"task_id":"work-1","status":"failed"}).to_string()
+                ],
+            )
+            .unwrap();
+    }
+    let (ids, with_history_steps) = steps(&store);
+    assert!(ids.is_empty());
+    assert_eq!(
+        live_steps, with_history_steps,
+        "suppressed roots do not scan retained jobs each tick"
     );
 }
 

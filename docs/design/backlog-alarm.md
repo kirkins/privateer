@@ -11,15 +11,17 @@ alarm (unscheduled tasks and stale remote waits) is unchanged.
 A fault on an open, running or blocked task is stranded when its own tree
 contains no live supervised job (`starting`, `queued`, `launching`, `running`,
 `orphaned`, `parked`), crew park (`parked`, `held`, `resuming`) or live schedule
-claim (`offered`, `claimed`, `executing`), and the schedule has no typed wait.
+claim (`offered`, `claimed`, `executing`). Typed waits are live only in schedule
+state `waiting`, which is never a fault-reminder candidate. `fault()` retains
+the old wait as evidence, not as a condition that can resume work: this includes
+cancelled task dependencies, closed remote waits and lost authority while
+waiting. Such dead waits must not silence a stranded fault.
 A blocked task remains excluded while an outgoing request or decision in its
 tree is open; once that ask is denied, withdrawn or otherwise ended, a fault
-with no unresolved typed wait needs an owner decision even if its task status
-is still blocked. A request wait referencing a denied, withdrawn or closed ask
-is resolved for this purpose: `park_on_ask` can leave that wait as fault evidence,
-not a condition that can resume the work. Duty tasks, offered handoffs, terminal tasks and tasks held by a
-scheduled ancestor remain excluded. On open/running tasks neither an open
-outgoing request nor a `waiting` pin counts as a typed wait; the notice names
+needs an owner decision even if its task status is still blocked. Duty tasks,
+offered handoffs, terminal tasks and tasks held by a scheduled ancestor remain
+excluded. On open/running tasks neither an open outgoing request nor a
+`waiting` pin suppresses a fault reminder; the notice names
 a bounded sample of both in the tree, including descendants, for review.
 
 This branch runs before ship-wide idle gates: unrelated work, an awake first
@@ -38,14 +40,19 @@ in a MATERIALIZED CTE before any live-job inspection. The first read takes no
 write lock; only a nonempty set takes the lock and rechecks eligibility before
 recording counters, mail and audit atomically. Ancestor holds are excluded
 before the batch limit so large held subtrees cannot starve later faults.
+Live-job probes repeat the `jobs_live` partial-index predicate, so retained
+terminal job history is not scanned even when a due fault stays suppressed.
+When upgrading reminder rows that predate fault counts, the recorded budget is
+attributed to the current count. A re-fault before that upgrade may miss one
+generation's reminders; subsequent counts/revisions receive a fresh budget.
 Each fault generation gets one reminder after
 `backlog_alarm_secs` from its fault time, and **at most one repeat**, no sooner
 than `max(8 hours, backlog_alarm_secs)` later. Legacy records with no fault time
 start a durable grace on first observation. Restarts do not reset this budget.
 Each pass sends at most one digest notice per owner, listing up to ten due
 faults, including on hosted ships that have no wake row. Deferring, enqueueing,
-handing off or closing removes eligibility; blocking does so while a typed
-wait or open ask holds the task. An explicit enqueue that faults again has a
+handing off or closing removes eligibility; blocking does so while an open
+ask holds the task. An explicit enqueue that faults again has a
 new revision and a fresh budget. Faults are no longer duplicated
 by the ordinary idle alarm. Tick reports include `fault_reminders` mail IDs;
 audit events use `scheduling.fault_reminder`.
