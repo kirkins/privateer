@@ -189,10 +189,11 @@ fn add_ships(m: &Machine, prefix: &str, count: usize) {
     }
 }
 
-/// A machine name within the link's 64-character peer-name bound, long enough
-/// that six sources force the bounded card text to truncate.
+/// A machine name long enough that six sources force the bounded card text to
+/// truncate. Links derive a peer named `machine-<name>`, which itself is
+/// bounded to 64 characters, so the name may use at most 56.
 fn long_machine_name(prefix: &str) -> String {
-    format!("{prefix}{}", "x".repeat(60 - prefix.len()))
+    format!("{prefix}{}", "x".repeat(56 - prefix.len()))
 }
 
 #[test]
