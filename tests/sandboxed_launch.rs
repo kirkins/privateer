@@ -492,17 +492,30 @@ fn comparable(job: &Value) -> Value {
 #[test]
 fn a_forwarded_launch_inherits_the_dispatcher_not_the_requester_session() {
     let mut ship = Ship::forced();
-    ship.serve();
-    assert_clean_forwarded_environment(&ship);
+    ship.serve_with(&[
+        ("PRIVATEER_TEST_LAUNCH_SOURCE", Path::new("dispatcher")),
+        (
+            "CODEX_CA_CERTIFICATE",
+            Path::new("/fixture/dispatcher-ca.pem"),
+        ),
+    ]);
+    assert_clean_forwarded_environment(
+        &ship,
+        &[
+            ("PRIVATEER_TEST_LAUNCH_SOURCE", "dispatcher"),
+            ("CODEX_CA_CERTIFICATE", "/fixture/dispatcher-ca.pem"),
+        ],
+    );
 }
 
-fn assert_clean_forwarded_environment(ship: &Ship) {
+fn assert_clean_forwarded_environment(ship: &Ship, dispatcher_env: &[(&str, &str)]) {
     let root = &ship.fleet.root;
     let probe = root.join("session-placement");
     let direct_probe = root.join("session-direct-placement");
     let arg0 = root.join("user/.codex/tmp/arg0-linux/codex-arg0fixture");
     fs::create_dir_all(&arg0).unwrap();
-    let baseline = ship.fleet.command();
+    let mut baseline = ship.fleet.command();
+    baseline.envs(dispatcher_env.iter().copied());
     let baseline_path = baseline
         .get_envs()
         .find(|(name, _)| *name == "PATH")
@@ -521,7 +534,9 @@ fn assert_clean_forwarded_environment(ship: &Ship) {
             ("CODEX_TOOL_CALL_ID", "fixture-tool-call"),
             ("CODEX_CI", "1"),
             ("CODEX_VERSION", "fixture-version"),
+            ("CODEX_CA_CERTIFICATE", "/untrusted/requester-ca.pem"),
             ("PRIVATEER_TEST_REQUESTER_ONLY", "not-launcher-config"),
+            ("PRIVATEER_TEST_LAUNCH_SOURCE", "requester"),
         ],
     );
     assert!(
@@ -530,11 +545,23 @@ fn assert_clean_forwarded_environment(ship: &Ship) {
         String::from_utf8_lossy(&output.stderr)
     );
     let started: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let direct = ship.fleet.ok(
-        "job.start",
-        json!({"task_id": "infra-repair", "command": placement_probe(&direct_probe)}),
-        Some("infra"),
+    let direct_output = baseline
+        .args([
+            "job.start",
+            "--json",
+            &json!({"task_id": "infra-repair", "command": placement_probe(&direct_probe)})
+                .to_string(),
+        ])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "infra")
+        .output()
+        .unwrap();
+    assert!(
+        direct_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&direct_output.stderr)
     );
+    let direct: Value = serde_json::from_slice(&direct_output.stdout).unwrap();
     for job in [&started, &direct] {
         ship.wait_status(job["id"].as_str().unwrap(), &["succeeded"]);
     }
@@ -547,10 +574,25 @@ fn assert_clean_forwarded_environment(ship: &Ship) {
             .collect()
     };
     let forwarded = environment(&probe);
+    for (name, value) in dispatcher_env {
+        assert!(
+            forwarded.contains(&format!("{name}={value}")),
+            "the dispatcher's marker must reach the payload"
+        );
+    }
+    assert!(!forwarded.contains(&"PRIVATEER_TEST_LAUNCH_SOURCE=requester".to_owned()));
     assert!(
         forwarded.iter().all(|line| {
             !line.starts_with("__MISE_")
-                && (!line.starts_with("CODEX_") || line.starts_with("CODEX_HOME="))
+                && ![
+                    "CODEX_THREAD_ID=",
+                    "CODEX_SESSION_ID=",
+                    "CODEX_TOOL_CALL_ID=",
+                    "CODEX_CI=",
+                    "CODEX_VERSION=",
+                ]
+                .iter()
+                .any(|name| line.starts_with(name))
                 && !line.starts_with("PRIVATEER_TEST_REQUESTER_ONLY=")
                 && !line.contains("codex-arg0fixture")
         }),
@@ -570,7 +612,7 @@ fn a_sandboxed_first_mate_starts_runs_and_cancels_a_heavy_job_a_crew_and_an_erra
     };
     ship.serve();
     let root = ship.fleet.root.clone();
-    assert_clean_forwarded_environment(&ship);
+    assert_clean_forwarded_environment(&ship, &[]);
 
     // A heavy job: the same answer as a direct start, run outside the
     // sandbox, its outcome readable from inside.

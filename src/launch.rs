@@ -751,9 +751,21 @@ fn environment_block(
         if bytes.is_empty()
             || bytes.contains(&b'=')
             || bytes.starts_with(b"__MISE_")
-            // CODEX_HOME is dispatcher-owned configuration, not session
-            // state. Retain it so isolated homes remain isolated.
-            || (bytes.starts_with(b"CODEX_") && bytes != b"CODEX_HOME")
+            // Strip known Codex session/tool-call and sandbox markers, not
+            // all CODEX_* names: HOME, CA_CERTIFICATE, API_KEY and future
+            // dispatcher-owned configuration must remain available. The
+            // sandbox prefix covers its network and platform variants.
+            || matches!(
+                bytes,
+                b"CODEX_SESSION_ID"
+                    | b"CODEX_THREAD_ID"
+                    | b"CODEX_TOOL_CALL_ID"
+                    | b"CODEX_TURN_ID"
+                    | b"CODEX_CI"
+                    | b"CODEX_VERSION"
+                    | b"CODEX_INTERNAL_ORIGINATOR_OVERRIDE"
+            )
+            || bytes.starts_with(b"CODEX_SANDBOX")
             || bytes == b"PRIVATEER_LAUNCH_VIA"
             || !seen.insert(bytes)
         {
