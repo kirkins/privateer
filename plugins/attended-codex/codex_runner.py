@@ -117,12 +117,18 @@ def daemon_check(daemon, record, custody):
     require((info.st_dev, info.st_ino) == (native["device"], native["inode"]), "daemon socket replaced")
 
 
+def exited(child):
+    """Leader exit WITHOUT reaping: the zombie keeps pinning its process group."""
+    return os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+
+
 def drain(child, timeout=3):
     """Own queue leader + observed descendants; never signal the daemon/pane.
 
     Record pidfds before signalling an escaped descendant. Sampling cannot prove
     an unobserved double-fork stopped; activation still needs native CLI boundary
-    qualification. Output is /dev/null, not an unbounded pipe/log.
+    qualification. Output is /dev/null, not an unbounded pipe/log. The whole
+    process group is killed on timeout AND after a normal exit, before reaping.
     """
     tracked = {}
     overflow = False
@@ -169,14 +175,17 @@ def drain(child, timeout=3):
                     added = True
                 if not added:
                     break
-            if child.poll() is not None or time.monotonic() >= deadline:
+            if exited(child) or time.monotonic() >= deadline:
                 break
             time.sleep(0.02)
     finally:
         try:
-            if child.poll() is None:
-                # Unreaped leader pins this Popen-owned session/process group.
+            # The unreaped leader (live or zombie) pins this Popen-owned
+            # session/process group, so its ID cannot name another group.
+            try:
                 os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # Group already empty except the zombie leader.
             for fd in tracked.values():
                 if live(fd):
                     try:
@@ -684,15 +693,102 @@ def tick(path):
     return {"tick": "invoked"}
 
 
+OUTCOME = {"prepared": "pending", "queued": "pending", "invoking": "uncertain", "uncertain": "uncertain"}
+LATE = ("Late native admission of this offer remains possible: resolution neither cancels "
+        "a queued item or turn nor acknowledges mail.")
+
+
+def bound_runner(path):
+    """Refuse before any ledger access unless a hosted binding is current."""
+    record = load(Path(path))
+    require(isinstance(record, dict) and record.get("state") == "bound" and record.get("hosted") is True,
+            "no current hosted Codex binding")
+    return Runner(path)
+
+
+def operator_check(runner, request, current):
+    """The runtime's operator gate ran in Rust; this checks it is still current.
+
+    Current bound hosted launch, the named holder, both fences, owned custody
+    and the live lease. `current` also requires the binding's own session.
+    """
+    record = load(runner.registry)
+    require(isinstance(request, dict) and record.get("state") == "bound" and record.get("hosted") is True,
+            "no current hosted Codex binding")
+    session, nonce = exact_uuid(request.get("session")), exact_uuid(request.get("notification_id"))
+    require(request.get("ship") == record["ship"] and request.get("holder") == record["holder"]
+            and (not current or session == record["session"]), "ship/holder/session is not the current binding")
+    require_fence(runner.registry, record)
+    custody_check(runner.registry, record, load(runner.registry.with_name("custody.json")))
+    presence_check(control(record, "ship.presence", {"ship": record["ship"]}), record)
+    intent = runner.ledger.read()["sessions"].get(session, {}).get("intent")
+    require(isinstance(intent, dict) and intent.get("nonce") == nonce, "not this session's current offer")
+    return record, session, nonce
+
+
+def reconcile_control(path, request):
+    """attended.codex.reconcile: the tick's own evidence reduction, on demand.
+
+    It cannot force acceptance, discard an uncertain offer or replay one; an
+    unresolved offer stays paused.
+    """
+    runner = bound_runner(path)
+    record, session, nonce = operator_check(runner, request, current=True)
+    state = runner.ledger.read()["sessions"][session]
+    seen = max(state["accepted_through"], state["acknowledged_through"], state.get("suppressed_through", 0))
+    pending = codex_mail.snapshot(control(record, "mail.pending", {"address": record["ship"], "after_seq": seen}),
+                                  record["ship"])
+    result = runner.observe(acknowledged_through=pending["acknowledged_through"])
+    state = runner.ledger.read()["sessions"][session]
+    intent = state["intent"]
+    require(intent["nonce"] == nonce, "offer changed during reconcile")
+    return {"outcome": OUTCOME.get(intent["state"], "settled"), "state": intent["state"],
+            "paused": result["paused"], "diagnostic": result["diagnostic"],
+            "accepted_through": state["accepted_through"], "acknowledged_through": state["acknowledged_through"],
+            "evidence": {key: intent.get(key) for key in (
+                "after_seq", "through_seq", "body_hash", "queue_id", "queue_client_id", "receipt",
+                "scan_caught_up", "pause_reason", "possibly_unattended", "custody_epoch")}}
+
+
+def resolve_control(path, request):
+    """attended.codex.resolve: evidence first, then the audited operator reducer.
+
+    Works for the current session's offer and for an older UUID's outstanding
+    one (its pane is gone), always under current custody. Nothing is deleted.
+    """
+    runner = bound_runner(path)
+    record, session, nonce = operator_check(runner, request, current=False)
+    if session == record["session"]:
+        evidence = reconcile_control(path, request)
+        if evidence["outcome"] == "settled":
+            return {"resolved": False, "outcome": "settled", "state": evidence["state"], "evidence": evidence}
+    reason = request.get("reason")
+    result = runner.ledger.resolve_operator(session, nonce, request.get("operation"), reason,
+                                            time.time_ns() // 1_000_000, caller_role="operator")
+    return {"resolved": True, "outcome": "settled", "state": result["state"], "audit": result["audit"],
+            "warning": LATE}
+
+
 def main(argv):
-    if len(argv) != 3 or argv[1] != "tick":
-        print("usage: codex_runner.py tick <launch.json>", file=sys.stderr)
-        return 2
-    try:
-        tick(argv[2])
-    except Exception:  # Bounded pass: diagnostics live in the ledger, not the pane.
-        return 1
-    return 0
+    if len(argv) == 3 and argv[1] == "tick":
+        try:
+            tick(argv[2])
+        except Exception:  # Bounded pass: diagnostics live in the ledger, not the pane.
+            return 1
+        return 0
+    if len(argv) == 3 and argv[1] in ("reconcile", "resolve"):
+        # The Rust operator control's child: a bounded JSON request on stdin,
+        # one JSON answer on stdout. No diagnostic reaches a pane.
+        try:
+            request = json.loads(sys.stdin.read(LIMIT))
+            handler = reconcile_control if argv[1] == "reconcile" else resolve_control
+            print(encode(handler(argv[2], request)))
+        except Exception as error:
+            print(encode({"error": str(error)[:512] or type(error).__name__}))
+            return 1
+        return 0
+    print("usage: codex_runner.py tick|reconcile|resolve <launch.json>", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

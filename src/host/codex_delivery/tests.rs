@@ -363,3 +363,222 @@ fn codex_delivery_ticker_runs_the_real_runner_under_isolated_python() {
     assert!(!output.contains("ModuleNotFoundError"), "{output}");
     assert!(!output.contains("Traceback"), "{output}");
 }
+
+// Hosted Codex delivery is Linux-only: on macOS these controls refuse first.
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_delivery_operator_controls_refuse_agents_and_bad_resolutions() {
+    let mut f = Fixture::new();
+    let offer = json!({"ship": "alpha", "holder": "host:alpha", "session": SESSION,
+        "notification_id": nonce(), "operation": "abandon", "reason": "alpha"});
+    for command in [
+        "attended.codex.reconcile",
+        "attended.codex.resolve",
+        "attended.codex.session",
+    ] {
+        let error = f.agent(command, json!({"ship": "alpha"})).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("operator"),
+            "{command}: {error:#}"
+        );
+    }
+    for (key, value) in [
+        ("operation", json!("ack")),
+        ("reason", json!(" ")),
+        ("reason", json!("x".repeat(513))),
+        ("notification_id", json!("alpha")),
+    ] {
+        let mut bad = offer.clone();
+        bad[key] = value;
+        assert!(f.operator("attended.codex.resolve", bad).is_err());
+    }
+    let beta = json!({"ship": "beta", "holder": "host:alpha", "session": SESSION,
+        "notification_id": nonce()});
+    let error = f.operator("attended.codex.reconcile", beta).unwrap_err();
+    assert!(format!("{error:#}").contains("ship folder"), "{error:#}");
+}
+
+// The real adapter child, its stdin/stdout protocol and clean environment.
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_delivery_reconcile_runs_the_real_runner_and_reports_its_refusal() {
+    if !Path::new(PYTHON).exists() {
+        return;
+    }
+    let mut f = Fixture::new();
+    let error = f
+        .operator(
+            "attended.codex.reconcile",
+            json!({"ship": "alpha", "holder": "host:alpha", "session": SESSION, "notification_id": nonce()}),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("adapter refused: no current hosted Codex binding"),
+        "{error:#}"
+    );
+}
+
+// Hosted Codex delivery is Linux-only: on macOS these controls refuse first.
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_delivery_session_refuses_without_bundled_codex_or_with_effort() {
+    let mut f = Fixture::new();
+    let error = f
+        .operator("attended.codex.session", json!({"ship": "alpha"}))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("bundled:codex"), "{error:#}");
+    let record = json!({"location": "here", "first_mate": {"manifest": "bundled:codex",
+        "options": {"effort": "high"}, "codex_session": SESSION, "duty_task": "duty"}});
+    f.store
+        .connection()
+        .execute(
+            "UPDATE ships SET record=?1 WHERE name='alpha'",
+            [record.to_string()],
+        )
+        .unwrap();
+    let error = f
+        .operator("attended.codex.session", json!({"ship": "alpha"}))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("effort"), "{error:#}");
+    // Refused before any reservation: no adapter child ran.
+    assert!(!f.dir.join("reservation.json").exists());
+}
+
+#[test]
+fn codex_delivery_assign_sets_the_session_and_poisons_a_grant_for_another() {
+    let mut f = Fixture::new();
+    f.operator(
+        "attended.codex.grant",
+        json!({"ship": "alpha", "session": SESSION}),
+    )
+    .unwrap();
+    let fresh = nonce();
+    let mut reserved = json!({"state": "reserved", "session": fresh, "generation": nonce()});
+    assert!(assign(&f.store, "alpha", &Value::Null, &reserved).is_err());
+    reserved["state"] = json!("verified");
+    let (session, record) = assign(&f.store, "alpha", &Value::Null, &reserved).unwrap();
+    assert_eq!(session, fresh);
+    assert_eq!(record["first_mate"]["codex_session"], fresh.as_str());
+    let stored: String = f
+        .store
+        .connection()
+        .query_row("SELECT record FROM ships WHERE name='alpha'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let stored: Value = serde_json::from_str(&stored).unwrap();
+    assert_eq!(stored["first_mate"]["codex_session"], fresh.as_str());
+    let status = f
+        .operator("attended.codex.status", json!({"ship": "alpha"}))
+        .unwrap();
+    assert!(status["grant"].is_null());
+    assert_eq!(f.poison().unwrap()["reason"], "delivery_disabled");
+    let audit: String = f
+        .store
+        .connection()
+        .query_row(
+            "SELECT payload FROM audit WHERE kind='attended.codex.session'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let audit: Value = serde_json::from_str(&audit).unwrap();
+    assert_eq!(audit["previous"], SESSION);
+    assert_eq!(audit["grant_revoked"], true);
+    // Re-assigning the same session leaves a grant for it alone.
+    f.operator(
+        "attended.codex.grant",
+        json!({"ship": "alpha", "session": fresh}),
+    )
+    .unwrap();
+    assign(&f.store, "alpha", &Value::Null, &reserved).unwrap();
+    let status = f
+        .operator("attended.codex.status", json!({"ship": "alpha"}))
+        .unwrap();
+    assert_eq!(status["grant"]["session"], fresh.as_str());
+}
+
+// A pass that exits normally still loses whatever it left in its group.
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_delivery_ticker_kills_a_finished_passs_whole_process_group() {
+    if !Path::new(PYTHON).exists() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let script = tmp.path().join("runner.py");
+    fs::write(
+        &script,
+        "import os, sys, time\nfrom pathlib import Path\n\
+         pid = os.fork()\n\
+         if pid == 0:\n    time.sleep(90)\n    os._exit(0)\n\
+         Path(sys.argv[2]).with_name('member').write_text(str(pid))\n",
+    )
+    .unwrap();
+    let mut ticker = Ticker::new(script);
+    ticker.poll(tmp.path());
+    let started = Instant::now();
+    while ticker.child.is_some() && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+        ticker.reap();
+    }
+    assert!(ticker.child.is_none());
+    let member: libc::pid_t = fs::read_to_string(tmp.path().join("member"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let started = Instant::now();
+    // Reparented and reaped by init once killed; signal 0 then fails.
+    while unsafe { libc::kill(member, 0) } == 0 && started.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_ne!(unsafe { libc::kill(member, 0) }, 0, "group member survived");
+}
+
+// The bound path end to end under isolated Python: presence and mail through
+// a stand-in control CLI, no daemon, so the pass records unavailable evidence.
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_delivery_ticker_runs_the_real_runner_on_a_bound_launch() {
+    if !Path::new(PYTHON).exists() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("project");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let control = tmp.path().join("control");
+    crate::service::tests::script(
+        &control,
+        "#!/usr/bin/python3\nimport json, sys\n\
+         answers = {'ship.presence': {'attended': True, 'lease': {'holder': 'host:alpha', 'expires_ms': 10**18}},\n\
+         'mail.pending': {'address': 'alpha', 'after_seq': 0, 'acknowledged_through': 0, 'count': 0,\n\
+         'through_seq': 0, 'actionable': 0, 'headers': [], 'attention': None}}\n\
+         if len(sys.argv) > 3: print(json.dumps(answers[sys.argv[3]]))\n",
+    );
+    let codex_home = tmp.path().join("codex");
+    fs::create_dir(&codex_home).unwrap();
+    let launch = json!({"home": tmp.path().join("home"), "ship": "alpha", "state": "bound",
+        "hosted": true, "session": SESSION, "holder": "host:alpha", "cwd": tmp.path(),
+        "codex_home": codex_home, "control": control, "path_env": {"HOME": tmp.path()}});
+    fs::write(dir.join("launch.json"), launch.to_string()).unwrap();
+    fs::set_permissions(dir.join("launch.json"), fs::Permissions::from_mode(0o600)).unwrap();
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/attended-codex/codex_runner.py");
+    let stderr = tmp.path().join("stderr");
+    let mut ticker = Ticker::new(script);
+    ticker.capture_stderr(stderr.clone());
+    ticker.poll(&dir);
+    let (child, _) = ticker.child.as_mut().expect("runner was not spawned");
+    let status = child.wait().unwrap();
+    ticker.child = None;
+    let output = fs::read_to_string(&stderr).unwrap();
+    assert!(status.success(), "runner exited {status}: {output}");
+    let ledger: Value =
+        serde_json::from_slice(&fs::read(dir.join("receipts.json")).unwrap()).unwrap();
+    assert!(ledger["sessions"][SESSION].is_object(), "{ledger}");
+    assert_eq!(
+        ledger["runner"]["diagnostic"],
+        "codex-native-evidence-unavailable"
+    );
+}

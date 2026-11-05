@@ -154,6 +154,9 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "privileged.run",
     "attended.codex.grant",
     "attended.codex.revoke",
+    "attended.codex.reconcile",
+    "attended.codex.resolve",
+    "attended.codex.session",
 ];
 
 /// Whether a command is the operator's alone for this caller. The ship the

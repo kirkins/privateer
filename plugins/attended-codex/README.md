@@ -10,6 +10,16 @@ ACT1 (Linux) makes a hosted Codex first mate resume the captain-set
 It does not implement scheduled work, qualify native autonomy or claim ATTACHED.
 The main attended-support table is unchanged until live qualification (PR C).
 
+ACT2 adds captain-only controls, each run from the ship folder's own home:
+`attended.codex.reconcile` and `attended.codex.resolve` (audited `abandon` or
+`mark_presented` with a reason) for one uncertain offer, and
+`attended.codex.session`, which creates a durable zero-turn legacy thread on the
+verified shared daemon (`codex_reserve.py`: `thread/start`, durable UUID,
+`thread/name/set`, exact verification), sets `first_mate.codex_session` and
+relaunches the hosted pane onto `codex resume <UUID>`. A ship with
+`first_mate.options.effort` is refused: Codex keeps neither model nor effort
+from `thread/start` at attach, and effort needs a daemon-excluding `-c`.
+
 Explicit opt-in: set `PRIVATEER_CODEX_ATTENDED=1` for a Privateer attended Codex
 launch **with `codex resume <exact UUID>`**. Fresh launches are refused before
 exec: a stable project hook cannot prove which pane created a new thread when
