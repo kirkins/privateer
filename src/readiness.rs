@@ -1628,6 +1628,7 @@ mod tests {
 
         /// Make this home's check look like one a sandboxed caller runs: its
         /// dispatcher recorded another PID namespace, as Codex's sandbox has.
+        #[cfg(target_os = "linux")]
         fn inside_a_sandbox(&self) {
             let own = crate::jobs::pid_namespace().expect("this PID namespace");
             self.store
@@ -1930,6 +1931,7 @@ mod tests {
     }
 
     /// The bubblewrap need, for probing it directly.
+    #[cfg(target_os = "linux")]
     fn bwrap_need() -> Need {
         Need {
             tool: "bubblewrap".into(),
