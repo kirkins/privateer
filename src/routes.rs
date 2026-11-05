@@ -2841,8 +2841,10 @@ mod allowance_tests {
     fn a_zero_margin_keeps_the_crew_release_as_it_was() {
         let now = Store::now_ms();
         let window = 5 * HOUR;
-        let mut limits = Limits::default();
-        limits.first_mate_margin = 0.0;
+        let limits = Limits {
+            first_mate_margin: 0.0,
+            ..Limits::default()
+        };
         for left in [0, 1, window / 4, window / 2, window - 1, window] {
             let reading = Spent {
                 share: 0.9,
@@ -2872,8 +2874,10 @@ mod allowance_tests {
             reset_ms: Some(now + 60_000),
             window_ms: Some(5 * HOUR),
         };
-        let mut limits = Limits::default();
-        limits.first_mate = 1.0;
+        let limits = Limits {
+            first_mate: 1.0,
+            ..Limits::default()
+        };
         assert_eq!(
             crew_reserve(&limits, &reading, now),
             reserve(&limits, 1.0 - limits.crew, &reading, now)
@@ -2892,8 +2896,10 @@ mod allowance_tests {
             reset_ms: Some(now + 60_000),
             window_ms: Some(5 * HOUR),
         };
-        let mut limits = Limits::default();
-        limits.release = Release::Fixed;
+        let mut limits = Limits {
+            release: Release::Fixed,
+            ..Limits::default()
+        };
         let (kept, reason) = crew_reserve(&limits, &reading, now);
         assert!((kept - 0.20).abs() < 1e-9 && reason == ReserveReason::Fixed);
         // A crew share inside the margin of the first mate's still stops the
