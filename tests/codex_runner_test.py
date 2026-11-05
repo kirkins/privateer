@@ -395,6 +395,25 @@ class RunnerTests(unittest.TestCase):
             self.runner._spawn(self.record, self.custody, self.daemon_class(None))
         self.assert_not_invoked()
 
+    def test_resume_callback_poison_survives_binding_recovery_and_runner_restart(self):
+        self.runner._observe_lifecycle(self.record)
+        binding.invalidate(self.registry, {"session_id": self.session, "source": "resume"})
+        poison_path = self.directory / "custody-poison.json"
+        poison = poison_path.read_bytes()
+        self.assertEqual(load(poison_path)["reason"], "resume_callback_requires_relaunch")
+        # Even a successful later binder can renew only the binding fence,
+        # not the separately sticky custody capability.
+        recovered = load(self.registry)
+        recovered.update(state="bound", binding=copy.deepcopy(self.record["binding"]))
+        recovered["binding"]["invalidation_token"] = binding.request_token(self.registry)
+        binding.atomic(self.registry, recovered)
+        for consumer in (self.runner, runner.Runner(self.registry)):
+            with self.assertRaisesRegex(ValueError, "resume callback requires explicit hosted relaunch"):
+                consumer._spawn(recovered, self.custody, self.daemon_class(None))
+            self.assert_not_invoked()
+            self.assertEqual(poison_path.read_bytes(), poison)
+        self.assertEqual(self.runner.ledger.read()["sessions"][self.session]["intent"]["state"], "prepared")
+
     def test_exit_before_final_check_refuses_pane(self):
         self.runner._observe_lifecycle(self.record)
         self.pane.kill()

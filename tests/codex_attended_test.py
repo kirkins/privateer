@@ -730,6 +730,21 @@ class BindingTests(unittest.TestCase):
         self.assertEqual((self.cwd / ".codex/hooks.json").read_bytes(), hooks)
         self.assertFalse(codex_socket.load(self.registry)["delivery_enabled"])
 
+    def test_exact_act3a_dispatcher_migration_and_near_match_refusal(self):
+        path = self.registry.with_name("hook.py")
+        body = (ROOT / "tests/fixtures/codex-dispatcher-act3a.txt").read_bytes()
+        self.assertEqual(hashlib.sha256(body).hexdigest(), binding.ACT3A_DISPATCHER_SHA256)
+        hooks = (self.cwd / ".codex/hooks.json").read_bytes()
+        self.record["process_identity"]["bootId"] = "stale"
+        binding.atomic(self.registry, self.record)
+        path.write_bytes(body + b"\n")
+        with self.assertRaisesRegex(ValueError, "dispatcher differs"):
+            binding.prepare(self.argv, self.env)
+        path.write_bytes(body)
+        binding.prepare(self.argv, self.env)
+        self.assertEqual(path.read_text(), binding.DISPATCHER)
+        self.assertEqual((self.cwd / ".codex/hooks.json").read_bytes(), hooks)
+
     def test_near_b0_body_is_not_migrated(self):
         path = self.registry.with_name("hook.py")
         body = (ROOT / "tests/fixtures/codex-dispatcher-b0.txt").read_bytes() + b"\n"
@@ -796,6 +811,43 @@ class BindingTests(unittest.TestCase):
         poison = self.registry.with_name("custody-poison.json").read_bytes()
         self.bind_current()
         self.assertEqual(self.registry.with_name("custody-poison.json").read_bytes(), poison)
+
+    def test_same_uuid_resume_poison_precedes_lock_and_requires_relaunch(self):
+        bound = self.bind_current()
+        custody = {"state": "owned", "generation": bound["generation"]}
+        binding.atomic(self.registry.with_name("custody.json"), custody)
+        original = self.registry.read_bytes()
+        for native_dispatcher in (False, True):
+            with self.subTest(native_dispatcher=native_dispatcher):
+                before = codex_socket.load(self.registry.with_name("custody-poison.json"))["token"]
+                with binding.locked(self.registry.parent):
+                    if native_dispatcher:
+                        result = subprocess.run(shlex.split(bound["hook_command"]), input=json.dumps(self.event),
+                                                text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("state lock timed out", result.stderr)
+                    else:
+                        with self.assertRaises(TimeoutError):
+                            binding.bind(self.registry, self.event)
+                poison = codex_socket.load(self.registry.with_name("custody-poison.json"))
+                self.assertNotEqual(poison["token"], before)
+                self.assertEqual(poison["reason"], "resume_callback_requires_relaunch")
+                self.assertEqual(self.registry.read_bytes(), original)
+        # A successful compact may restore binding, never custody. Only prepare
+        # (an explicit new launch generation) can mint an unrevoked token.
+        poison = self.registry.with_name("custody-poison.json").read_bytes()
+        with patch.object(binding, "Daemon", return_value=self.daemon), \
+                patch.object(binding, "control", side_effect=[
+                    {"attended": True, "lease": {"holder": "host:alpha"}}, {"recorded": True}]):
+            binding.bind(self.registry, {**self.event, "source": "compact"})
+        self.assertEqual(self.registry.with_name("custody-poison.json").read_bytes(), poison)
+        self.assertEqual(codex_socket.load(self.registry)["state"], "bound")
+
+    def test_old_generation_custody_does_not_poison_new_resume(self):
+        binding.atomic(self.registry.with_name("custody.json"), {"state": "owned", "generation": "old-launch"})
+        before = self.registry.with_name("custody-poison.json").read_bytes()
+        self.bind_current()
+        self.assertEqual(self.registry.with_name("custody-poison.json").read_bytes(), before)
 
     def test_daemon_change_callback_revokes_custody_without_enabling_delivery(self):
         self.bind_current()

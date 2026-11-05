@@ -83,8 +83,10 @@ def custody_check(registry, record, expected):
     poison_path = registry.with_name("custody-poison.json")
     safe(poison_path, private=True)
     poison = load(poison_path)
+    reason = ("custody poisoned: resume callback requires explicit hosted relaunch"
+              if poison.get("reason") == "resume_callback_requires_relaunch" else "custody poisoned")
     require(poison.get("reason") is None and poison.get("generation") == record["generation"]
-            and poison["token"] == current["token"], "custody poisoned")
+            and poison["token"] == current["token"], reason)
     exact_uuid(current["token"])
     exact_uuid(current["epoch"])
     for key in ("generation", "session", "holder", "ship", "home", "cwd", "codex_home", "pid", "process_identity"):
