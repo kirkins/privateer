@@ -83,9 +83,11 @@ def claim(path, request):
                     "another Codex session reservation is in progress")
             record["kept"] = old["kept"]
             entry = {k: old.get(k) for k in ("generation", "state", "session", "started_ms", "error")}
-            if old["state"] in ("reserved", "verified") and old.get("session") != request["current"]:
-                # Crash after the UUID was saved: continue with that EXACT
-                # UUID (verification below), never create another one.
+            if old["state"] in ("reserved", "verified") and old.get("session") is not None:
+                # A UUID was saved: continue with that EXACT UUID (verification
+                # below), never create another one. This also covers a
+                # same-commit retry after Rust committed it but before the
+                # assigned marker was written.
                 record.update(session=old["session"], state="reserved", daemon=old.get("daemon"),
                               adopted=old["generation"], start=old.get("start"))
             elif old["state"] != "unsent":
@@ -95,6 +97,28 @@ def claim(path, request):
                 require(len(record["kept"]) <= MAX_KEPT, "reservation history full; operator cleanup required")
         atomic(path, record)
         return record
+
+
+def assign(path, request):
+    """Mark a verified reservation as committed by Rust; never mark another.
+
+    Rust calls this only after its writer transaction set
+    first_mate.codex_session. Repeating it for the same generation/session is
+    idempotent, which keeps the crash-after-commit retry on that exact UUID.
+    """
+    with locked(path.parent):
+        record = read(path)
+        require(isinstance(record, dict) and record.get("version") == 1,
+                "reservation record identity mismatch")
+        require(record.get("generation") == request.get("generation"), "reservation generation changed")
+        require(record.get("session") == request.get("session"), "reservation session changed")
+        exact_uuid(record["session"])
+        require(record.get("state") in ("verified", "assigned"), "reservation is not verified")
+        if record.get("state") == "assigned":
+            return {"assigned": True, "generation": record["generation"], "session": record["session"]}
+        record.update(state="assigned", assigned_ms=now_ms())
+        atomic(path, record)
+        return {"assigned": True, "generation": record["generation"], "session": record["session"]}
 
 
 def create(path, request):
@@ -146,8 +170,8 @@ def create(path, request):
 
 
 def main(argv):
-    if len(argv) != 3 or argv[1] != "create":
-        print("usage: codex_reserve.py create <reservation.json>", file=sys.stderr)
+    if len(argv) != 3 or argv[1] not in ("create", "assign"):
+        print("usage: codex_reserve.py create|assign <reservation.json>", file=sys.stderr)
         return 2
     path = Path(argv[2])
     generation = None
@@ -156,30 +180,37 @@ def main(argv):
         cwd = Path.cwd().resolve()
         require(isinstance(request, dict) and request.get("cwd") == str(cwd)
                 and path == cwd / ".codex/privateer-attended/reservation.json", "reservation path/cwd mismatch")
-        require(isinstance(request.get("ship"), str) and isinstance(request.get("name"), str)
-                and (request.get("model") is None or isinstance(request["model"], str))
-                and (request.get("current") is None or exact_uuid(request["current"])), "invalid reservation request")
-        home = os.environ.get("CODEX_HOME") or str(Path(os.environ["HOME"]) / ".codex")
-        request["codex_home"] = str(Path(home).resolve(strict=True))
-        for directory in (cwd / ".codex", path.parent):
-            directory.mkdir(mode=0o700, exist_ok=True)
-            safe(directory, stat.S_ISDIR)
-        print(encode(create(path, request)))
+        if argv[1] == "create":
+            require(isinstance(request.get("ship"), str) and isinstance(request.get("name"), str)
+                    and (request.get("model") is None or isinstance(request["model"], str))
+                    and (request.get("current") is None or exact_uuid(request["current"])),
+                    "invalid reservation request")
+            home = os.environ.get("CODEX_HOME") or str(Path(os.environ["HOME"]) / ".codex")
+            request["codex_home"] = str(Path(home).resolve(strict=True))
+            for directory in (cwd / ".codex", path.parent):
+                directory.mkdir(mode=0o700, exist_ok=True)
+                safe(directory, stat.S_ISDIR)
+            print(encode(create(path, request)))
+        else:
+            require(isinstance(request.get("generation"), str) and isinstance(request.get("session"), str),
+                    "invalid reservation assignment")
+            print(encode(assign(path, request)))
         return 0
     except Exception as error:
         message = str(error)[:512] or type(error).__name__
-        try:
-            record = read(path)
-            generation = record.get("generation") if isinstance(record, dict) else None
-            if generation and record.get("pid") == os.getpid():
-                if record.get("state") == "reserved":
-                    # The UUID stays recorded; the next create keeps it, not reuses it.
-                    update(path, generation, state="failed", error=message)
-                elif record.get("state") == "reserving" and generation not in SENT:
-                    # Nothing reached the daemon: no native fact to keep.
-                    update(path, generation, state="unsent", error=message)
-        except Exception:
-            pass
+        if argv[1] == "create":
+            try:
+                record = read(path)
+                generation = record.get("generation") if isinstance(record, dict) else None
+                if generation and record.get("pid") == os.getpid():
+                    if record.get("state") == "reserved":
+                        # The UUID stays recorded; the next create keeps it, not reuses it.
+                        update(path, generation, state="failed", error=message)
+                    elif record.get("state") == "reserving" and generation not in SENT:
+                        # Nothing reached the daemon: no native fact to keep.
+                        update(path, generation, state="unsent", error=message)
+            except Exception:
+                pass
         print(encode({"error": message}))
         return 1
 

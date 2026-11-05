@@ -20,6 +20,24 @@ relaunches the hosted pane onto `codex resume <UUID>`. A ship with
 `first_mate.options.effort` is refused: Codex keeps neither model nor effort
 from `thread/start` at attach, and effort needs a daemon-excluding `-c`.
 
+**Reservation history cleanup.** `reservation.json` keeps the live top-level
+record plus up to 64 earlier reservations in `kept`. When a control answers
+`reservation history full; operator cleanup required`, stop the ship's hosted
+pane and no other control may be running, then edit
+`$SHIP_FOLDER/.codex/privateer-attended/reservation.json` (mode 0600) by hand:
+
+- remove only `kept` entries whose `state` is `failed`, or `reserving` with
+  `session` null (a lost `thread/start` response). Those were never assigned
+  and nothing resumes them automatically;
+- keep every `kept` entry whose `state` is `assigned` (Rust committed that UUID
+  as `first_mate.codex_session`) and every `verified`/`reserved` entry that
+  carries a `session`. Assigned and live entries are never safe to remove;
+- never remove or rewrite the top-level record, and keep its `pid`,
+  `process_identity`, `generation`, `session`, `daemon`, `rollout` and `start`.
+
+This drops only Privateer's duplicate history, not the native threads. Leave the
+JSON valid and the file private; the next reservation then has room.
+
 Explicit opt-in: set `PRIVATEER_CODEX_ATTENDED=1` for a Privateer attended Codex
 launch **with `codex resume <exact UUID>`**. Fresh launches are refused before
 exec: a stable project hook cannot prove which pane created a new thread when

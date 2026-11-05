@@ -453,11 +453,29 @@ fn codex_delivery_assign_sets_the_session_and_poisons_a_grant_for_another() {
     )
     .unwrap();
     let fresh = nonce();
+    let folder = f
+        .dir
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    let target = f.dir.join("reservation.json");
     let mut reserved = json!({"state": "reserved", "session": fresh, "generation": nonce()});
-    assert!(assign(&f.store, "alpha", &Value::Null, &reserved).is_err());
+    assert!(assign(&f.store, "alpha", &folder, &Value::Null, &reserved).is_err());
     reserved["state"] = json!("verified");
-    let (session, record) = assign(&f.store, "alpha", &Value::Null, &reserved).unwrap();
+    fs::write(
+        &target,
+        json!({"version": 1, "state": "verified", "session": fresh,
+            "generation": reserved["generation"]})
+        .to_string(),
+    )
+    .unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+    let (session, record) = assign(&f.store, "alpha", &folder, &Value::Null, &reserved).unwrap();
     assert_eq!(session, fresh);
+    let stored_reservation: Value = serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
+    assert_eq!(stored_reservation["state"], "assigned");
     assert_eq!(record["first_mate"]["codex_session"], fresh.as_str());
     let stored: String = f
         .store
@@ -491,7 +509,7 @@ fn codex_delivery_assign_sets_the_session_and_poisons_a_grant_for_another() {
         json!({"ship": "alpha", "session": fresh}),
     )
     .unwrap();
-    assign(&f.store, "alpha", &Value::Null, &reserved).unwrap();
+    assign(&f.store, "alpha", &folder, &Value::Null, &reserved).unwrap();
     let status = f
         .operator("attended.codex.status", json!({"ship": "alpha"}))
         .unwrap();
