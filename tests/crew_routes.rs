@@ -1473,7 +1473,10 @@ fn bearings_report_the_window_that_would_refuse_the_reserve() {
         text.contains("20% reserve for crew on its five-hour window"),
         "{text}"
     );
-    assert!(!text.contains("0% reserve for crew"), "{text}");
+    assert!(
+        !text.contains("0% reserve for crew on its weekly window"),
+        "{text}"
+    );
 }
 
 /// Errand and review launches are selected on the crew share, so bearings name
