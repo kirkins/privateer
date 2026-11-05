@@ -1363,7 +1363,7 @@ fn a_reserve_releases_as_the_weekly_reset_nears() {
         json!({"task_id":"fix","route":"shared"}),
     );
     assert!(refused.contains("83% of its weekly window"), "{refused}");
-    assert!(refused.contains("reserve for crew"), "{refused}");
+    assert!(refused.contains("reserve of the configured"), "{refused}");
     assert!(refused.contains("released as the reset nears"), "{refused}");
 
     // Ten hours before the reset the kept share has shrunk, so the same

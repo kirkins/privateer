@@ -540,6 +540,9 @@ fn aliases_use_the_same_headroom_at_selection_and_admission() {
     strict["allowance"] = json!({"window_hours":5,"runs":2});
     strict["tier"] = json!(1);
     strict["crew_headroom_pct"] = json!(50);
+    // This test pins alias agreement at an exact share; the release has its
+    // own tests and would move that share by a fraction as the window opens.
+    strict["reserve_release"] = json!("fixed");
     let mut alias = strict.clone();
     alias["crew_headroom_pct"] = json!(100);
     f.routes(
