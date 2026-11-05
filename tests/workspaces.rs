@@ -25,27 +25,37 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::build(true)
+    }
+    /// A charter repository that is not a Git repository at all: the shape a
+    /// sandboxed first mate's non-git task cwd has (#746).
+    fn without_git() -> Self {
+        Self::build(false)
+    }
+    fn build(with_git: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let repo = root.join("repo");
         fs::create_dir(&repo).unwrap();
-        git(&repo, &["init", "--quiet", "--initial-branch=main"]);
         fs::write(repo.join("file.txt"), "base\n").unwrap();
-        fs::write(repo.join(".gitignore"), "/cache/\n/target/\n").unwrap();
-        git(&repo, &["add", "."]);
-        git(
-            &repo,
-            &[
-                "-c",
-                "user.name=Fixture",
-                "-c",
-                "user.email=fixture@example.invalid",
-                "commit",
-                "--quiet",
-                "-m",
-                "base",
-            ],
-        );
+        if with_git {
+            git(&repo, &["init", "--quiet", "--initial-branch=main"]);
+            fs::write(repo.join(".gitignore"), "/cache/\n/target/\n").unwrap();
+            git(&repo, &["add", "."]);
+            git(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "base",
+                ],
+            );
+        }
         let script = root.join("treehouse");
         fs::write(&script, include_str!("fixtures/treehouse.py")).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
@@ -162,6 +172,143 @@ fn git(repo: &Path, args: &[&str]) -> String {
 }
 fn path(w: &Value) -> PathBuf {
     PathBuf::from(w["path"].as_str().unwrap())
+}
+
+/// Admission choices kept out of the way: these cases are about classifying
+/// `.git`, not about capacity.
+fn admission(f: &Fixture) {
+    f.ok(
+        "resource.configure",
+        json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,
+            "min_free_disk_bytes":0,"ramp_secs":0,
+            "heavy_estimate":{"memory_bytes":0,"disk_bytes":0,"cpus":1}}),
+    );
+}
+
+/// #746: while a Codex wake runs, its sandbox mounts an empty read-only `.git`
+/// over each writable root without one. That placeholder is not a repository,
+/// so a crew or heavy job in that cwd must start as a non-git task: no
+/// workspace lease, no Treehouse helper, and the command runs in place.
+#[test]
+fn an_empty_git_placeholder_in_a_non_git_cwd_starts_jobs_without_a_workspace() {
+    let f = Fixture::without_git();
+    admission(&f);
+    fs::create_dir(f.repo.join(".git")).unwrap();
+    assert!(
+        fs::read_dir(f.repo.join(".git")).unwrap().next().is_none(),
+        "the placeholder must be empty"
+    );
+    for (id, heavy) in [("light", false), ("heavy", true)] {
+        let job = f.ok(
+            "job.start",
+            json!({"task_id":"one","id":id,"heavy":heavy,
+                "command":["/bin/sh","-c",format!("printf {id} > {id}.txt")]}),
+        );
+        assert_eq!(job["workspace_lease_id"], Value::Null, "{job}");
+        assert_eq!(job["cwd"], f.repo.to_str().unwrap(), "{job}");
+        let done = f.wait(id);
+        assert_eq!(done["status"], "succeeded", "{done}");
+        assert_eq!(done["exit_code"], 0, "{done}");
+        assert_eq!(
+            fs::read_to_string(f.repo.join(format!("{id}.txt"))).unwrap(),
+            id
+        );
+    }
+    // The Treehouse stub would have created its pool on any allocation.
+    assert!(
+        !f.root.join("ledger/worktrees").exists(),
+        "a lease was allocated for a non-git cwd"
+    );
+}
+
+/// The same shape with the placeholder held open by bwrap, as Codex's Linux
+/// sandbox leaves it. Skipped where bwrap cannot create a namespace: that
+/// limit is readiness's concern, not this regression's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_bwrap_held_empty_git_placeholder_starts_a_job_without_a_workspace() {
+    let f = Fixture::without_git();
+    admission(&f);
+    let repo = f.repo.to_str().unwrap().to_owned();
+    let mut bwrap = match Command::new("bwrap")
+        .args([
+            "--ro-bind",
+            "/",
+            "/",
+            "--bind",
+            &repo,
+            &repo,
+            "--tmpfs",
+            &format!("{repo}/.git"),
+            "--remount-ro",
+            &format!("{repo}/.git"),
+            "--",
+            "sleep",
+            "60",
+        ])
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("skipped: cannot run bwrap ({error})");
+            return;
+        }
+    };
+    let until = Instant::now() + Duration::from_secs(5);
+    while !f.repo.join(".git").is_dir() {
+        if bwrap.try_wait().unwrap().is_some() {
+            eprintln!("skipped: bwrap could not create a user namespace (AppArmor?)");
+            return;
+        }
+        if Instant::now() >= until {
+            let _ = bwrap.kill();
+            let _ = bwrap.wait();
+            eprintln!("skipped: bwrap's .git placeholder is not visible outside its namespace");
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let started = f.run(
+        "job.start",
+        json!({"task_id":"one","id":"sandboxed","heavy":true,
+            "command":["/bin/sh","-c","printf ran > ran.txt"]}),
+    );
+    let job = parse(started);
+    assert_eq!(job["workspace_lease_id"], Value::Null, "{job}");
+    let done = f.wait("sandboxed");
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert_eq!(done["exit_code"], 0, "{done}");
+    assert_eq!(fs::read_to_string(f.repo.join("ran.txt")).unwrap(), "ran");
+    assert!(!f.root.join("ledger/worktrees").exists());
+    let _ = bwrap.kill();
+    let _ = bwrap.wait();
+}
+
+/// Real but corrupt metadata is still refused, and the refusal names the Git
+/// step that failed instead of only "failure category unknown" (#746).
+#[test]
+fn a_corrupt_git_directory_is_refused_and_the_error_names_the_git_step() {
+    let f = Fixture::without_git();
+    fs::create_dir(f.repo.join(".git")).unwrap();
+    // Non-empty, so it is not a placeholder; Git rejects it as metadata.
+    fs::write(f.repo.join(".git/HEAD"), "not a ref\n").unwrap();
+    let out = f.run(
+        "job.start",
+        json!({"task_id":"one","id":"corrupt","command":["true"],"heavy":false}),
+    );
+    assert!(!out.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("git rev-parse --show-toplevel"), "{text}");
+    assert!(text.contains(f.repo.to_str().unwrap()), "{text}");
+    assert!(text.contains("exit status: 128"), "{text}");
+    // Diagnostics stay bounded: no environment or raw helper stderr dump.
+    assert!(!text.contains("GIT_TERMINAL_PROMPT"), "{text}");
+    assert!(!text.contains("fatal:"), "{text}");
+    assert!(!f.root.join("ledger/worktrees").exists());
 }
 
 #[test]

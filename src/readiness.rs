@@ -1577,7 +1577,11 @@ mod tests {
         /// project under it, `<folder>/projects/<name>/.git`.
         fn git_charter(&self, id: &str) {
             let folder = self.root.join(format!("ship-{id}"));
-            std::fs::create_dir_all(folder.join("projects").join(id).join(".git")).unwrap();
+            let git_dir = folder.join("projects").join(id).join(".git");
+            std::fs::create_dir_all(&git_dir).unwrap();
+            // Real metadata, not an empty placeholder: `workspace` reads an
+            // empty `.git` (Codex's sandbox mount) as no repository at all.
+            std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
             self.charter(id, &folder);
         }
 
