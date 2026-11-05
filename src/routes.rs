@@ -2937,19 +2937,36 @@ mod allowance_tests {
         }
     }
 
-    /// An errand mid-window still stops at the first mate's configured share
-    /// less the margin: with the default 95 and 3 that is 92%, not 95%.
+    /// An errand keeps the margin across the window: with the default 95 and 3
+    /// its limit is 92% while the first mate's reserve is configured, and it
+    /// stays three points below the first mate's as that reserve releases.
     #[test]
-    fn errands_keep_the_margin_mid_window_too() {
+    fn errands_keep_the_margin_across_the_window() {
         let now = Store::now_ms();
-        let reading = Spent {
-            share: 0.9,
-            what: "window".into(),
-            reset_ms: Some(now + 5 * HOUR / 2),
-            window_ms: Some(5 * HOUR),
+        let window = 5 * HOUR;
+        let limits = Limits::default();
+        let limits_at = |reset: i64| {
+            let reading = Spent {
+                share: 0.9,
+                what: "window".into(),
+                reset_ms: Some(reset),
+                window_ms: Some(window),
+            };
+            let (kept, reason) = errand_reserve(&limits, &reading, now);
+            let (mate, _) = reserve(&limits, 1.0 - limits.first_mate, &reading, now);
+            ((1.0 - kept) * 100.0, (1.0 - mate) * 100.0, reason)
         };
-        let (kept, reason) = errand_reserve(&Limits::default(), &reading, now);
-        assert!((kept - 0.08).abs() < 1e-9, "{kept}");
+        // At the start of the window the configured first-mate share stands,
+        // so the errand stops at 92%, not 95%.
+        let (errand, mate, reason) = limits_at(now + window);
+        assert!((errand - 92.0).abs() < 0.01, "{errand} vs {mate}");
+        assert!((mate - 95.0).abs() < 0.01, "{errand} vs {mate}");
+        assert_eq!(reason, ReserveReason::FirstMateMargin(3));
+        // Halfway through, the first mate's released 97.5% puts the errand at
+        // 94.5%: still three points below the first mate's own limit.
+        let (errand, mate, reason) = limits_at(now + window / 2);
+        assert!((errand - (mate - 3.0)).abs() < 0.01, "{errand} vs {mate}");
+        assert!((mate - 97.5).abs() < 0.01, "{errand} vs {mate}");
         assert_eq!(reason, ReserveReason::FirstMateMargin(3));
     }
 
