@@ -3373,6 +3373,55 @@ fn routes_set_and_a_first_mate_profile_flag_a_harness_that_is_not_installed() {
     assert_eq!(ship["first_mate"]["manifest"], manifest, "{ship}");
 }
 
+/// A Codex first mate on workspace-write needs bubblewrap on Linux, and
+/// setting the profile says so before the first wake.
+#[cfg(target_os = "linux")]
+#[test]
+fn ship_put_reports_a_codex_sandbox_without_a_working_bubblewrap() {
+    let f = Fleet::new();
+    let bwrap = f.root.join("bin/bwrap");
+    fs::write(&bwrap, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&bwrap, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut profile =
+        f.json(None, "ship.show", json!({"name": "engineering"}))["first_mate"].clone();
+    profile["options"]["sandbox"] = json!("workspace-write");
+    let put = f.json(
+        None,
+        "ship.put",
+        json!({"name": "engineering", "first_mate": profile.clone()}),
+    );
+    let item = put["readiness"]["missing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["tool"] == "bubblewrap")
+        .unwrap_or_else(|| panic!("{put}"));
+    assert!(
+        item["why"]
+            .as_str()
+            .unwrap()
+            .contains("cannot create a user namespace (AppArmor restrict_unprivileged_userns?)"),
+        "{item}"
+    );
+    assert_eq!(item["needed_by"], json!(["engineering"]), "{item}");
+
+    fs::write(&bwrap, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&bwrap, fs::Permissions::from_mode(0o700)).unwrap();
+    let put = f.json(
+        None,
+        "ship.put",
+        json!({"name": "engineering", "first_mate": profile}),
+    );
+    assert!(
+        put["readiness"]["missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["tool"] != "bubblewrap"),
+        "{put}"
+    );
+}
+
 impl Fleet {
     /// The routes file exactly as written.
     fn routes_file(&self) -> Option<Value> {

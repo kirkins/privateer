@@ -6,7 +6,7 @@ Status (2026-11-05): approved by the first mate with conditions A to C below, an
 
 A native Codex first mate runs its Privateer CLI calls inside Codex's `workspace-write` sandbox. Mail and reads work there. Starting work does not:
 
-- **Linux (bwrap).** The sandbox has its own PID namespace with its own `/proc`. `ensure_dispatcher_namespace` (`src/jobs.rs`) refuses `job.start`, `job.retry`, `agent.start` (and so `errand.start`, `review.start` and `crew.resume`), `verify.run` and the `workspace.*` commands that allocate, because a record made there names PIDs nobody outside can inspect, settle or signal.
+- **Linux (bwrap).** A native Codex first mate's host needs bubblewrap on the dispatcher's PATH and permission to create unprivileged user namespaces; readiness checks both when the profile is set and on each dispatcher pass (issue #733). The sandbox has its own PID namespace with its own `/proc`. `ensure_dispatcher_namespace` (`src/jobs.rs`) refuses `job.start`, `job.retry`, `agent.start` (and so `errand.start`, `review.start` and `crew.resume`), `verify.run` and the `workspace.*` commands that allocate, because a record made there names PIDs nobody outside can inspect, settle or signal.
 - **macOS (Seatbelt).** Every child of a sandboxed CLI inherits the sandbox. A supervisor the CLI spawned would run its job (a build, or a crew's harness) under the first mate's profile. That job could not inspect or signal its own processes (`ps` is denied, and `(allow signal (target same-sandbox))` limits signals), and `job.cancel` from the sandbox could not signal a payload outside it.
 
 The captain's requirement for qualification: on each OS, a real errand, crew and heavy job started from inside the sandbox must run, report their outcome and be cancellable.

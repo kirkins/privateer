@@ -132,8 +132,10 @@ impl Machine {
     fn ready(&self) {
         let bin = self.root.join("bin");
         fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join("codex"), "#!/bin/sh\n").unwrap();
-        fs::set_permissions(bin.join("codex"), fs::Permissions::from_mode(0o755)).unwrap();
+        for name in ["codex", "bwrap"] {
+            fs::write(bin.join(name), "#!/bin/sh\n").unwrap();
+            fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     /// One dispatcher pass in a ship's home.
@@ -7705,7 +7707,7 @@ fn the_gateway_reports_its_machines_readiness_to_the_operator_only() {
     // Rows its dispatcher stored a moment ago: codex missing, the rest found.
     {
         let conn = rusqlite::Connection::open(&database).unwrap();
-        for (tool, ok, why) in [
+        let mut rows = vec![
             ("git", true, None),
             ("python3", true, None),
             (
@@ -7713,7 +7715,10 @@ fn the_gateway_reports_its_machines_readiness_to_the_operator_only() {
                 false,
                 Some("codex is not on the dispatcher's PATH"),
             ),
-        ] {
+        ];
+        #[cfg(target_os = "linux")]
+        rows.push(("bubblewrap", true, None));
+        for (tool, ok, why) in rows {
             conn.execute(
                 "INSERT OR REPLACE INTO machine_readiness(tool, level, ok, why, install,
                    needed_by, fingerprint, checked_ms)

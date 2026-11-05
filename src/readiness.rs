@@ -12,7 +12,10 @@
 //! declares no `requires` is reported unchecked, never missing. Herdr when a
 //! local ship's first mate is hosted (warning: it falls back to headless
 //! wakes), and ssh when this machine reaches a linked one over SSH (warning:
-//! that link cannot be reached).
+//! that link cannot be reached). On Linux, a Codex profile whose sandbox is
+//! workspace-write or read-only also needs a bubblewrap (`bwrap`) that can
+//! create a user namespace; it is checked when the profile or route is set
+//! and by the dispatcher, like the harness itself.
 //!
 //! A check only stats binaries. It spawns the version and protocol probes
 //! when a tool's fingerprint (PATH, resolved path, its size and modification
@@ -37,6 +40,8 @@ const TREEHOUSE_INSTALL: &str =
     "install Treehouse 3.1.2 or later, see https://github.com/kunchenguid/treehouse#install";
 const HERDR_INSTALL: &str = "install Herdr so herdr is on the dispatcher's PATH";
 const SSH_INSTALL: &str = "install an OpenSSH client so ssh is on the dispatcher's PATH";
+#[cfg(target_os = "linux")]
+const BWRAP_INSTALL: &str = "install bubblewrap (bwrap) with your package manager; if it is installed, allow it unprivileged user namespaces (Ubuntu 24+ AppArmor restrict_unprivileged_userns)";
 /// A failure is probed again this soon, since an install clears it.
 const FAIL_TTL_MS: i64 = 5 * 60_000;
 const PASS_TTL_MS: i64 = 6 * 3_600_000;
@@ -99,6 +104,9 @@ enum Probe {
     Version(&'static str),
     /// On PATH, nothing run.
     Presence,
+    /// Runs a trivial command in a new user and PID namespace, as Codex's
+    /// Linux sandbox does.
+    Bwrap,
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +145,22 @@ impl Needs {
         }
     }
 
+    /// A harness as a profile or route runs it: what its manifest requires,
+    /// and on Linux the bubblewrap a Codex sandbox needs.
+    fn profile(&mut self, manifest: &str, options: &Value, block: bool, who: &str) {
+        self.harness(manifest, block, who);
+        if needs_bwrap(manifest, options) {
+            self.add(Need {
+                tool: "bubblewrap".into(),
+                binary: "bwrap".into(),
+                probe: Probe::Bwrap,
+                block,
+                needed_by: vec![who.to_owned()],
+                install: BWRAP_INSTALL.into(),
+            });
+        }
+    }
+
     fn harness(&mut self, manifest: &str, block: bool, who: &str) {
         match requires(manifest) {
             Some(names) => {
@@ -158,6 +182,25 @@ impl Needs {
             }
         }
     }
+}
+
+/// Whether a Codex profile runs under a Linux sandbox that needs bubblewrap.
+/// `danger-full-access` and yolo bypass the sandbox; an absent selector uses
+/// the first mate default (workspace-write) or Codex's own sandboxed default.
+#[cfg(target_os = "linux")]
+fn needs_bwrap(manifest: &str, options: &Value) -> bool {
+    crate::bundled::harness(manifest).as_deref() == Some("codex")
+        && options["yolo"] != true
+        && !matches!(
+            options["sandbox"].as_str(),
+            Some("danger-full-access") | Some("")
+        )
+}
+
+/// macOS and other hosts never run Codex's bubblewrap sandbox.
+#[cfg(not(target_os = "linux"))]
+fn needs_bwrap(_manifest: &str, _options: &Value) -> bool {
+    false
 }
 
 /// The executables a harness manifest declares, or None when it declares
@@ -255,7 +298,7 @@ fn needed_from(
             continue;
         };
         if let Some(manifest) = ship["first_mate"]["manifest"].as_str() {
-            needs.harness(manifest, true, name);
+            needs.profile(manifest, &ship["first_mate"]["options"], true, name);
         }
         if crate::host::hosted(&ship["first_mate"]) {
             needs.add(Need {
@@ -283,7 +326,7 @@ fn needed_from(
     if let Some(routes) = policy.and_then(|p| p["routes"].as_object()) {
         for (name, route) in routes {
             if let Some(manifest) = route["manifest"].as_str() {
-                needs.harness(manifest, false, &format!("route:{name}"));
+                needs.profile(manifest, &route["options"], false, &format!("route:{name}"));
             }
         }
     }
@@ -377,6 +420,23 @@ fn probe(need: &Need, program: &Path, path: &str, deadline: Instant) -> Outcome 
     };
     let floor = match need.probe {
         Probe::Presence => return outcome,
+        Probe::Bwrap => {
+            if let Err(why) = run(&[
+                "--unshare-user",
+                "--unshare-pid",
+                "--ro-bind",
+                "/",
+                "/",
+                "true",
+            ]) {
+                outcome.ok = false;
+                outcome.why = Some(format!(
+                    "bubblewrap (bwrap) at {} is present but cannot create a user namespace (AppArmor restrict_unprivileged_userns?): {why}",
+                    program.display()
+                ));
+            }
+            return outcome;
+        }
         Probe::Version(flag) => {
             match run(&[flag]) {
                 Ok(text) => outcome.version = version(&text).map(shown),
@@ -457,6 +517,11 @@ fn missing(need: &Need, login: Option<&str>, dispatcher: bool) -> Outcome {
     } else {
         "this command's PATH"
     };
+    let label = if need.probe == Probe::Bwrap {
+        "bubblewrap (bwrap)"
+    } else {
+        need.tool.as_str()
+    };
     let why = if Path::new(&need.binary).is_absolute() {
         format!("{} ({}) is not an executable file", need.binary, need.tool)
     } else if let Some(found) =
@@ -469,11 +534,13 @@ fn missing(need: &Need, login: Option<&str>, dispatcher: bool) -> Outcome {
         };
         format!(
             "{} is found at {} in your login shell but not on {on}{advice}",
-            need.tool,
+            label,
             found.display()
         )
+    } else if need.probe == Probe::Bwrap {
+        format!("{label} is not installed on {on}")
     } else {
-        format!("{} is not on {on}", need.tool)
+        format!("{label} is not on {on}")
     };
     Outcome {
         ok: false,
@@ -877,13 +944,13 @@ pub(crate) fn missing_for(conn: &Connection, manifest: &str) -> Result<Vec<Missi
 /// is missing; the rows are left to the dispatcher, whose PATH may differ
 /// from this one and whose own check follows within a minute.
 pub(crate) fn harness_report(
-    manifests: &[(String, String)],
+    profiles: &[(String, String, Value)],
     path: &str,
     login: &dyn Fn() -> String,
 ) -> Value {
     let mut needs = Needs::default();
-    for (who, manifest) in manifests {
-        needs.harness(manifest, false, who);
+    for (who, manifest, options) in profiles {
+        needs.profile(manifest, options, false, who);
     }
     let resolved: Vec<(&Need, Option<PathBuf>)> = needs
         .tools
@@ -917,9 +984,9 @@ pub(crate) fn harness_report(
 
 /// `harness_report` on this process's PATH, the one a dispatcher started
 /// from here records, for routes.set and a first-mate profile's ship.put.
-pub(crate) fn harness_report_here(manifests: &[(String, String)]) -> Value {
+pub(crate) fn harness_report_here(profiles: &[(String, String, Value)]) -> Value {
     let path = std::env::var("PATH").unwrap_or_default();
-    harness_report(manifests, &path, &crate::service::login_path)
+    harness_report(profiles, &path, &crate::service::login_path)
 }
 
 /// Bearings lines for `ship`: each failing tool its own work needs.
@@ -1414,8 +1481,13 @@ mod tests {
 
         /// A local ship whose first mate runs `manifest`.
         fn ship(&self, name: &str, manifest: &str) {
+            self.ship_options(name, manifest, json!({}));
+        }
+
+        /// The same, with the first mate's options, such as its sandbox.
+        fn ship_options(&self, name: &str, manifest: &str, options: Value) {
             let record = json!({"name": name, "location": "here",
-                "first_mate": {"manifest": manifest, "duty_task": "duty"}});
+                "first_mate": {"manifest": manifest, "duty_task": "duty", "options": options}});
             self.store
                 .connection()
                 .execute(
@@ -1727,9 +1799,9 @@ mod tests {
         std::fs::write(&file, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
         let manifests = [
-            ("route:cheap".to_owned(), fake.clone()),
-            ("alpha".to_owned(), fake),
-            ("route:own".to_owned(), custom.clone()),
+            ("route:cheap".to_owned(), fake.clone(), json!({})),
+            ("alpha".to_owned(), fake, json!({})),
+            ("route:own".to_owned(), custom.clone(), json!({})),
         ];
         let asked = std::sync::atomic::AtomicUsize::new(0);
         let login_path = || {
@@ -1763,6 +1835,137 @@ mod tests {
         assert_eq!(report["missing"], json!([]), "{report}");
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(m.calls("fakeharness"), 0, "a presence check runs nothing");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_codex_profile_report_names_a_missing_or_denied_bwrap() {
+        let m = Machine::new();
+        m.tool("codex", "exit 0");
+        let profiles = |sandbox: &str| {
+            vec![(
+                "alpha".to_owned(),
+                "bundled:codex".to_owned(),
+                json!({"sandbox": sandbox}),
+            )]
+        };
+        let login = || String::new();
+        let bwrap = |report: &Value| {
+            report["missing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["tool"] == "bubblewrap")
+                .cloned()
+        };
+        let report = harness_report(&profiles("workspace-write"), &m.path(), &login);
+        let item = bwrap(&report).unwrap_or_else(|| panic!("{report}"));
+        assert!(
+            item["why"]
+                .as_str()
+                .unwrap()
+                .contains("bubblewrap (bwrap) is not installed on this command's PATH"),
+            "{item}"
+        );
+        assert_eq!(item["needed_by"], json!(["alpha"]));
+        assert!(
+            item["install"]
+                .as_str()
+                .unwrap()
+                .contains("AppArmor restrict_unprivileged_userns"),
+            "{item}"
+        );
+
+        m.tool("bwrap", "exit 1");
+        let report = harness_report(&profiles("read-only"), &m.path(), &login);
+        let item = bwrap(&report).unwrap_or_else(|| panic!("{report}"));
+        assert!(
+            item["why"].as_str().unwrap().contains(
+                "cannot create a user namespace (AppArmor restrict_unprivileged_userns?)"
+            ),
+            "{item}"
+        );
+
+        m.tool("bwrap", "exit 0");
+        let report = harness_report(&profiles("workspace-write"), &m.path(), &login);
+        assert!(bwrap(&report).is_none(), "{report}");
+        let calls = m.calls("bwrap");
+        let report = harness_report(&profiles("danger-full-access"), &m.path(), &login);
+        assert!(bwrap(&report).is_none(), "{report}");
+        assert_eq!(m.calls("bwrap"), calls, "danger-full-access never probes");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_codex_sandbox_never_probes_bwrap_off_linux() {
+        let m = Machine::new();
+        m.tool("codex", "exit 0");
+        m.tool("bwrap", "exit 1");
+        let profiles = [(
+            "alpha".to_owned(),
+            "bundled:codex".to_owned(),
+            json!({"sandbox": "workspace-write"}),
+        )];
+        let report = harness_report(&profiles, &m.path(), &|| String::new());
+        assert!(
+            report["missing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["tool"] != "bubblewrap"),
+            "{report}"
+        );
+        assert_eq!(m.calls("bwrap"), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_codex_first_mate_needs_a_working_bwrap() {
+        let m = Machine::new();
+        m.tool("python3", "exit 0");
+        m.tool("codex", "exit 0");
+        m.ship_options(
+            "alpha",
+            "bundled:codex",
+            json!({"sandbox": "workspace-write"}),
+        );
+        m.check();
+        assert_eq!(m.failing_tools(), ["bubblewrap"]);
+        assert!(
+            m.why("bubblewrap")
+                .contains("bubblewrap (bwrap) is not installed on the dispatcher's PATH"),
+            "{}",
+            m.why("bubblewrap")
+        );
+        assert!(
+            bearings_lines(&m.store, "alpha").unwrap()[0].contains(
+                "bubblewrap (bwrap) is not installed on the dispatcher's PATH, so the first mate of alpha cannot wake"
+            )
+        );
+
+        m.tool("bwrap", "exit 1");
+        m.check();
+        assert_eq!(m.failing_tools(), ["bubblewrap"]);
+        assert!(
+            m.why("bubblewrap").contains(
+                "cannot create a user namespace (AppArmor restrict_unprivileged_userns?)"
+            ),
+            "{}",
+            m.why("bubblewrap")
+        );
+
+        m.tool("bwrap", "exit 0");
+        m.check();
+        assert!(m.failing_tools().is_empty());
+        let calls = m.calls("bwrap");
+        m.ship_options(
+            "alpha",
+            "bundled:codex",
+            json!({"sandbox": "danger-full-access"}),
+        );
+        m.check();
+        assert!(m.failing_tools().is_empty());
+        assert_eq!(m.calls("bwrap"), calls, "danger-full-access never probes");
     }
 
     #[test]

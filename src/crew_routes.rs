@@ -735,8 +735,8 @@ pub(crate) fn expire(store: &Store) -> Result<Option<Value>> {
     ))
 }
 
-/// Each route's harness manifest, with the route that names it.
-fn manifests(value: &Value) -> Vec<(String, String)> {
+/// Each route's harness manifest and options, with the route that names it.
+fn manifests(value: &Value) -> Vec<(String, String, Value)> {
     value["routes"]
         .as_object()
         .into_iter()
@@ -745,6 +745,7 @@ fn manifests(value: &Value) -> Vec<(String, String)> {
             Some((
                 format!("route:{name}"),
                 route["manifest"].as_str()?.to_owned(),
+                route["options"].clone(),
             ))
         })
         .collect()
