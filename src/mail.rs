@@ -349,8 +349,15 @@ fn ship_put(store: &Store, args: &Value) -> Result<Value> {
         // Flag a harness that is not installed when it is set, not at the
         // first wake; the profile is kept all the same.
         if let Some(manifest) = record["first_mate"]["manifest"].as_str() {
-            record["readiness"] =
-                crate::readiness::harness_report_here(&[(name.to_owned(), manifest.to_owned())]);
+            record["readiness"] = crate::readiness::harness_report_here(
+                &[crate::readiness::Profile {
+                    who: name.to_owned(),
+                    manifest: manifest.to_owned(),
+                    options: record["first_mate"]["options"].clone(),
+                    hosted: crate::host::hosted(&record["first_mate"]),
+                }],
+                Some(store.home()),
+            );
         }
     }
     Ok(record)

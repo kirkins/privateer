@@ -45,13 +45,29 @@ dispatcher launches with (the one its user service records):
 - the executables a harness manifest lists in `requires`, such as
   `["python3", "claude"]`, for each local ship's first mate and each route in
   the routes file. A custom manifest without `requires` is reported unchecked;
+- bubblewrap (`bwrap`) on Linux when a local ship's first mate, or a route,
+  runs Codex with an effective sandbox of `workspace-write` or `read-only`
+  (`danger-full-access` and yolo need none). An absent sandbox selector is
+  read as the launch reads it: `agent.start` fills in `danger-full-access`
+  for crew and headless first mates, so only a hosted first mate, which Codex
+  starts with its own sandboxed default, needs one without a selector. The
+  probe is skipped when the check is made from inside a sandbox itself, which
+  would make it lie; the dispatcher's own check is the one that counts. The check runs
+  `bwrap --unshare-user --unshare-pid --ro-bind / / true` under the usual
+  short timeout. A missing `bwrap` is reported as `bubblewrap (bwrap) is not
+  installed`; one that is installed but cannot create a user namespace is
+  reported as `bwrap present but cannot create a user namespace (AppArmor
+  restrict_unprivileged_userns?)`. The latter is common on Ubuntu 24 and
+  later, where `kernel.apparmor_restrict_unprivileged_userns=1` denies
+  unprivileged user namespaces until a profile allows `bwrap`;
 - Herdr (`herdr --version`) when a local ship's first mate has `host: herdr`;
 - ssh (`ssh -V`, or `PRIVATEER_SSH_EXECUTABLE`) when this machine reaches a
   linked machine over SSH.
 
 Missing git, Treehouse, or a first mate's harness blocks: that work cannot
-start. Herdr and ssh only warn: without Herdr a hosted first mate falls back
-to headless wakes, and without ssh a linked machine cannot be reached. A
+start, and so does missing bubblewrap for a Codex first mate's Linux sandbox.
+Herdr and ssh only warn: without Herdr a hosted first mate falls back to
+headless wakes, and without ssh a linked machine cannot be reached. A
 route's missing harness only warns too, and route choice passes that
 route over for the next on the list, as it does one backing off: the chosen
 route's `why` adds `passed over <route>: unavailable: <tool> not installed`.

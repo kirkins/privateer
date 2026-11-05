@@ -515,7 +515,11 @@ runtime turns them into one captain **decision** from the task's owner (see
   prompt) is no decision: it is one `harness_restriction` notice to the
   captain that names the harness, its sandbox mode and network setting, and the
   supported fix (for Codex `workspace-write`, first_mate options
-  `network:true`). The ship's answer says plainly that no policy denied it.
+  `network:true`). On Linux a `workspace-write` or `read-only` Codex first
+  mate also needs a working `bwrap`; [machine readiness](workspaces.md#machine-readiness)
+  reports a missing one or AppArmor's unprivileged-userns denial when the
+  profile is set and before a wake. The ship's answer says plainly that no
+  policy denied it.
   The notice's id is its cause (ship, harness, sandbox, network, kind), so the
   same restriction reported again, from any task or after any policy change,
   adds no mail; a changed cause is a new notice.
