@@ -623,7 +623,15 @@ fn recording_task_done_does_not_kill_its_already_running_result_producer() {
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
 }
 
+/// The payload creates `fail-ps` mid-run, after which every process-table
+/// and process-group read fails: through a fake `ps` on PATH where Privateer
+/// runs `ps`, and on macOS, which reads the kernel instead, through the
+/// `test-process-faults` hook watching the same marker.
 #[test]
+#[cfg_attr(
+    all(target_os = "macos", not(feature = "test-process-faults")),
+    ignore = "needs --features test-process-faults on macOS"
+)]
 fn unexpected_supervisor_error_is_private_durable_and_keeps_payload_capacity() {
     use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new();
@@ -639,7 +647,8 @@ fn unexpected_supervisor_error_is_private_durable_and_keeps_payload_capacity() {
     fs::set_permissions(fakebin.join("ps"), fs::Permissions::from_mode(0o700)).unwrap();
     let output = cli(&home).arg("--home").arg(&home).arg("job.start").arg("--json")
         .arg(json!({"task_id":"task","id":"diagnostic","command":["/bin/sh","-c","sleep 0.3; touch fail-ps; exec sleep 30"]}).to_string())
-        .env("PATH",format!("{}:/usr/bin:/bin",fakebin.display())).output().unwrap();
+        .env("PATH",format!("{}:/usr/bin:/bin",fakebin.display()))
+        .env("PRIVATEER_TEST_PROCESS_FAULT",&marker).output().unwrap();
     assert!(
         output.status.success(),
         "{}",

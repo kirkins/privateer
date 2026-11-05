@@ -128,18 +128,7 @@ fn foreign_namespace(home: &Path) -> bool {
 /// `sandbox_check` with no operation. A missing symbol is no sandbox.
 #[cfg(target_os = "macos")]
 fn seatbelt() -> bool {
-    type Check =
-        unsafe extern "C" fn(libc::pid_t, *const libc::c_char, libc::c_int, ...) -> libc::c_int;
-    // SAFETY: a NUL-terminated name; a null result means the symbol is absent.
-    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"sandbox_check".as_ptr()) };
-    if symbol.is_null() {
-        return false;
-    }
-    // SAFETY: libsystem_sandbox declares `int sandbox_check(pid_t, const char
-    // *operation, enum sandbox_filter_type, ...)`; a null operation with
-    // SANDBOX_FILTER_NONE (0) asks only whether the process is sandboxed.
-    let check: Check = unsafe { std::mem::transmute::<*mut libc::c_void, Check>(symbol) };
-    unsafe { check(libc::getpid(), std::ptr::null(), 0) > 0 }
+    identify::seatbelt_state(std::process::id()) == Some(true)
 }
 
 /// What a requester took from its environment and flags, as a direct call
@@ -343,7 +332,8 @@ fn unconfirmed(command: &str, reason: &str) -> String {
 }
 
 /// How `contained` names a proven job whose record this home cannot load.
-const UNREADABLE: &str = "under a record this home's dispatcher cannot load (it may be read-only)";
+const UNREADABLE: &str =
+    "under a record the dispatcher cannot load from the home that proved it (it may be read-only)";
 
 fn contained_refusal(command: &str, job: &str, what: &str) -> String {
     format!(
@@ -585,6 +575,21 @@ fn carry_out(home: &Path, conn: &Connection, row: &Row, me: &str) -> Result<Carr
     };
     #[cfg(feature = "test-launch-gap")]
     test_gap(row, &found);
+    // A sandboxed requester whose ancestry never leaves its sandbox was not
+    // started by anything outside it (a double fork out of its job's tree):
+    // the walk could not tell its job, and its claim never stands in. It is
+    // refused before its caller is resolved; a requester that exited
+    // meanwhile is reported as that.
+    if let Err(error) = identify::ensure_leaves_sandbox(&found, &claimed.sandbox) {
+        let reason = match identify::ensure_still(&row.requester, &found) {
+            Err(gone) => gone,
+            Ok(()) => error,
+        };
+        return Ok(Carried::Refused(unconfirmed(
+            &row.command,
+            &reason.to_string(),
+        )));
+    }
     // The command runs as a direct call from the requester would: with its
     // environment, from its directory, on its registry. All three come from
     // the kernel's view of the requester, never from the row, but the
@@ -632,14 +637,21 @@ fn carry_out(home: &Path, conn: &Connection, row: &Row, me: &str) -> Result<Carr
     // only `PRIVATEER_JOB` names is not, and a direct call tolerates one
     // that does not exist.
     let walked = crate::crew_scope::proven_job();
-    let jobs = job
+    let jobs: Vec<(String, bool)> = job
         .iter()
-        .map(|id| (id, walked.as_ref() == Some(id)))
-        .chain(crew.as_ref().map(|c| (&c.crew, true)));
-    for (id, proven) in jobs {
-        if let Some(what) = contained(&store, id, proven)? {
-            return Ok(Carried::Refused(contained_refusal(&row.command, id, what)));
-        }
+        .map(|id| (id.clone(), walked.as_ref() == Some(id)))
+        .chain(crew.as_ref().map(|c| (c.crew.clone(), true)))
+        .collect();
+    let proven_home = crate::crew_scope::proven_home();
+    // A visible `_job-supervise` argv names the home it proves in, and from
+    // outside every argv is visible, so a home is trusted only when the
+    // caller could name it anyway: this one, or one the real registry lists.
+    let listed = match &proven_home {
+        Some(_) => crate::crew_scope::world_homes(Some(home)),
+        None => vec![],
+    };
+    if let Some((id, what)) = containment(&store, proven_home.as_deref(), &listed, &jobs)? {
+        return Ok(Carried::Refused(contained_refusal(&row.command, &id, what)));
     }
     store.audit(
         "launch.forwarded",
@@ -659,8 +671,11 @@ fn carry_out(home: &Path, conn: &Connection, row: &Row, me: &str) -> Result<Carr
 /// refused: it may be read-only (in another home, or in a record that no
 /// longer parses), and an unknown containment is never read as none.
 fn contained(store: &Store, job: &str, proven: bool) -> Result<Option<&'static str>> {
-    if crate::review::is_review_errand(store, job)? {
-        return Ok(Some("as a read-only review errand"));
+    match crate::review::is_review_errand(store, job) {
+        Ok(true) => return Ok(Some("as a read-only review errand")),
+        Ok(false) => {}
+        Err(_) if proven => return Ok(Some(UNREADABLE)),
+        Err(error) => return Err(error),
     }
     let record = match crate::jobs::record(store, job) {
         Ok(record) => record,
@@ -671,6 +686,46 @@ fn contained(store: &Store, job: &str, proven: bool) -> Result<Option<&'static s
         || record["launch"]["options"]["sandbox"] == json!("read-only")
     {
         return Ok(Some("read-only"));
+    }
+    Ok(None)
+}
+
+/// The first of the caller's `jobs` (id, proven) that keeps its sandbox
+/// closed, each judged from the home that holds its record: a proven job,
+/// and the crew classified with it, from `proven_home`, the home the walk
+/// proved it in, which may be another ship's than this one; any other job
+/// from this home. A proven home is believed only when it is this home or
+/// one of `listed` (canonical: this home and those the real registry
+/// lists): the walk takes a visible supervisor's home from its argv, which
+/// a requester can forge with a process of its own pointed at a database it
+/// wrote. A proven home that is not listed, or cannot be opened, is an
+/// unknown containment, never none.
+fn containment(
+    store: &Store,
+    proven_home: Option<&Path>,
+    listed: &[PathBuf],
+    jobs: &[(String, bool)],
+) -> Result<Option<(String, &'static str)>> {
+    let elsewhere = proven_home
+        .filter(|home| *home != store.home())
+        .map(|home| {
+            let canonical = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_owned());
+            ensure!(
+                listed.contains(&canonical),
+                "home {} is neither this home nor one the fleet registry lists",
+                home.display()
+            );
+            Store::open_readonly(home, Caller::Operator)
+        });
+    for (id, proven) in jobs {
+        let what = match (&elsewhere, proven) {
+            (Some(Ok(other)), true) => contained(other, id, true)?,
+            (Some(Err(_)), true) => Some(UNREADABLE),
+            _ => contained(store, id, *proven)?,
+        };
+        if let Some(what) = what {
+            return Ok(Some((id.clone(), what)));
+        }
     }
     Ok(None)
 }

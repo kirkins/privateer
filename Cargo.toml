@@ -22,6 +22,11 @@ test-intake-budget = []
 # caller (tests/sandboxed_launch.rs). CI enables it via --all-features;
 # never enable in a release.
 test-launch-gap = []
+# Tests only: honour PRIVATEER_TEST_PROCESS_FAULT on macOS, which fails
+# process-table and process-group reads while a marker file exists, as a
+# failing `ps` on PATH does on Linux (tests/jobs.rs). CI enables it via
+# --all-features; never enable in a release.
+test-process-faults = []
 
 [[bin]]
 name = "privateer-dashboard"
