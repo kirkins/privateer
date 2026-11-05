@@ -60,6 +60,41 @@ if kind == "drop":
               prefix=["env", "-u", "PRIVATEER_ROLE", "-u", "PRIVATEER_ACTOR"])
     (root / "drop.txt").write_text("%d\n%s" % (out.returncode, out.stderr))
     done()
+if kind == "forge":
+    # A crew that claims the operator: no role, no actor, no PRIVATEER_JOB.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("PRIVATEER_ROLE", "PRIVATEER_ACTOR", "PRIVATEER_JOB")}
+    def forge(job):
+        args = {"task_id": task, "id": job, "command": ["touch", str(root / ("ran-" + job))]}
+        return subprocess.Popen(wrap + cli + ["job.start", "--json", json.dumps(args)], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    live = forge("forged-live")
+    _, err = live.communicate(timeout=60)
+    (root / "forge-live.txt").write_text("%d\n%s" % (live.returncode, err))
+    # The dispatcher holds this one's launcher once it has identified the
+    # requester; the requester then exits, as a crew that kills and reaps
+    # its own waiter would, and only then is its caller resolved.
+    gaps = root / "gaps"
+    gapped = forge("forged-gap")
+    identified = gaps / "forged-gap.identified"
+    deadline = time.time() + 60
+    while not (identified.exists() and identified.read_text()) and time.time() < deadline:
+        time.sleep(0.05)
+    gapped.kill()
+    gapped.wait()
+    note = "never identified"
+    if identified.exists():
+        waiter = int(identified.read_text())
+        while time.time() < deadline:
+            try:
+                os.kill(waiter, 0)
+            except ProcessLookupError:
+                note = "requester %d gone" % waiter
+                break
+            time.sleep(0.05)
+    (gaps / "forged-gap.hold").unlink()
+    (root / "forge-gap.txt").write_text(note)
+    done()
 marker = root / ("parked-on-" + task)
 if not marker.exists():
     started = call("job.start", {"task_id": task, "heavy": True, "wait_for_capacity": True,
@@ -108,8 +143,15 @@ impl Ship {
     /// Start the home's resident dispatcher and wait for its first pass,
     /// which records the PID namespace work is recorded in.
     fn serve(&mut self) {
+        self.serve_with(&[]);
+    }
+
+    fn serve_with(&mut self, env: &[(&str, &Path)]) {
         let mut command = self.fleet.command();
         command.args(["serve", "--json", r#"{"interval_secs":1}"#]);
+        for (name, value) in env {
+            command.env(name, value);
+        }
         self.dispatcher = Some(Resident::spawn(command, &self.fleet.root));
         self.until("the dispatcher's first pass", || {
             rusqlite::Connection::open(self.fleet.home.join("privateer.sqlite"))
@@ -219,6 +261,17 @@ impl Ship {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap()
+    }
+
+    /// The state and error of the request whose `id` argument is `job`.
+    fn request_for(&self, job: &str) -> Option<(String, Option<String>)> {
+        let db = rusqlite::Connection::open(self.fleet.home.join("privateer.sqlite")).unwrap();
+        db.query_row(
+            "SELECT state, error FROM launch_requests WHERE json_extract(args, '$.id')=?1",
+            [job],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
     }
 
     fn jobs(&self) -> Vec<Value> {
@@ -797,4 +850,120 @@ fn a_requester_gone_before_the_claim_is_refused() {
     assert_eq!(request["state"], "refused", "{request}");
     assert_sandbox_refusal(request["error"].as_str().unwrap());
     assert!(!ship.jobs().iter().any(|j| j["id"] == "orphan-job"));
+}
+
+#[test]
+fn a_request_rewritten_after_its_waiter_started_is_refused_and_starts_nothing() {
+    let Some(mut ship) = Ship::new() else {
+        return;
+    };
+    ship.fleet.tick();
+    // Hold the serve lock so the request waits, pending, for a dispatcher.
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(ship.fleet.home.join("serve.lock"))
+        .unwrap();
+    use std::os::fd::AsRawFd;
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let mut cli = ship.fleet.command();
+    cli.args([
+        "job.start",
+        "--json",
+        &json!({"task_id": "infra-repair", "id": "honest-job", "command": ["true"]}).to_string(),
+    ])
+    .env("PRIVATEER_ROLE", "agent")
+    .env("PRIVATEER_ACTOR", "infra");
+    let waiter = support::inside(&ship.wrap, &cli)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    ship.until("the request to be pending", || {
+        ship.request_for("honest-job")
+            .is_some_and(|(state, _)| state == "pending")
+    });
+    // Someone else with write access to the home rewrites the waiting row:
+    // another command, and a claim to be the operator.
+    let marker = ship.fleet.root.join("rewritten-ran");
+    let db = rusqlite::Connection::open(ship.fleet.home.join("privateer.sqlite")).unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE launch_requests SET args=?1, claimed=?2
+             WHERE json_extract(args, '$.id')='honest-job' AND state='pending'",
+            rusqlite::params![
+                json!({"task_id": "infra-repair", "id": "honest-job",
+                    "command": ["touch", marker.to_str().unwrap()]})
+                .to_string(),
+                json!({"role": "operator", "actor": null, "env_job": null, "fleet": null,
+                    "sandbox": "pid_namespace"})
+                .to_string()
+            ],
+        )
+        .unwrap(),
+        1
+    );
+    drop(lock);
+    ship.serve();
+    let output = waiter.wait_with_output().unwrap();
+    assert!(!output.status.success(), "the waiter reports a refusal");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not waiting on this request"),
+        "{stderr}"
+    );
+    assert_sandbox_refusal(&stderr);
+    let (state, error) = ship.request_for("honest-job").unwrap();
+    assert_eq!(state, "refused", "{error:?}");
+    assert!(!marker.exists(), "the rewritten command never ran");
+    assert!(!ship.jobs().iter().any(|j| j["id"] == "honest-job"));
+}
+
+/// The race review f9369bed found: a sandboxed crew records a request that
+/// claims the operator, with no `PRIVATEER_JOB`, and kills and reaps its own
+/// waiter after the dispatcher identified it but before it resolved its
+/// caller. The walk then finds nothing; the claim must never stand in.
+#[cfg(feature = "test-launch-gap")]
+#[test]
+fn a_crew_claiming_the_operator_is_refused_even_if_its_requester_exits_mid_launch() {
+    let Some(mut ship) = Ship::new() else {
+        return;
+    };
+    let gaps = ship.fleet.root.join("gaps");
+    fs::create_dir_all(&gaps).unwrap();
+    fs::write(gaps.join("forged-gap.hold"), "").unwrap();
+    ship.serve_with(&[("PRIVATEER_TEST_LAUNCH_GAP", &gaps)]);
+    fs::write(ship.fleet.root.join("crew-mode"), "forge").unwrap();
+    ship.ok_inside(
+        "agent.start",
+        json!({"id": "forging-crew", "task_id": "infra-repair"}),
+    );
+    let gap = ship.fleet.root.join("forge-gap.txt");
+    ship.until("the crew's attempts", || gap.exists());
+    // With its requester alive, the walk finds the crew's supervisor.
+    let live = fs::read_to_string(ship.fleet.root.join("forge-live.txt")).unwrap();
+    assert!(!live.starts_with("0\n"), "{live}");
+    assert!(live.contains("cannot drop its role"), "{live}");
+    let note = fs::read_to_string(&gap).unwrap();
+    assert!(note.contains("gone"), "{note}");
+    ship.until("the gapped request to be judged", || {
+        ship.request_for("forged-gap")
+            .is_some_and(|(state, _)| state != "pending" && state != "claimed")
+    });
+    let (state, error) = ship.request_for("forged-gap").unwrap();
+    let error = error.unwrap_or_default();
+    assert_eq!(state, "refused", "{error}");
+    assert_sandbox_refusal(&error);
+    assert!(
+        error.contains("exited while its caller was being resolved"),
+        "{error}"
+    );
+    for job in ["forged-live", "forged-gap"] {
+        assert!(
+            !ship.fleet.root.join(format!("ran-{job}")).exists(),
+            "{job} never ran"
+        );
+        assert!(!ship.jobs().iter().any(|j| j["id"] == job), "{job}");
+    }
 }

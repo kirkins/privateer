@@ -51,7 +51,7 @@ struct Resolved {
 
 static RESOLVED: OnceLock<Resolved> = OnceLock::new();
 
-fn env_job() -> Option<String> {
+pub(crate) fn env_job() -> Option<String> {
     std::env::var("PRIVATEER_JOB")
         .ok()
         .filter(|job| !job.is_empty())

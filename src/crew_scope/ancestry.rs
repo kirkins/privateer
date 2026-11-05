@@ -8,7 +8,7 @@
 //! not see its ancestors' command lines; `crew_scope` handles both.
 // The kernel walk runs on macOS; elsewhere only its tests use it.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 /// Parent links followed from a caller to its supervisor.
 pub(super) const DEPTH: usize = 64;
@@ -46,11 +46,18 @@ pub(super) fn hidden_ancestry(pid: u32, error: &std::io::Error) -> String {
     )
 }
 
+/// Why a walk from `pid` has no answer: the process itself has gone, so
+/// nothing says which job it ran in.
+pub(crate) fn gone(pid: u32) -> String {
+    format!("process {pid} has exited, so its ancestry cannot be read")
+}
+
 /// Walk from `me` to its ancestors, nearest first, through `kinfo` (one
 /// kernel read; `Ok(None)` once the process has gone) and `argv` (an error
 /// is a hidden argv, or the end of the chain if the process has gone
 /// meanwhile). A read the kernel refuses is a refusal, never an empty
-/// ancestry.
+/// ancestry, and so is a `me` that has gone: its ancestry is unknown, not
+/// empty.
 pub(crate) fn walk(
     me: u32,
     kinfo: impl Fn(u32) -> std::io::Result<Option<Kinfo>>,
@@ -64,7 +71,7 @@ pub(crate) fn walk(
     };
     let mut found = vec![];
     let Some(mut info) = read(me)? else {
-        return Ok(found);
+        bail!("{}", gone(me));
     };
     // The process whose parent `info.ppid` is.
     let mut child = me;
@@ -375,12 +382,14 @@ pub(crate) fn ancestors_of(start: u32) -> Result<Vec<Ancestor>> {
             .ok()
     };
     let mut found = vec![];
-    let mut pid = start;
+    // The first link is `start`'s own: one that has gone has an unknown
+    // ancestry, never an empty one.
+    let mut next = parent(start).with_context(|| gone(start))?;
     for _ in 0..DEPTH {
-        match parent(pid) {
-            Some(next) if next > 1 => pid = next,
-            _ => break,
+        if next <= 1 {
+            break;
         }
+        let pid = next;
         // A process that exited since its child named it has no argv to
         // read; any other failure is not "no crew launch" and is reported.
         let argv = match std::fs::read(format!("/proc/{pid}/cmdline")) {
@@ -404,6 +413,10 @@ pub(crate) fn ancestors_of(start: u32) -> Result<Vec<Ancestor>> {
                     .collect(),
             ),
         });
+        match parent(pid) {
+            Some(parent) => next = parent,
+            None => break,
+        }
     }
     Ok(found)
 }
@@ -433,6 +446,7 @@ pub(crate) fn ancestors_of(start: u32) -> Result<Vec<Ancestor>> {
         };
         table.insert(pid, (parent, fields.map(str::to_owned).collect::<Vec<_>>()));
     }
+    ensure!(table.contains_key(&start), "{}", gone(start));
     let mut found = vec![];
     let mut pid = start;
     for _ in 0..DEPTH {

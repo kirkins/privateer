@@ -4,11 +4,12 @@
 //! is not the dispatcher's, and on macOS whatever it spawns inherits its
 //! sandbox. It writes the command into a `launch_requests` row instead and
 //! execs into `_launch-wait ID`, which keeps its pid and start time and puts
-//! the row's id in its argv. The home's resident dispatcher starts one
-//! `_launch-run ID` per row. That launcher finds the requester from outside
-//! the sandbox, checks that binding, resolves the requester's caller with the
-//! rule a direct call uses, and runs the same `dispatch` as that caller. The
-//! waiter prints the answer, or the error, as a direct call would.
+//! the row's id and a digest of its content in its argv. The home's resident
+//! dispatcher starts one `_launch-run ID` per row. That launcher finds the
+//! requester from outside the sandbox, checks that binding, resolves the
+//! requester's caller with the rule a direct call uses, checks that the
+//! requester is still the same process, and runs the same `dispatch` as that
+//! caller. The waiter prints the answer, or the error, as a direct call would.
 //!
 //! Choosing this path is not a security decision: the launcher decides who
 //! the caller is, from the kernel and the job records, never from the row.
@@ -18,8 +19,8 @@ use crate::store::{Caller, Store};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::ffi::OsString;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CString, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,7 +48,9 @@ pub const FORWARDED: &[&str] = &[
 const CLAIM_WINDOW_MS: i64 = 30_000;
 /// Requests a home holds before they are claimed or finished.
 const IN_FLIGHT: i64 = 16;
-/// Launchers a dispatcher runs at once for one home.
+/// Launchers a dispatcher runs at once for one home that have not yet
+/// claimed their request. One that claimed it carries out its command for as
+/// long as that takes and holds no slot: `IN_FLIGHT` bounds those.
 const LAUNCHERS: usize = 4;
 /// Finished requests are kept this long, and at most `KEEP_ROWS` of them.
 const KEEP_MS: i64 = 7 * 24 * 3600 * 1000;
@@ -269,6 +272,19 @@ fn load(conn: &Connection, id: &str) -> Result<Option<Row>> {
     }))
 }
 
+/// The digest a waiter's argv binds: the row's command, arguments, claim and
+/// directory as the requester recorded them. A row rewritten after that is
+/// no longer its waiter's request.
+fn digest(command: &str, args: &Value, claimed: &Value, cwd: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let content = json!([command, args, claimed, cwd]).to_string();
+    format!("{:x}", Sha256::digest(content.as_bytes()))
+}
+
+fn row_digest(row: &Row) -> String {
+    digest(&row.command, &row.args, &row.claimed, row.cwd.as_deref())
+}
+
 /// The ids a launch would draw for itself, drawn before the request so the
 /// work can be found by them whatever happens to the answer.
 fn fill_ids(command: &str, args: &mut Value) {
@@ -378,6 +394,8 @@ pub fn forward(
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|d| d.to_str().map(str::to_owned));
+    let claimed = claimed.to_json();
+    let bound = digest(command, &args, &claimed, cwd.as_deref());
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let in_flight: i64 = tx.query_row(
         "SELECT COUNT(*) FROM launch_requests WHERE state IN ('recorded','pending','claimed')",
@@ -396,7 +414,7 @@ pub fn forward(
             command,
             args.to_string(),
             requester.to_string(),
-            claimed.to_json().to_string(),
+            claimed.to_string(),
             cwd,
             now,
             now + CLAIM_WINDOW_MS
@@ -409,6 +427,7 @@ pub fn forward(
         .arg(&home)
         .arg("_launch-wait")
         .arg(&id)
+        .arg(&bound)
         .exec();
     let text = format!(
         "{command} was not started: could not wait for the dispatcher ({error}). No work was started, so retrying the same command is safe."
@@ -439,10 +458,10 @@ fn claim_window() -> i64 {
         .unwrap_or(CLAIM_WINDOW_MS)
 }
 
-/// `_launch-wait ID`: the requester after its exec. Binds the row to this
-/// process, waits a bounded time for a dispatcher to claim it, then for its
-/// outcome, which it returns as the command's answer or error.
-pub fn wait(home: &Path, id: &str) -> Result<Value> {
+/// `_launch-wait ID DIGEST`: the requester after its exec. Binds the row to
+/// this process, waits a bounded time for a dispatcher to claim it, then for
+/// its outcome, which it returns as the command's answer or error.
+pub fn wait(home: &Path, id: &str, bound: &str) -> Result<Value> {
     let store = Store::open(home)?;
     let conn = store.connection();
     ensure_table(conn)?;
@@ -452,6 +471,15 @@ pub fn wait(home: &Path, id: &str) -> Result<Value> {
         "launch request {id} belongs to another process"
     );
     let sandbox = Claimed::from_json(&row.claimed)?.sandbox;
+    if row_digest(&row) != bound {
+        let text = unconfirmed(
+            &row.command,
+            &format!("request {id} was changed after this process recorded it"),
+        );
+        if withdraw(conn, id, &text)? {
+            bail!("{text}");
+        }
+    }
     conn.execute(
         "UPDATE launch_requests SET state='pending' WHERE id=?1 AND state='recorded'",
         [id],
@@ -543,7 +571,7 @@ pub fn run(home: &Path, id: &str) -> Result<()> {
 
 fn carry_out(home: &Path, conn: &Connection, row: &Row, me: &str) -> Result<Carried> {
     let claimed = Claimed::from_json(&row.claimed)?;
-    let found = match identify::requester(&row.requester, home, &row.id) {
+    let found = match identify::requester(&row.requester, home, &row.id, &row_digest(row)) {
         Ok(found) => found,
         Err(error) => {
             return Ok(Carried::Refused(unconfirmed(
@@ -552,23 +580,37 @@ fn carry_out(home: &Path, conn: &Connection, row: &Row, me: &str) -> Result<Carr
             )));
         }
     };
+    #[cfg(feature = "test-launch-gap")]
+    test_gap(row, &found);
     // The command runs as a direct call from the requester would: with its
-    // environment, from its directory, on its registry.
+    // environment, from its directory, on its registry. All three come from
+    // the kernel's view of the requester, never from the row, but the
+    // registry, which only a flag chose.
     adopt_environment(&found.env);
-    if let Some(cwd) = row.cwd.as_deref().map(Path::new).filter(|d| d.is_dir()) {
-        let _ = std::env::set_current_dir(cwd);
-    } else {
-        let _ = std::env::set_current_dir(home);
-    }
+    heartbeat(home, &row.id, me);
+    let _ = std::env::set_current_dir(found.cwd.as_deref().unwrap_or(home));
     if let Some(fleet) = &claimed.fleet {
         crate::fleet::use_registry(fleet.clone())?;
     }
-    let caller = match crate::crew_scope::resolve_from(
+    // A requester that has gone is refused by the walk itself, and its
+    // `PRIVATEER_JOB` is the kernel's copy of its environment, now this
+    // process's own.
+    let resolved = crate::crew_scope::resolve_from(
         found.pid,
         Some(home),
         claimed.caller.clone(),
-        claimed.env_job.clone(),
-    ) {
+        crate::crew_scope::env_job(),
+    );
+    // The walk proves the requester's caller only if the requester is still
+    // that process: one that exited, or whose pid was reused, while it ran
+    // proves nothing, whatever the walk returned.
+    if let Err(error) = identify::ensure_still(&row.requester, &found) {
+        return Ok(Carried::Refused(unconfirmed(
+            &row.command,
+            &error.to_string(),
+        )));
+    }
+    let caller = match resolved {
         Ok(caller) => caller,
         Err(error) => return Ok(Carried::Refused(error.to_string())),
     };
@@ -592,7 +634,6 @@ fn carry_out(home: &Path, conn: &Connection, row: &Row, me: &str) -> Result<Carr
             )));
         }
     }
-    heartbeat(home, &row.id, me);
     store.audit(
         "launch.forwarded",
         &json!({"request": row.id, "command": row.command, "requester": found.pid,
@@ -623,23 +664,91 @@ fn contained(store: &Store, job: &str) -> Result<Option<&'static str>> {
     Ok(None)
 }
 
-/// Replace this process's environment with the requester's, less what
-/// describes its own sandbox.
+/// The requester's environment as `NAME=value` strings, less what describes
+/// its own sandbox. A name given twice keeps its first value, which `getenv`
+/// reads. Linear in its size.
+fn environment_block(env: &[(OsString, OsString)]) -> Vec<CString> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut seen = HashSet::with_capacity(env.len());
+    let mut block = Vec::with_capacity(env.len());
+    for (name, value) in env {
+        let bytes = name.as_bytes();
+        if bytes.is_empty()
+            || bytes.contains(&b'=')
+            || STRIPPED_ENV.iter().any(|s| s.as_bytes() == bytes)
+            || !seen.insert(bytes)
+        {
+            continue;
+        }
+        let mut entry = Vec::with_capacity(bytes.len() + value.len() + 1);
+        entry.extend_from_slice(bytes);
+        entry.push(b'=');
+        entry.extend_from_slice(value.as_bytes());
+        // An environment read from the kernel has no NUL inside an entry.
+        if let Ok(entry) = CString::new(entry) {
+            block.push(entry);
+        }
+    }
+    block
+}
+
+/// Replace this process's environment with `environment_block(env)` in one
+/// pass: the C library's `environ` is pointed at a new array, where `setenv`
+/// per variable would scan the environment each time. The array is never
+/// freed: a launcher adopts once.
 fn adopt_environment(env: &[(OsString, OsString)]) {
-    let current: Vec<OsString> = std::env::vars_os().map(|(name, _)| name).collect();
+    let mut block: Vec<*mut libc::c_char> = environment_block(env)
+        .into_iter()
+        .map(CString::into_raw)
+        .collect();
+    block.push(std::ptr::null_mut());
+    let block = Box::leak(block.into_boxed_slice()).as_mut_ptr();
     // SAFETY: a launcher is single-threaded until `heartbeat`, which starts
-    // after this; nothing else reads the environment meanwhile.
-    unsafe {
-        for name in current {
-            std::env::remove_var(name);
-        }
-        for (name, value) in env {
-            let text = name.to_string_lossy();
-            if name.is_empty() || text.contains('=') || STRIPPED_ENV.contains(&text.as_ref()) {
-                continue;
-            }
-            std::env::set_var(name, value);
-        }
+    // after this, so nothing reads or writes the environment meanwhile.
+    // `block` is a NULL-terminated array of NUL-terminated `NAME=value`
+    // strings that lives for the rest of the process, as `environ` must.
+    unsafe { *environ() = block };
+}
+
+/// The C library's `environ`, which `getenv`, `setenv` and the standard
+/// library's environment and process spawning all read.
+#[cfg(target_os = "macos")]
+fn environ() -> *mut *mut *mut libc::c_char {
+    // SAFETY: `_NSGetEnviron` has no preconditions.
+    unsafe { libc::_NSGetEnviron() }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn environ() -> *mut *mut *mut libc::c_char {
+    unsafe extern "C" {
+        static mut environ: *mut *mut libc::c_char;
+    }
+    &raw mut environ
+}
+
+/// Tests only: hold a launcher between identifying its requester and
+/// resolving its caller, the gap a requester that exits must not slip
+/// through. `PRIVATEER_TEST_LAUNCH_GAP` names a directory: a request whose
+/// `id` argument is J, while `J.hold` exists there, writes the requester's
+/// pid here to `J.identified` and waits until `J.hold` is gone, for at most
+/// 60 s.
+#[cfg(feature = "test-launch-gap")]
+fn test_gap(row: &Row, found: &identify::Found) {
+    let (Some(dir), Some(job)) = (
+        std::env::var_os("PRIVATEER_TEST_LAUNCH_GAP"),
+        row.args["id"].as_str(),
+    ) else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let hold = dir.join(format!("{job}.hold"));
+    if !hold.exists() {
+        return;
+    }
+    let _ = std::fs::write(dir.join(format!("{job}.identified")), found.pid.to_string());
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while hold.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -762,8 +871,15 @@ fn launcher_pass(home: &Path, conn: &Connection, launchers: &mut Launchers) -> R
             .collect::<rusqlite::Result<_>>()?
     };
     launchers.attempts.retain(|id, _| pending.contains(id));
+    // Only launchers that have not claimed yet hold a slot: four commands
+    // that block (`wait_for_capacity`) never starve a later `job.cancel`.
+    let mut unclaimed = launchers
+        .running
+        .keys()
+        .filter(|id| pending.contains(id))
+        .count();
     for id in pending {
-        if launchers.running.len() >= LAUNCHERS {
+        if unclaimed >= LAUNCHERS {
             break;
         }
         if launchers.running.contains_key(&id) {
@@ -790,6 +906,7 @@ fn launcher_pass(home: &Path, conn: &Connection, launchers: &mut Launchers) -> R
         *attempts += 1;
         let child = spawn_launcher(home, &id)?;
         launchers.running.insert(id, child);
+        unclaimed += 1;
     }
     Ok(())
 }

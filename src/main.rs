@@ -13,6 +13,7 @@ fn run() -> Result<()> {
     let mut command = None;
     let mut args = json!({});
     let mut internal_job = None;
+    let mut launch_digest: Option<String> = None;
     let mut positional: Vec<String> = vec![];
     let mut json_given = false;
     let mut file_given = false;
@@ -81,6 +82,10 @@ fn run() -> Result<()> {
             {
                 internal_job = Some(token)
             }
+            // A launch waiter's second token: the digest its request binds.
+            _ if command.as_deref() == Some("_launch-wait") && launch_digest.is_none() => {
+                launch_digest = Some(token)
+            }
             // Human commands take positional arguments and flags of their own.
             _ if command
                 .as_deref()
@@ -123,7 +128,8 @@ fn run() -> Result<()> {
         let home = home.context("--home is required")?;
         let id = internal_job.context("launch request ID is required")?;
         if command.as_deref() == Some("_launch-wait") {
-            let outcome = privateer::launch::wait(&home, &id)?;
+            let digest = launch_digest.context("launch request digest is required")?;
+            let outcome = privateer::launch::wait(&home, &id, &digest)?;
             println!("{}", serde_json::to_string(&outcome)?);
             return Ok(());
         }
