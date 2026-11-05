@@ -348,6 +348,24 @@ fn no_imports(conn: &Connection) -> Result<()> {
     }
     Ok(())
 }
+/// `decision.why` and `decision.question` are bounded by `mail.rs` (500 and
+/// 200 characters). Runtime-composed text must fit before anything is stored:
+/// a generation-one manifest with many sources used to refuse the card only
+/// after the pending record, audit row and owner guard were durable. Truncate
+/// on a character boundary; only this summary is bounded, while the card body
+/// and the stored record keep every source and its ships.
+fn card_text(text: String, max: usize) -> String {
+    debug_assert!(max > 0);
+    if text.chars().count() <= max {
+        return text;
+    }
+    let mut bounded: String = text.chars().take(max.saturating_sub(1)).collect();
+    bounded.push('…');
+    bounded
+}
+const DECISION_WHY_MAX: usize = 500;
+const DECISION_QUESTION_MAX: usize = 200;
+
 fn write_decision(conn: &Connection, p: &Proposal) -> Result<()> {
     let member = crate::fleet::members(conn)?
         .into_iter()
@@ -357,16 +375,51 @@ fn write_decision(conn: &Connection, p: &Proposal) -> Result<()> {
     if crate::mail::find(&store, &p.decision)?.is_some() {
         return Ok(());
     }
+    let owner = local_source(p, &p.manifest.owner_core)?.name.as_str();
+    let directions = p
+        .manifest
+        .sources
+        .iter()
+        .map(|s| {
+            format!(
+                "{} {} ({} ships)",
+                s.name,
+                s.intake_direction,
+                s.ships.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let source_ships = p
+        .manifest
+        .sources
+        .iter()
+        .map(|s| format!("{}: {}", s.name, s.ships.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let question = card_text(
+        format!("Place desk domain {} at {owner}?", p.manifest.domain),
+        DECISION_QUESTION_MAX,
+    );
+    let why = card_text(
+        format!(
+            "Generation {}; manifest {}. {} sources; owner {owner}. {directions}",
+            p.manifest.generation,
+            p.manifest_hash,
+            p.manifest.sources.len()
+        ),
+        DECISION_WHY_MAX,
+    );
     let mut payload = json!({"desk_placement":{"proposal_id":p.proposal_id,"manifest_hash":p.manifest_hash},
-        "decision":{"question":format!("Place desk domain {} at {}?",p.manifest.domain,local_source(p, &p.manifest.owner_core)?.name),
-        "why":format!("Generation 1; manifest {}. Sources and intake directions: {}",p.manifest_hash,serde_json::to_string(&p.manifest.sources)?),
+        "decision":{"question":question,
+        "why":why,
         "options":[{"id":"accept","label":"Accept placement","what_happens":"Install this exact generation-1 agreement on every participant. Pending bootstrap pauses legacy mail, away, digest and cursor service. Once certified, only the local owner resumes those independent legacy channels until migration; sources stay fenced with placement cards only. No desk subscriptions are exposed."},
         {"id":"reject","label":"Reject placement","what_happens":"Abort before certification; do not change the desk."}]}});
     crate::mail::typed_payload("decision", &mut payload)?;
     crate::mail::record_runtime(
         &store,
         &json!({"id":p.decision,"from":member.name,"to":"captain","kind":"decision",
-        "body":format!("Desk placement {}: {}",p.manifest.domain,serde_json::to_string(&p.manifest)?),"payload":payload,"urgency":"normal"}),
+        "body":format!("Desk placement {}: generation {}; manifest {}; owner {owner}; {directions}. Ships by source: {source_ships}.",p.manifest.domain,p.manifest.generation,p.manifest_hash),"payload":payload,"urgency":"normal"}),
     )?;
     Ok(())
 }
@@ -427,6 +480,7 @@ fn absorb_record(conn: &Connection, incoming: &Record) -> Result<()> {
             );
         }
     }
+    let mut staged_guard = false;
     if guard()?.is_none() {
         no_imports(conn)?;
         // Validate the existing coverage projection before reserving/fencing.
@@ -448,6 +502,7 @@ fn absorb_record(conn: &Connection, incoming: &Record) -> Result<()> {
             proposal: p.clone(),
             certificate: None,
         })?;
+        staged_guard = true;
     }
     let mut r = existing
         .into_iter()
@@ -530,6 +585,7 @@ fn absorb_record(conn: &Connection, incoming: &Record) -> Result<()> {
             accepted,
         });
     }
+    let mut card_written = false;
     if let Some(c) = &r.certificate {
         save_guard(&Guard {
             proposal: p.clone(),
@@ -561,12 +617,43 @@ fn absorb_record(conn: &Connection, incoming: &Record) -> Result<()> {
         tx.commit()?;
     } else {
         let new = !records(conn)?.iter().any(|old| old.proposal == *p);
-        save(conn, &r)?;
-        if new {
-            audit(conn, "desk.placement.proposed", p)?;
+        // The captain's card is part of staging: write it before the pending
+        // record and audit row become durable, so a refused card leaves no
+        // half-written proposal behind. Clear the owner guard this call saved
+        // too; a guard from an earlier staging stays with its record.
+        if id == p.manifest.coordinator {
+            if let Err(error) = write_decision(conn, p) {
+                if staged_guard {
+                    clear_pending_guard(p)
+                        .with_context(|| format!("decision card refused: {error:#}"))?;
+                }
+                return Err(error);
+            }
+            card_written = true;
+        }
+        let staged = (|| -> Result<()> {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            save(&tx, &r)?;
+            if new {
+                audit(&tx, "desk.placement.proposed", p)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = staged {
+            if staged_guard {
+                clear_pending_guard(p)
+                    .with_context(|| format!("pending record refused: {error:#}"))?;
+            }
+            return Err(error);
         }
     }
-    if id == p.manifest.coordinator {
+    // Commit/replay paths above do not stage a card, but a certified record
+    // whose card went missing (older failures) still gets one.
+    if id == p.manifest.coordinator && !card_written {
         write_decision(conn, p)?;
     }
     Ok(())
@@ -1523,5 +1610,25 @@ mod legacy_fence_tests {
         missing_certificate.certificate = guard.certificate;
         missing_certificate.proposal.manifest.incarnation = SOURCE.into();
         assert!(!legacy_owner(&record, &missing_certificate, OWNER));
+    }
+}
+
+#[cfg(test)]
+mod decision_card_text_tests {
+    use super::*;
+
+    #[test]
+    fn card_text_keeps_short_text_and_bounds_long_multibyte_text() {
+        assert_eq!(card_text("short".into(), 500), "short");
+        // A caption of two-byte characters must not split one, and the result
+        // must stay within the limit `mail.rs` counts in characters.
+        let long = "é".repeat(700);
+        let bounded = card_text(long, DECISION_WHY_MAX);
+        assert_eq!(bounded.chars().count(), DECISION_WHY_MAX);
+        assert!(bounded.ends_with('…'));
+        assert!(bounded.starts_with('é'));
+        let question = card_text("界".repeat(250), DECISION_QUESTION_MAX);
+        assert_eq!(question.chars().count(), DECISION_QUESTION_MAX);
+        assert!(question.ends_with('…'));
     }
 }

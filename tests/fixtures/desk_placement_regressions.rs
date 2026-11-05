@@ -173,3 +173,178 @@ fn reject_releases_a_pending_proposal_after_ship_create() {
         assert!(m.run(&["back"]).status.success());
     }
 }
+
+/// Give a machine `count` extra ships in its registry. Placement descriptions
+/// and manifests carry ship names only, so a test can model a large fleet
+/// without creating that many ship homes.
+fn add_ships(m: &Machine, prefix: &str, count: usize) {
+    let conn = Connection::open(m.registry()).unwrap();
+    for i in 0..count {
+        let name = format!("{prefix}-{i:02}");
+        conn.execute(
+            "INSERT INTO ships(name,home,created_by,created_ms) VALUES(?1,?2,'captain',0)",
+            rusqlite::params![name, m.root.join(&name).to_string_lossy()],
+        )
+        .unwrap();
+    }
+}
+
+/// A machine name long enough that six sources force the bounded card text to
+/// truncate. Links derive a peer named `machine-<name>`, which itself is
+/// bounded to 64 characters, so the name may use at most 56.
+fn long_machine_name(prefix: &str) -> String {
+    format!("{prefix}{}", "x".repeat(56 - prefix.len()))
+}
+
+#[test]
+fn a_large_manifest_still_writes_the_decision_card() {
+    let t = tempfile::tempdir().unwrap();
+    let names: Vec<String> = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+        .iter()
+        .map(|prefix| long_machine_name(prefix))
+        .collect();
+    let ships = ["survey", "relay", "lookout", "beacon", "harbor", "watch"];
+    let mut machines = vec![];
+    for ship in ships {
+        machines.push(Machine::new(t.path().join(ship), ship));
+    }
+    for i in 1..machines.len() {
+        machines[0].link(&names[0], &machines[i], &names[i]);
+    }
+    // Six sources of about twenty ships each plus long names make the old
+    // unbounded generation-one `why` (the whole source JSON) exceed 500
+    // characters by far, and the bounded summary still has to truncate.
+    for (i, m) in machines.iter().enumerate() {
+        add_ships(m, &format!("m{i}"), 20);
+    }
+    let a = &machines[0];
+    let sources: Vec<&str> = names.iter().map(String::as_str).collect();
+    proposal(a, &names[0], &sources);
+    let p = a.row()["proposal"].clone();
+    let manifest_sources = p["manifest"]["sources"].as_array().unwrap();
+    assert_eq!(manifest_sources.len(), 6);
+    for source in manifest_sources {
+        assert_eq!(source["ships"].as_array().unwrap().len(), 21, "{source}");
+    }
+    let card = a.ok("mail.show", json!({"id":p["decision"]}));
+    assert_eq!(card["kind"], "decision");
+    assert_eq!(card["state"], "open");
+    let why = card["payload"]["decision"]["why"].as_str().unwrap();
+    assert_eq!(why.chars().count(), 500, "why: {why}");
+    assert!(
+        why.ends_with('…'),
+        "truncated why must end on a whole character: {why}"
+    );
+    assert!(why.contains(p["manifest_hash"].as_str().unwrap()), "{why}");
+    assert!(why.contains("6 sources"), "{why}");
+    // The full source facts stay readable on the card body and the record.
+    let body = card["body"].as_str().unwrap();
+    assert!(body.contains(p["manifest_hash"].as_str().unwrap()), "{body}");
+    for name in &names {
+        assert!(body.contains(name.as_str()), "{body}");
+    }
+    for i in 0..machines.len() {
+        for j in [0, 19] {
+            let ship = format!("m{i}-{j:02}");
+            assert!(body.contains(&ship), "body must list ship {ship}: {body}");
+        }
+    }
+    assert_eq!(a.status()["records"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn a_refused_decision_card_leaves_no_pending_record_or_guard() {
+    let (_t, a, _b) = pair();
+    let store = Connection::open(a.root.join("survey/.privateer/privateer.sqlite")).unwrap();
+    store
+        .execute_batch(
+            "CREATE TRIGGER refuse_decision BEFORE INSERT ON mail
+             BEGIN SELECT RAISE(ABORT, 'forced decision refusal'); END;",
+        )
+        .unwrap();
+    drop(store);
+    a.fails(
+        "machine.desk.propose",
+        json!({"domain":"survey-domain","owner":"beta","sources":["alpha","beta"]}),
+        "forced decision refusal",
+    );
+    let status = a.status();
+    assert!(status["records"].as_array().unwrap().is_empty(), "{status}");
+    assert_eq!(status["restore_guard"], false, "{status}");
+    assert!(!a.registry().with_extension("desk-placement-owner.json").exists());
+    assert_eq!(a.audit_count("desk.placement.proposed"), 0);
+    // Drop the injected mail refusal so the retry can write the card and stage.
+    let store = Connection::open(a.root.join("survey/.privateer/privateer.sqlite")).unwrap();
+    store.execute_batch("DROP TRIGGER refuse_decision;").unwrap();
+    drop(store);
+    proposal(&a, "beta", &["alpha", "beta"]);
+    let p = a.row()["proposal"].clone();
+    let card = a.ok("mail.show", json!({"id":p["decision"]}));
+    assert_eq!(card["kind"], "decision");
+    assert_eq!(a.status()["restore_guard"], false);
+}
+
+/// A failure after the card is written must leave neither the staged owner
+/// guard nor a pending record behind, and a retry must stage normally.
+fn assert_failed_staging_leaves_no_guard_or_record(
+    a: &Machine,
+    trigger: &str,
+    table: &str,
+    condition: &str,
+    why: &str,
+) {
+    let store = Connection::open(a.registry()).unwrap();
+    store
+        .execute_batch(&format!(
+            "CREATE TRIGGER {trigger} BEFORE INSERT ON {table} {condition}
+             BEGIN SELECT RAISE(ABORT, '{why}'); END;"
+        ))
+        .unwrap();
+    drop(store);
+    a.fails(
+        "machine.desk.propose",
+        json!({"domain":"survey-domain","owner":"beta","sources":["alpha","beta"]}),
+        why,
+    );
+    let status = a.status();
+    assert!(status["records"].as_array().unwrap().is_empty(), "{status}");
+    assert_eq!(status["restore_guard"], false, "{status}");
+    assert!(!a.registry().with_extension("desk-placement-owner.json").exists());
+    assert_eq!(a.audit_count("desk.placement.proposed"), 0);
+    let store = Connection::open(a.registry()).unwrap();
+    store
+        .execute_batch(&format!("DROP TRIGGER {trigger};"))
+        .unwrap();
+    drop(store);
+    proposal(a, "beta", &["alpha", "beta"]);
+    let status = a.status();
+    assert_eq!(status["records"].as_array().unwrap().len(), 1, "{status}");
+    assert_eq!(status["restore_guard"], false, "{status}");
+    assert_eq!(a.audit_count("desk.placement.proposed"), 1);
+    let p = a.row()["proposal"].clone();
+    assert_eq!(a.ok("mail.show", json!({"id":p["decision"]}))["kind"], "decision");
+}
+
+#[test]
+fn a_refused_pending_record_clears_the_staged_guard_and_retries() {
+    let (_t, a, _b) = pair();
+    assert_failed_staging_leaves_no_guard_or_record(
+        &a,
+        "refuse_pending_record",
+        "desk_placement_record",
+        "",
+        "forced record refusal",
+    );
+}
+
+#[test]
+fn a_refused_audit_rolls_back_the_pending_record_and_guard() {
+    let (_t, a, _b) = pair();
+    assert_failed_staging_leaves_no_guard_or_record(
+        &a,
+        "refuse_pending_audit",
+        "desk_placement_audit",
+        "WHEN NEW.event='desk.placement.proposed'",
+        "forced audit refusal",
+    );
+}
