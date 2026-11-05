@@ -603,7 +603,7 @@ class BindingTests(unittest.TestCase):
         def control(record, command, args):
             if command == "ship.presence":
                 entered.set()
-                if not release.wait(5):
+                if not release.wait(SUBPROCESS_TIMEOUT):
                     raise TimeoutError("test did not release callback")
                 return {"attended": True, "lease": {"holder": record["holder"]}}
             return {"recorded": True}
@@ -977,7 +977,7 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
                 def control(record, command, args):
                     if command == "ship.presence":
                         entered.set()
-                        if not release.wait(5):
+                        if not release.wait(SUBPROCESS_TIMEOUT):
                             raise TimeoutError("test did not release report")
                         return {"attended": True, "lease": {"holder": record["holder"]}}
                     return {"recorded": True}
@@ -1055,7 +1055,7 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
                 self.assertEqual(saved["last_binding"], good)
                 if threading.get_ident() == first_thread[0]:
                     entered.set()
-                    if not release.wait(5):
+                    if not release.wait(SUBPROCESS_TIMEOUT):
                         raise TimeoutError("test did not release earlier callback")
                 return {"attended": True, "lease": {"holder": record["holder"]}}
             return {"recorded": True}
