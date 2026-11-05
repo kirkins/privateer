@@ -258,7 +258,7 @@ Examples can demonstrate a generic native harness or a gateway-constrained Pi ro
 
 `peer.put` stores a transport address: name, `ssh` or `local`, absolute executable/home paths, timeout, and response limit. A machine peer (`gateway: true`, optionally with the remote `fleet` registry) reaches another machine's gateway instead of one home, and a `collected` peer has no transport: its mail waits for the other machine to collect it. `peer.call` sends one correlated RPC request and returns the remote envelope. Each remote command enforces that remote home's workflow rules. Native SSH supplies host verification and authentication.
 
-#### Per-link SSH configuration and native Codex sandboxes
+### Per-link SSH configuration and native Codex sandboxes
 
 SSH endpoints optionally accept `ssh_config`, an absolute **local** path, in
 `peer.put` or `machine.add` JSON. The human CLI equivalent is:
