@@ -115,11 +115,50 @@ pub(crate) fn init(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// How a folder's `.git` entry reads to this module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DotGit {
+    /// No `.git` entry at all.
+    Absent,
+    /// A directory with no entries: Codex's Linux sandbox mounts an empty
+    /// read-only `.git` over each writable root that has none (#746). No real
+    /// repository looks like that, so it is not metadata.
+    Placeholder,
+    /// Real metadata: a non-empty directory, a `.git` file (a worktree's
+    /// `gitdir:` link), a symlink, or anything that cannot be read.
+    Git,
+}
+
+/// Classify `dir/.git` without following symlinks: only a plain directory
+/// holding at least one entry is metadata Git can work with. Anything that
+/// exists but cannot be read stays `Git`, so callers refuse it rather than
+/// guessing that a repository is absent.
+fn dot_git(dir: &Path) -> DotGit {
+    let path = dir.join(".git");
+    let meta = match path.symlink_metadata() {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return DotGit::Absent,
+        Err(_) => return DotGit::Git,
+    };
+    // `symlink_metadata` never follows: a `.git` symlink reads as a symlink
+    // here, so this refuses it instead of trusting what it points at.
+    if !meta.is_dir() {
+        return DotGit::Git;
+    }
+    match fs::read_dir(&path) {
+        Ok(mut entries) => match entries.next() {
+            None => DotGit::Placeholder,
+            Some(_) => DotGit::Git,
+        },
+        Err(_) => DotGit::Git,
+    }
+}
+
 /// Whether a job working in `dir` runs in a Treehouse workspace: some
-/// folder from it up holds a `.git`, even one Git cannot read.
+/// folder from it up holds real `.git` metadata. An empty placeholder reads
+/// exactly as if `.git` were absent; one Git cannot read still counts.
 pub(crate) fn in_git(dir: &Path) -> bool {
-    dir.ancestors()
-        .any(|p| p.join(".git").symlink_metadata().is_ok())
+    dir.ancestors().any(|p| dot_git(p) == DotGit::Git)
 }
 
 /// Whether a charter's jobs can land in a Git repository, and so need
@@ -135,7 +174,7 @@ pub(crate) fn git_backed(store: &Store, repo: &Path) -> Result<bool> {
         .flatten();
     if projects
         .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-        .any(|e| e.path().join(".git").symlink_metadata().is_ok())
+        .any(|e| dot_git(&e.path()) == DotGit::Git)
     {
         return Ok(true);
     }
@@ -193,11 +232,20 @@ fn git(lock: &Lock, repo: &Path, args: &[&str]) -> Result<String> {
         .arg(repo)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0");
-    Ok(
-        String::from_utf8(process::Operation::git(args).run(cmd, lock.0.as_raw_fd())?)?
-            .trim()
-            .to_owned(),
-    )
+    // Name the step and where it ran, so a refusal reads as
+    // "git rev-parse --show-toplevel in <cwd>" rather than only a helper
+    // category. The helper's text is kept whole, and its stderr still never
+    // leaves `process`.
+    let output = process::Operation::git(args)
+        .run(cmd, lock.0.as_raw_fd())
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "git {} in {} failed: {error}",
+                args.join(" "),
+                repo.display()
+            )
+        })?;
+    Ok(String::from_utf8(output)?.trim().to_owned())
 }
 fn treehouse(lock: &Lock, w: &Workspace, args: &[&str]) -> Result<Vec<u8>> {
     let mut cmd = Command::new(&w.binary);
@@ -752,5 +800,105 @@ pub(crate) fn validate_job(
             "job cwd changed outside charter before spawn"
         );
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod dot_git_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn temp() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    /// Undo a restrictive mode so the fixture can be removed.
+    fn readable(path: &Path) {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn an_absent_git_entry_is_not_a_repository() {
+        let root = temp();
+        assert_eq!(dot_git(root.path()), DotGit::Absent);
+        assert!(!in_git(root.path()));
+    }
+
+    #[test]
+    fn an_empty_git_placeholder_is_not_a_repository() {
+        // Codex's Linux sandbox mounts exactly this over a writable root that
+        // has no `.git` (#746): a directory with no entries, no HEAD.
+        let root = temp();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        assert_eq!(dot_git(root.path()), DotGit::Placeholder);
+        assert!(!in_git(root.path()));
+        // A job cwd below the placeholder reads as non-git too.
+        let child = root.path().join("work");
+        fs::create_dir(&child).unwrap();
+        assert!(!in_git(&child));
+    }
+
+    #[test]
+    fn a_non_empty_git_directory_is_a_repository() {
+        let root = temp();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::write(root.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(dot_git(root.path()), DotGit::Git);
+        assert!(in_git(root.path()));
+    }
+
+    #[test]
+    fn a_git_file_is_a_repository() {
+        // A linked worktree's `.git` is a `gitdir:` file, not a directory.
+        let root = temp();
+        fs::write(
+            root.path().join(".git"),
+            "gitdir: /elsewhere/.git/worktrees/x\n",
+        )
+        .unwrap();
+        assert_eq!(dot_git(root.path()), DotGit::Git);
+        assert!(in_git(root.path()));
+    }
+
+    #[test]
+    fn a_git_symlink_is_refused_rather_than_followed() {
+        let root = temp();
+        let real = root.path().join("real-git");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let dir = root.path().join("linked");
+        fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&real, dir.join(".git")).unwrap();
+        assert_eq!(dot_git(&dir), DotGit::Git);
+        assert!(in_git(&dir));
+    }
+
+    #[test]
+    fn an_unreadable_git_directory_is_refused() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root reads every directory");
+            return;
+        }
+        let root = temp();
+        let git_dir = root.path().join(".git");
+        fs::create_dir(&git_dir).unwrap();
+        fs::set_permissions(&git_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let classified = dot_git(root.path());
+        readable(&git_dir);
+        assert_eq!(classified, DotGit::Git);
+    }
+
+    #[test]
+    fn a_placeholder_does_not_hide_real_metadata_above_it() {
+        // The sandbox mounts its placeholder on the writable root only, so a
+        // non-git folder inside a real repository is still git-backed.
+        let root = temp();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::write(root.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let nested = root.path().join("projects/plain");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir(nested.join(".git")).unwrap();
+        assert_eq!(dot_git(&nested), DotGit::Placeholder);
+        assert!(in_git(&nested));
     }
 }
