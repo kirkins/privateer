@@ -56,12 +56,16 @@ DOOR = PLUGIN / "door.py"
 FAKE = ROOT / "tests" / "fake_live_voice_app_server.py"
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(PLUGIN))
+# The fake's control-log helper lives beside the fixtures; keep the plugin
+# modules first so no test file can shadow one of them.
+sys.path.insert(1, str(ROOT / "tests"))
 import door as door_module  # noqa: E402
 import pacing  # noqa: E402
 import request_log  # noqa: E402
 import rules  # noqa: E402
 import voice  # noqa: E402
 import web  # noqa: E402
+from live_voice_control import read_records  # noqa: E402
 
 OFFER = ("v=0\r\no=- 7 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\n"
          "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=sendrecv\r\n"
@@ -325,21 +329,12 @@ class Door:
         os.replace(path + ".tmp", path)
 
     def received(self, method=None):
-        try:
-            with open(os.path.join(self.ctl, "received.jsonl")) as f:
-                raw = f.read()
-        except OSError:
-            return []
         # The fake may be mid-write of a large line: only finished lines count.
-        lines = [json.loads(line) for line in raw.split("\n")[:-1]]
+        lines = read_records(os.path.join(self.ctl, "received.jsonl"))
         return [m for m in lines if method is None or m.get("method") == method]
 
     def started(self):
-        try:
-            with open(os.path.join(self.ctl, "started.jsonl")) as f:
-                return [json.loads(line) for line in f]
-        except OSError:
-            return []
+        return read_records(os.path.join(self.ctl, "started.jsonl"))
 
     def codex_calls(self):
         """Every argv the fake codex on PATH was run with, in order."""
