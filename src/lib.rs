@@ -345,6 +345,8 @@ pub(crate) fn check_dispatch(store: &Store, command: &str, args: &Value) -> Resu
 }
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
+    // A wake's first mate reached the runtime, whatever this command does.
+    activation::mark_contact(store);
     // Planning does subprocess/file I/O, so never hold the ledger lock across
     // it. If another launch wins admission first, automatic work replans on
     // the next route; named work keeps its precise refusal (or queue).

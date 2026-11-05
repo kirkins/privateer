@@ -227,6 +227,23 @@ pub fn init(store: &Store) -> Result<()> {
     if !has_reason {
         tx.execute_batch("ALTER TABLE wakes ADD COLUMN reason TEXT NOT NULL DEFAULT 'mail';")?;
     }
+    // Whether a headless wake's first mate reached the runtime at all
+    // (docs/design/codex-sandboxed-callers.md, (c)): only wakes recorded with
+    // `tracks_contact` are judged, so one an older release started is not.
+    for (column, kind) in [
+        ("tracks_contact", "INTEGER"),
+        ("contact_ms", "INTEGER"),
+        ("caller_refusal", "TEXT"),
+    ] {
+        let present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wakes') WHERE name=?1)",
+            [column],
+            |r| r.get(0),
+        )?;
+        if !present {
+            tx.execute_batch(&format!("ALTER TABLE wakes ADD COLUMN {column} {kind};"))?;
+        }
+    }
     // One native session per ship and focus, so topics never share a
     // conversation.
     tx.execute_batch(
@@ -916,30 +933,92 @@ fn settle(store: &mut Store) -> Result<Vec<Value>> {
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default();
         let reported = usage(&text);
-        let outcome = if status == "succeeded" {
-            "succeeded"
+        let unreached = if status == "succeeded" {
+            unreached(store, &wake)?
         } else {
-            "failed"
+            None
+        };
+        let (outcome, error) = match (status, unreached) {
+            ("succeeded", None) => ("succeeded", None),
+            ("succeeded", Some(error)) => ("failed", Some(error)),
+            _ => ("failed", Some(format!("first mate job {status}"))),
         };
         // The session binding and the wake's settlement commit together: a
         // crash between them would settle the wake again next pass and count
         // a resumed session's wake twice.
         let tx = store.write_transaction()?;
-        bind_session(store, &wake, outcome, &text)?;
+        // A first mate that could not reach the runtime was most likely kept
+        // from it by its environment (a sandbox), not by its conversation:
+        // its focus keeps the session it had.
+        if status != "succeeded" || outcome == "succeeded" {
+            bind_session(store, &wake, outcome, &text)?;
+        }
         store.connection().execute(
             "UPDATE wakes SET status=?2, finished_ms=?3, error=?4, usage=?5 WHERE id=?1",
             params![
                 wake,
                 outcome,
                 Store::now_ms(),
-                (outcome == "failed").then(|| format!("first mate job {status}")),
+                error,
                 reported.as_ref().map(Value::to_string)
             ],
         )?;
         tx.commit()?;
-        settled.push(json!({"wake": wake, "status": outcome, "usage": reported}));
+        let mut entry = json!({"wake": wake, "status": outcome, "usage": reported});
+        if outcome == "failed" {
+            entry["error"] = json!(error);
+        }
+        settled.push(entry);
     }
     Ok(settled)
+}
+
+/// Why a wake whose job succeeded did not reach the runtime: a tracked
+/// wake on which no Privateer command recorded contact. Every reply, ack
+/// and handoff note goes through the CLI, so such a wake answered nothing
+/// and must not cover its mail (docs/design/codex-sandboxed-callers.md).
+fn unreached(store: &Store, wake: &str) -> Result<Option<String>> {
+    let (tracked, contact, refusal): (Option<i64>, Option<i64>, Option<String>) =
+        store.connection().query_row(
+            "SELECT tracks_contact, contact_ms, caller_refusal FROM wakes WHERE id=?1",
+            [wake],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+    if tracked != Some(1) || contact.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(match refusal {
+        Some(refusal) => format!("first mate ran no Privateer command: {refusal}"),
+        None => "first mate ran no Privateer command".to_owned(),
+    }))
+}
+
+/// Record that the job this process runs in reached the runtime: the first
+/// command past caller resolution marks its running wake, whatever that
+/// command's outcome. One read per command, and a write only the first time.
+pub(crate) fn mark_contact(store: &Store) {
+    if let Some(job) = crate::crew_scope::job_id() {
+        let _ = contact(store, &job);
+    }
+}
+
+fn contact(store: &Store, job: &str) -> Result<()> {
+    {
+        let pending: bool = store.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM wakes WHERE job_id=?1 AND status='running'
+               AND contact_ms IS NULL)",
+            [job],
+            |r| r.get(0),
+        )?;
+        if pending {
+            store.connection().execute(
+                "UPDATE wakes SET contact_ms=?2 WHERE job_id=?1 AND status='running'
+                   AND contact_ms IS NULL",
+                params![job, Store::now_ms()],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// After a wake, keep the focus's native session for warm resumes: a
@@ -1423,9 +1502,9 @@ fn headless_wake(
     // Record the wake, with its job id, before the job exists: its outcome
     // must never be mistaken for crew and wake this first mate again.
     store.connection().execute(
-        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, focuses, harness, session_id, retry_of, cause, route, model_route, dispatcher_generation)
+        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, focuses, harness, session_id, retry_of, cause, route, model_route, dispatcher_generation, tracks_contact)
          VALUES(?1, ?2, ?3, ?4, ?1, ?5, 'running', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-           (SELECT value FROM metadata WHERE key='dispatcher_generation'))",
+           (SELECT value FROM metadata WHERE key='dispatcher_generation'), 1)",
         params![
             wake,
             name,
@@ -1894,6 +1973,135 @@ mod tests {
         let idle = wakes[2]["output_idle_ms"].as_i64().unwrap();
         assert!(idle >= 36 * 60 * 1000);
         assert_eq!(idle_duration(idle), "36m");
+    }
+
+    /// A headless wake on job `id` whose job ended `status`, with a warm
+    /// session for its focus; `tracked` as this release records wakes.
+    fn finished_wake(store: &Store, id: &str, status: &str, tracked: bool) {
+        crate::jobs::init(store).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO jobs(id, record) VALUES(?1, ?2)",
+                params![
+                    id,
+                    json!({"id": id, "status": status, "incarnation": "inc-1",
+                        "task_id": "survey", "command": ["true"]})
+                    .to_string()
+                ],
+            )
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms,
+                   focuses, harness, tracks_contact)
+                 VALUES(?1, 'gull', 'task:survey', 7, ?1, 'resume', 'running', 0,
+                   '[\"task:survey\"]', 'codex', ?2)",
+                params![id, tracked.then_some(1)],
+            )
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT OR REPLACE INTO sessions(ship, focus, harness, session_id, wakes, started_ms, last_turn_ms)
+                 VALUES('gull', 'task:survey', 'codex', 'thread-1', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn outcome(store: &Store, id: &str) -> (String, Option<String>) {
+        store
+            .connection()
+            .query_row("SELECT status, error FROM wakes WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+    }
+
+    fn sessions(store: &Store) -> i64 {
+        store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_wake_that_ran_no_privateer_command_settles_failed_and_keeps_its_session() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(&temp.path().join("home")).unwrap();
+        finished_wake(&store, "wake-silent", "succeeded", true);
+        store
+            .connection()
+            .execute(
+                "UPDATE wakes SET caller_refusal='this caller''s sandbox hides its process ancestry' WHERE id='wake-silent'",
+                [],
+            )
+            .unwrap();
+        let settled = settle(&mut store).unwrap();
+        assert_eq!(settled[0]["status"], "failed", "{settled:?}");
+        let (status, error) = outcome(&store, "wake-silent");
+        assert_eq!(status, "failed");
+        assert_eq!(
+            error.as_deref(),
+            Some(
+                "first mate ran no Privateer command: this caller's sandbox hides its process ancestry"
+            )
+        );
+        // Its mail is not covered: no succeeded wake reaches seq 7.
+        let covered: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COALESCE(MAX(through_seq), 0) FROM wakes WHERE status='succeeded'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(covered, 0);
+        assert_eq!(sessions(&store), 1, "the focus keeps its session");
+    }
+
+    #[test]
+    fn a_wake_whose_first_mate_reached_the_runtime_succeeds() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(&temp.path().join("home")).unwrap();
+        finished_wake(&store, "wake-heard", "succeeded", true);
+        contact(&store, "wake-heard").unwrap();
+        let first: Option<i64> = store
+            .connection()
+            .query_row(
+                "SELECT contact_ms FROM wakes WHERE id='wake-heard'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(first.is_some());
+        // A later command leaves the first contact as it is.
+        contact(&store, "wake-heard").unwrap();
+        settle(&mut store).unwrap();
+        assert_eq!(outcome(&store, "wake-heard"), ("succeeded".into(), None));
+        // A job no running wake has marks nothing.
+        contact(&store, "crew-job").unwrap();
+    }
+
+    #[test]
+    fn an_untracked_wake_and_a_failed_job_settle_as_before() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(&temp.path().join("home")).unwrap();
+        // Started by a release that did not mark contact.
+        finished_wake(&store, "wake-old", "succeeded", false);
+        settle(&mut store).unwrap();
+        assert_eq!(outcome(&store, "wake-old"), ("succeeded".into(), None));
+        assert_eq!(sessions(&store), 1);
+        // A failed job still fails its wake and drops the session.
+        finished_wake(&store, "wake-crashed", "failed", true);
+        settle(&mut store).unwrap();
+        assert_eq!(
+            outcome(&store, "wake-crashed"),
+            ("failed".into(), Some("first mate job failed".into()))
+        );
+        assert_eq!(sessions(&store), 0);
     }
 
     #[test]
