@@ -278,6 +278,52 @@ print(json.dumps(said))
 """
 
 
+def check_decision_send_failure() -> None:
+    """A refused button answer keeps the card actionable; a committed answer
+    clears it, including after a prior refusal of the same decision."""
+    probe = r'''
+import json, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import door, tg
+tg.STATE_DIR = tempfile.mkdtemp()
+calls, said, submissions = [], [], []
+class Runtime:
+    failure = "unknown correlated message ask"
+    def call(self, command, args):
+        submissions.append([command, args])
+        if self.failure:
+            raise RuntimeError(self.failure)
+        return {"ship":"remote", "mail":{"id":"answer"}}
+runtime = Runtime()
+d = door.Door({"door":"t"}, {"chat_id":"42", "allowed_user_ids":[7]}, runtime)
+d.say = lambda text, **kwargs: (said.append(text) or (99, ""))
+tg.api = lambda cfg, method, params, **kwargs: (calls.append(method) or ({}, ""))
+tg.write_state(door.DECISIONS, {"key":{"mail":"ask", "from":"remote",
+    "options":["East"], "ids":["east"]}})
+markup = {"inline_keyboard":[[{"text":"East", "callback_data":"d:key:0"}]]}
+tg.write_state(door.CARDS, {"ask":{"message_id":10, "markup":markup}})
+query = {"id":"q", "data":"d:key:0", "from":{"id":7},
+    "message":{"message_id":10, "chat":{"id":42}}}
+for failure in ["unknown correlated message ask", "Privateer did not answer send within 30s"]:
+    runtime.failure = failure
+    try:
+        d.on_callback(query)
+    except RuntimeError:
+        assert failure.startswith("Privateer did not answer")
+    assert tg.read_state(door.CARDS, {})["ask"]["markup"] == markup
+    assert "editMessageReplyMarkup" not in calls
+assert any("not sent" in text for text in said)
+runtime.failure = None
+d.on_callback(query)
+assert tg.read_state(door.CARDS, {})["ask"]["markup"] is None
+assert calls.count("editMessageReplyMarkup") == 1
+assert submissions[-1][1]["payload"]["answer"] == {"option_id":"east"}
+'''
+    out = subprocess.run([sys.executable, "-c", probe, str(ROOT / "plugins" / "telegram")],
+                         capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+
+
 def check_card_rendering() -> None:
     """Mail attached to a card this door does not know is shown, quietly;
     high urgency is never only a silent card edit; a digest is one message."""
@@ -1369,6 +1415,7 @@ def main() -> int:
     check_upgrade_command()
     check_yolo_replies()
     check_card_rendering()
+    check_decision_send_failure()
     check_privileged_text()
     check_struck_text()
     check_edited_replies()

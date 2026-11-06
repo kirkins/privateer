@@ -654,7 +654,7 @@ class Door:
             except OSError:
                 tg.log("telegram outcome=inbox_cleanup_failed")
 
-    def send(self, args: dict, msg_id, label: str) -> None:
+    def send(self, args: dict, msg_id, label: str) -> bool:
         """Mail from the captain, with what the chat sees about it."""
         if self.cfg.get("send_kind") in ("request", "notice") and args.get("kind") is None:
             args["kind"] = self.cfg["send_kind"]
@@ -667,7 +667,7 @@ class Door:
                 if not to:
                     self.outcome = "terminal_refused"
                     self.say("⚠️ not sent: no default recipient; use /to SHIP.", reply_to=msg_id, notice_key=-12)
-                    return
+                    return False
                 args["to"] = to
             identity = json.dumps([self.cfg.get("bot_id"), self.hello.get("door"),
                                    tg.chat_id(self.cfg), self.update_id])
@@ -677,7 +677,7 @@ class Door:
         args = dict(args)
         body = self.ingress(args.get("body") or "", msg_id)
         if body is None:
-            return
+            return False
         args["body"] = body
         if isinstance((args.get("payload") or {}).get("answer"), dict):
             payload = dict(args["payload"])
@@ -685,7 +685,7 @@ class Door:
             if "text" in answer:
                 text = self.ingress(answer["text"], msg_id)
                 if text is None:
-                    return
+                    return False
                 answer["text"] = text
             payload["answer"] = answer
             args["payload"] = payload
@@ -698,7 +698,7 @@ class Door:
             self.outcome = "terminal_file_put_refused"
             self.say("⚠️ not sent: could not store the full text. Please retry or send it as a document.",
                      reply_to=msg_id, notice_key=-11)
-            return
+            return False
         try:
             result = self.spool.result(self.update_id) if self.update_id is not None else None
             if result is None:
@@ -740,11 +740,11 @@ class Door:
                         raise
                     self.outcome = "terminal_refused"
                     self.say(f"⚠️ not sent: {again}", reply_to=msg_id, notice_key=-10)
-                    return
+                    return False
             else:
                 self.outcome = "terminal_refused"
                 self.say(f"⚠️ not sent: {e}", reply_to=msg_id, notice_key=-10)
-                return
+                return False
         if self.update_id is not None:
             self.spool.result(self.update_id, result)
         self.outcome = "mail_committed"
@@ -776,6 +776,7 @@ class Door:
                                   notice_key=-1000 - int(message_id or 0))
                 if self.update_id is None:
                     tg.log("telegram outcome=confirmation_failed" if err else "telegram outcome=confirmation_sent")
+        return True
 
     def react(self, msg_id) -> bool:
         if not msg_id or not self.cfg.get("confirm_with_reaction", True):
@@ -998,7 +999,8 @@ class Door:
             option_id = (decision.get("ids") or [None] * len(decision["options"]))[int(index)]
             if option_id:
                 args["payload"] = {"answer": {"option_id": option_id}}
-            self.send(args, msg.get("message_id"), f"decision: {choice}")
+            if not self.send(args, msg.get("message_id"), f"decision: {choice}"):
+                return
             # An answered card keeps no buttons, even when later mail edits it.
             cards = tg.read_state(CARDS, {})
             if decision["mail"] in cards:
