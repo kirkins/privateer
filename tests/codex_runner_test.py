@@ -1255,10 +1255,140 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("pre_spawn_fence", self.runner.ledger.read()["runner"])
         self.assertEqual(self.grant["spent"], spent + 1)
 
+    def test_tick_refresh_failure_keeps_refusal_and_publishes_receipts(self):
+        self.loaded_sessions = []
+        with self.assertRaises(runner.LoadedThreadRefused):
+            self.runner.dispatch()
+        refusal = self.runner.ledger.read()["runner"]["pre_spawn_fence"]
+        self.loaded_sessions = [self.session]
+        self.promoted()
+        original_call = self.daemon_class.call
+        for failure in ("unreachable", "missing thread", "null thread", "list thread"):
+            with self.subTest(failure=failure):
+                self.mutate(lambda v: v["sessions"][self.session]["intent"].pop("wake_reported", None))
+                self.calls.clear()
+                enters = 0
+                reads = 0
+                def enter(daemon):
+                    nonlocal enters
+                    enters += 1
+                    if enters == 2 and failure == "unreachable":
+                        raise ConnectionError("fixture daemon unreachable")
+                    return daemon
+                def call(daemon, method, params):
+                    nonlocal reads
+                    if method == "thread/read":
+                        reads += 1
+                        if reads == 2:
+                            return {"missing thread": {}, "null thread": {"thread": None},
+                                    "list thread": {"thread": []}}[failure]
+                    return original_call(daemon, method, params)
+                with patch.object(self.daemon_class, "__enter__", new=enter), \
+                        patch.object(self.daemon_class, "call", new=call), \
+                        patch.object(runner.subprocess, "Popen") as spawn:
+                    self.assertEqual(runner.tick(self.registry), {"tick": "held"})
+                    spawn.assert_not_called()
+                a = self.runner.ledger.read()["runner"]
+                self.assertEqual(a["pre_spawn_fence"], refusal)
+                self.assertEqual(a["pre_spawn_fence_events"], [refusal])
+                self.assertEqual(a["sticky"], [])
+                wakes = self.commands("wake.hosted")
+                self.assertEqual([w["trigger"] for w in wakes], ["mail", "delivery"])
+                self.assertTrue(wakes[-1]["paused"])
+                self.assertEqual(wakes[-1]["accepted_through"], 1)
+
+    def test_status_lookup_precedes_fence_and_refusal_spends_nothing(self):
+        self.settle_setup_offer()
+        self.prepare(1, reserve=False)
+        self.calls.clear()
+        spent = self.grant["spent"]
+        other = str(uuid.uuid4())
+        original = runner.control
+        def control(record, command, args):
+            result = original(record, command, args)
+            if command == "attended.codex.status":
+                # This full adapter lookup used to be AFTER the last fence.
+                self.loaded_sessions.append(other)
+                self.other_threads[other] = {"id": other, "cwd": self.record["cwd"]}
+            return result
+        with patch.object(runner, "control", side_effect=control), \
+                patch.object(runner.subprocess, "Popen") as spawn:
+            with self.assertRaises(runner.LoadedThreadRefused):
+                self.runner.dispatch()
+            spawn.assert_not_called()
+        value = self.runner.ledger.read()
+        self.assertNotIn("reservation", value["sessions"][self.session]["intent"])
+        self.assertEqual(value["runner"]["possibly_unattended_spent"], 0)
+        self.assertEqual(value["runner"]["sticky"], [])
+        self.assertEqual(self.grant["spent"], spent)
+        self.assertEqual(self.commands("attended.codex.reserve"), [])
+        self.assertEqual(len(self.commands("attended.codex.status")), 1)
+        self.assertEqual(runner.status_control(self.registry)["diagnostic"], runner.PRE_SPAWN_FENCE_REFUSED)
+
+    def test_reserve_uses_prefetched_grant_but_rust_still_authorizes_nonce(self):
+        self.settle_setup_offer()
+        self.prepare(1, reserve=False)
+        original_call = self.daemon_class.call
+        original_control = runner.control
+        fenced = False
+        def call(daemon, method, params):
+            nonlocal fenced
+            if method == "thread/loaded/list":
+                fenced = True
+            return original_call(daemon, method, params)
+        def control(record, command, args):
+            if command == "attended.codex.status":
+                self.assertFalse(fenced, "full status child between native fence and spawn")
+                result = original_control(record, command, args)
+                self.grant = {**self.grant, "grant_id": str(uuid.uuid4())}
+                return result  # Stale snapshots are not authority to spawn.
+            return original_control(record, command, args)
+        with patch.object(self.daemon_class, "call", new=call), \
+                patch.object(runner, "control", side_effect=control), \
+                patch.object(runner.subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(ValueError, "refused"):
+                self.runner.dispatch()
+            spawn.assert_not_called()
+        self.assertNotIn("reservation", self.runner.ledger.read()["sessions"][self.session]["intent"])
+
+    def test_malformed_pre_spawn_diagnostic_is_absent_and_does_not_crash_tick(self):
+        self.loaded_sessions = []
+        with self.assertRaises(runner.LoadedThreadRefused):
+            self.runner.dispatch()
+        valid = self.runner.ledger.read()["runner"]["pre_spawn_fence"]
+        self.loaded_sessions = [self.session]
+        self.settle_setup_offer()
+        malformed = [[], "bad", 1, {}, {**valid, "context": []},
+                     {**valid, "context": {"untrusted": "key"}},
+                     {**valid, "facts": None}, {**valid, "facts": {}},
+                     {**valid, "at_ms": "yesterday"}, {**valid, "diagnostic": "unknown"}]
+        for entry in malformed:
+            with self.subTest(entry=entry):
+                self.mutate(lambda v: v["runner"].update(pre_spawn_fence=entry))
+                self.assertIsNone(runner.status_control(self.registry)["pre_spawn_fence"])
+                self.assertFalse(self.runner.refresh_pre_spawn_fence(self.record))
+                self.assertEqual(runner.tick(self.registry), {"tick": "idle"})
+        self.assert_not_invoked()
+
+    def test_sticky_pause_never_advertises_transient_recovery(self):
+        self.loaded_sessions = []
+        with self.assertRaises(runner.LoadedThreadRefused):
+            self.runner.dispatch()
+        for sticky in runner.STICKY:
+            with self.subTest(sticky=sticky):
+                self.mutate(lambda v: v["runner"].update(sticky=[sticky]))
+                for report in (self.runner.report(self.session), runner.status_control(self.registry)):
+                    self.assertEqual(report["diagnostics"], [sticky])
+                    self.assertNotEqual(report["pause_reason"], runner.FENCE_CLEARS_WHEN)
+                    self.assertTrue(report["paused"])
+        self.assert_not_invoked()
+
     def test_pre_spawn_events_log_changes_only_and_are_bounded(self):
         self.loaded_sessions = []
         for count in range(20):
-            refusal = runner.LoadedThreadRefused("not loaded", {"loaded_count": count})
+            refusal = runner.LoadedThreadRefused("not loaded", {"loaded_count": count,
+                "threads_in_cwd": None, "bound_uuid_loaded": False, "cursor_state": "null",
+                "cwd_thread_is_bound": None})
             self.runner._record_pre_spawn_fence(self.record, refusal)
             self.runner._record_pre_spawn_fence(self.record, refusal)
         events = self.runner.ledger.read()["runner"]["pre_spawn_fence_events"]
