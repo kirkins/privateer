@@ -1,6 +1,7 @@
 use super::*;
 use crate::{mail::source, store::Store};
 use std::time::{Duration, Instant};
+mod premise_tests;
 mod review_tests;
 mod round3_tests;
 mod round4_tests;
