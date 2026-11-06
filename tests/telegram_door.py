@@ -306,14 +306,18 @@ query = {"id":"q", "data":"d:key:0", "from":{"id":7},
     "message":{"message_id":10, "chat":{"id":42}}}
 for failure in ["unknown correlated message ask", "Privateer did not answer send within 30s"]:
     runtime.failure = failure
+    calls.clear()
     try:
         d.on_callback(query)
     except RuntimeError:
         assert failure.startswith("Privateer did not answer")
     assert tg.read_state(door.CARDS, {})["ask"]["markup"] == markup
     assert not any(method == "editMessageReplyMarkup" for method, _ in calls)
+    assert not any(method == "answerCallbackQuery" and params.get("text")
+                   for method, params in calls), calls
 assert any("not sent" in text for text in said)
 runtime.failure = "mail already answered"
+calls.clear()
 before = len(submissions)
 d.on_callback(query)
 assert len(submissions) == before + 1, submissions[before:]
@@ -325,6 +329,16 @@ d.on_callback(query)
 assert tg.read_state(door.CARDS, {})["ask"]["markup"] is None
 assert sum(method == "editMessageReplyMarkup" for method, _ in calls) == 1
 assert submissions[-1][1]["payload"]["answer"] == {"option_id":"east"}
+tg.write_state(door.DECISIONS, {})
+calls.clear()
+d.on_callback(query)
+unknown_toast = [params.get("text") for method, params in calls
+                 if method == "answerCallbackQuery"]
+assert unknown_toast == ["Decision details are unavailable; reply to its message instead"], calls
+query["data"] = "d:malformed"
+calls.clear()
+d.on_callback(query)
+assert any(method == "answerCallbackQuery" for method, _ in calls), calls
 '''
     out = subprocess.run([sys.executable, "-c", probe, str(ROOT / "plugins" / "telegram")],
                          capture_output=True, text=True, cwd=ROOT)

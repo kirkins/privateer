@@ -184,15 +184,22 @@ def bot_identity(cfg):
     return True
 
 
+def fetch_bot_username(cfg):
+    """Refresh the optional username with one getMe request."""
+    bot, err = tg.api(cfg, "getMe", {}, retries=2)
+    if not err and isinstance(bot, dict) and isinstance(bot.get("username"), str):
+        cfg["bot_username"] = bot["username"]
+        return True
+    tg.log("telegram outcome=bot_username_unavailable")
+    return False
+
+
 def refresh_bot_username(cfg, stop):
     """Keep retrying getMe off the polling thread with capped backoff."""
     delay = 1
     while not stop.is_set():
-        bot, err = tg.api(cfg, "getMe", {}, retries=2)
-        if not err and isinstance(bot, dict) and isinstance(bot.get("username"), str):
-            cfg["bot_username"] = bot["username"]
+        if fetch_bot_username(cfg):
             return
-        tg.log("telegram outcome=bot_username_unavailable")
         if stop.wait(delay):
             return
         delay = min(delay * 2, 60)
@@ -221,6 +228,7 @@ class Door:
         self.spool = inbound.Spool()
         self.update_id = None
         self.outcome = "terminal_ignored"
+        self.last_send_refusal = ""
 
     def process_inbound(self) -> bool:
         """Own one durable update until handling or bounded terminal refusal."""
@@ -677,6 +685,7 @@ class Door:
 
     def send(self, args: dict, msg_id, label: str, fallback_on_answered: bool = True) -> bool:
         """Mail from the captain, with what the chat sees about it."""
+        self.last_send_refusal = ""
         if self.cfg.get("send_kind") in ("request", "notice") and args.get("kind") is None:
             args["kind"] = self.cfg["send_kind"]
         if self.update_id is not None:
@@ -734,6 +743,7 @@ class Door:
                     label = "stored text"
                     result = self.runtime.call("send", args)
         except RuntimeError as e:
+            self.last_send_refusal = str(e)
             if "Privateer did not answer" in str(e):
                 raise  # Uncertain commit: recover with the same mail id.
             if ("already answered" in str(e) and args.get("kind") == "reply"
@@ -758,6 +768,7 @@ class Door:
                 try:
                     result = self.runtime.call("send", args)
                 except RuntimeError as again:
+                    self.last_send_refusal = str(again)
                     if "Privateer did not answer" in str(again):
                         raise
                     self.outcome = "terminal_refused"
@@ -1018,30 +1029,44 @@ class Door:
                 "chat_id": tg.chat_id(self.cfg), "message_id": msg.get("message_id"),
                 "reply_markup": json.dumps({"inline_keyboard": []})}, retries=1)
         elif data.startswith("d:"):
-            _, key, index = data.split(":", 2)
-            decision = tg.read_state(DECISIONS, {}).get(key)
-            if not decision:
-                answer("Already answered")
-                return
-            choice = decision["options"][int(index)]
-            args = {"to": decision["from"], "kind": "reply", "correlation": decision["mail"],
-                    "body": choice}
-            option_id = (decision.get("ids") or [None] * len(decision["options"]))[int(index)]
-            if option_id:
-                args["payload"] = {"answer": {"option_id": option_id}}
-            if not self.send(args, msg.get("message_id"), f"decision: {choice}",
-                             fallback_on_answered=False):
-                answer("Already answered")
-                return
-            answer()
-            # An answered card keeps no buttons, even when later mail edits it.
-            cards = tg.read_state(CARDS, {})
-            if decision["mail"] in cards:
-                cards[decision["mail"]]["markup"] = None
-                tg.write_state(CARDS, cards)
-            tg.api(self.cfg, "editMessageReplyMarkup", {
-                "chat_id": tg.chat_id(self.cfg), "message_id": msg.get("message_id"),
-                "reply_markup": json.dumps({"inline_keyboard": []})}, retries=1)
+            toast = None
+            try:
+                parts = data.split(":", 2)
+                if len(parts) != 3 or not parts[2].isdecimal():
+                    toast = "Decision button is invalid; reply to its message instead"
+                    return
+                _, key, raw_index = parts
+                decision = tg.read_state(DECISIONS, {}).get(key)
+                if not decision:
+                    toast = "Decision details are unavailable; reply to its message instead"
+                    return
+                index = int(raw_index)
+                options = decision.get("options") or []
+                if index >= len(options):
+                    toast = "Decision button is invalid; reply to its message instead"
+                    return
+                choice = options[index]
+                args = {"to": decision["from"], "kind": "reply", "correlation": decision["mail"],
+                        "body": choice}
+                option_id = (decision.get("ids") or [None] * len(options))[index]
+                if option_id:
+                    args["payload"] = {"answer": {"option_id": option_id}}
+                sent = self.send(args, msg.get("message_id"), f"decision: {choice}",
+                                 fallback_on_answered=False)
+                if not sent:
+                    if "already answered" in self.last_send_refusal.lower():
+                        toast = "Already answered"
+                    return
+                # An answered card keeps no buttons, even when later mail edits it.
+                cards = tg.read_state(CARDS, {})
+                if decision["mail"] in cards:
+                    cards[decision["mail"]]["markup"] = None
+                    tg.write_state(CARDS, cards)
+                tg.api(self.cfg, "editMessageReplyMarkup", {
+                    "chat_id": tg.chat_id(self.cfg), "message_id": msg.get("message_id"),
+                    "reply_markup": json.dumps({"inline_keyboard": []})}, retries=1)
+            finally:
+                answer(toast)
 
     def command(self, text: str, msg_id) -> None:
         words = text.split(maxsplit=1)
@@ -1742,8 +1767,9 @@ def main() -> int:
     door = Door(hello, cfg, runtime)
     door.group = kind != "private"
     stop = threading.Event()
-    threading.Thread(target=refresh_bot_username, args=(cfg, stop),
-                     name="telegram-bot-identity", daemon=True).start()
+    if not fetch_bot_username(cfg):
+        threading.Thread(target=refresh_bot_username, args=(cfg, stop),
+                         name="telegram-bot-identity", daemon=True).start()
     threading.Thread(target=poll_telegram, args=(cfg, events, stop),
                      name="telegram-poller", daemon=True).start()
     tg.log(f"door {hello.get('door')} up; plain messages go to {door.recipient() or 'nobody yet'}")
