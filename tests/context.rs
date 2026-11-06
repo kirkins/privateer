@@ -42,6 +42,267 @@ fn put(s: &mut Store, focus: &str, body: &str) -> anyhow::Result<Value> {
     )
 }
 
+fn child(s: &mut Store, id: &str, parent: &str) {
+    dispatch(
+        s,
+        "task.create",
+        json!({"id":id,"parent":parent,"owner":"infra","title":"Bounded repair"}),
+    )
+    .unwrap();
+}
+
+fn read_parent(s: &mut Store) -> Value {
+    dispatch(
+        s,
+        "note.get",
+        json!({"ship":"infra","focus":"task:repair","versions":5}),
+    )
+    .unwrap()
+}
+
+#[test]
+fn parent_reads_show_finished_child_facts_without_rewriting_commentary() {
+    let (temp, mut s) = fleet();
+    child(&mut s, "index", "repair");
+    child(&mut s, "grandchild", "index");
+    child(&mut s, "unrelated", "cleanup");
+    put(&mut s, "task:repair", "The index child is still running.").unwrap();
+    put(
+        &mut s,
+        "thread:question",
+        "The index child is still running.",
+    )
+    .unwrap();
+    let before = read_parent(&mut s);
+    let started = before["child_status"]["children"][0]["status_changed_ms"]
+        .as_i64()
+        .unwrap();
+    // A recorded merge is evidence, not a claim inferred from prose or pins.
+    s.connection()
+        .execute(
+            "INSERT INTO merges(id,ship,task_id,repo,pr,head_sha,record,created_ms)
+         VALUES('merge-index','infra','index','example/repairs',42,'abc123',?1,?2)",
+            rusqlite::params![json!({"merge_sha":"def456"}).to_string(), Store::now_ms()],
+        )
+        .unwrap();
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"id":"index","actor":"infra","status":"done"}),
+    )
+    .unwrap();
+    let after = read_parent(&mut s);
+    let children = after["child_status"]["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1, "only direct children: {after}");
+    let finished = &children[0];
+    assert_eq!(finished["id"], "index");
+    assert_eq!(finished["status"], "done");
+    assert_eq!(finished["status_changed_approx"], false);
+    assert!(finished["status_changed_ms"].as_i64().unwrap() >= started);
+    assert_eq!(finished["closing_evidence"]["task_done"], true);
+    assert_eq!(finished["closing_evidence"]["merge"]["pr"], 42);
+    assert_eq!(finished["closing_evidence"]["merge"]["head_sha"], "abc123");
+    assert_eq!(finished["closing_evidence"]["merge"]["merge_sha"], "def456");
+    assert_eq!(after["notes"], before["notes"]);
+    let digest = dispatch(
+        &mut s,
+        "focus.digest",
+        json!({"ship":"infra","focus":"task:repair"}),
+    )
+    .unwrap();
+    assert_eq!(digest["child_status"], after["child_status"]);
+    let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap();
+    assert_eq!(
+        bearings["child_statuses"]["task:repair"],
+        after["child_status"]
+    );
+    assert!(bearings["text"].as_str().unwrap().contains("PR#42 def456"));
+    // Audit retention and a restart must not discard closing facts or times.
+    s.connection().execute("DELETE FROM audit", []).unwrap();
+    drop(s);
+    let mut s = Store::open(&temp.path().join("home")).unwrap();
+    assert_eq!(read_parent(&mut s), after);
+    let thread = dispatch(
+        &mut s,
+        "note.get",
+        json!({"ship":"infra","focus":"thread:question"}),
+    )
+    .unwrap();
+    assert_eq!(
+        thread["notes"][0]["body"],
+        "The index child is still running."
+    );
+    assert!(thread.get("child_status").is_none());
+}
+
+#[test]
+fn child_status_is_bounded_newest_first_and_does_not_leak_another_owners_parent() {
+    let (_temp, mut s) = fleet();
+    for n in 0..23 {
+        let id = format!("child-{n:02}");
+        child(&mut s, &id, "repair");
+        s.connection()
+            .execute(
+                "UPDATE tasks SET status_changed_ms=?2 WHERE id=?1",
+                rusqlite::params![id, n],
+            )
+            .unwrap();
+    }
+    let read = read_parent(&mut s);
+    let children = read["child_status"]["children"].as_array().unwrap();
+    assert_eq!(children.len(), 20);
+    assert_eq!(children[0]["id"], "child-22");
+    assert_eq!(children[19]["id"], "child-03");
+    assert_eq!(read["child_status"]["more"], true);
+    let foreign = dispatch(
+        &mut s,
+        "note.get",
+        json!({"ship":"apps","focus":"task:repair"}),
+    )
+    .unwrap();
+    assert!(foreign["child_status"].is_null());
+    let empty = dispatch(
+        &mut s,
+        "note.get",
+        json!({"ship":"infra","focus":"task:cleanup"}),
+    )
+    .unwrap();
+    assert_eq!(empty["child_status"], json!({"children":[],"more":false}));
+}
+
+#[test]
+fn child_status_times_track_real_edges_including_scheduler_writes() {
+    let (_temp, mut s) = fleet();
+    child(&mut s, "index", "repair");
+    s.connection()
+        .execute("UPDATE tasks SET status_changed_ms=1 WHERE id='index'", [])
+        .unwrap();
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"id":"index","actor":"infra","status":"open"}),
+    )
+    .unwrap();
+    dispatch(&mut s, "task.rank", json!({"id":"index","rank":1})).unwrap();
+    assert_eq!(
+        read_parent(&mut s)["child_status"]["children"][0]["status_changed_ms"],
+        1
+    );
+    // Scheduling changes status directly in the same transaction; every path
+    // must capture the edge, not just task.update.
+    s.connection()
+        .execute("UPDATE tasks SET status='blocked' WHERE id='index'", [])
+        .unwrap();
+    let read = read_parent(&mut s);
+    assert_eq!(read["child_status"]["children"][0]["status"], "blocked");
+    assert!(
+        read["child_status"]["children"][0]["status_changed_ms"]
+            .as_i64()
+            .unwrap()
+            > 1
+    );
+    assert_eq!(
+        read["child_status"]["children"][0]["closing_evidence"],
+        json!({"task_done":false,"merge":null})
+    );
+}
+
+#[test]
+fn legacy_child_times_are_recovered_once_without_inventing_missing_history() {
+    let (temp, mut s) = fleet();
+    child(&mut s, "known", "repair");
+    child(&mut s, "unknown", "repair");
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"id":"known","actor":"infra","status":"blocked"}),
+    )
+    .unwrap();
+    // Include repeated same-status updates and unrelated audit traffic.
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"id":"known","actor":"infra","status":"blocked"}),
+    )
+    .unwrap();
+    s.connection().execute_batch(
+        "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5000)
+         INSERT INTO audit(time_ms,kind,payload) SELECT x,'unrelated','{}' FROM n;
+         DELETE FROM audit WHERE json_extract(payload,'$.id')='unknown';
+         UPDATE audit SET time_ms=1234 WHERE kind='task.update' AND json_extract(payload,'$.id')='known';
+         DROP TRIGGER task_status_created; DROP TRIGGER task_status_changed;
+         DROP INDEX tasks_parent_status_time; ALTER TABLE tasks DROP COLUMN status_changed_ms;
+         ALTER TABLE tasks DROP COLUMN status_changed_approx;"
+    ).unwrap();
+    drop(s);
+    let mut s = Store::open(&temp.path().join("home")).unwrap();
+    let read = read_parent(&mut s);
+    assert_eq!(read["child_status"]["children"][0]["id"], "known");
+    assert_eq!(
+        read["child_status"]["children"][0]["status_changed_ms"],
+        1234
+    );
+    assert!(read["child_status"]["children"][1]["status_changed_ms"].is_null());
+    assert_eq!(
+        read["child_status"]["children"][0]["status_changed_approx"],
+        true
+    );
+    // A same-status audit update need not be a real edge; the recovered time
+    // must remain visibly approximate until a new, observed transition.
+    let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap();
+    assert!(bearings["text"].as_str().unwrap().contains("~1970-"));
+    s.connection().execute("DELETE FROM audit", []).unwrap();
+    drop(s);
+    let mut s = Store::open(&temp.path().join("home")).unwrap();
+    assert_eq!(read_parent(&mut s), read);
+    s.connection()
+        .execute("UPDATE tasks SET status='blocked' WHERE id='known'", [])
+        .unwrap();
+    assert_eq!(
+        read_parent(&mut s)["child_status"]["children"][0]["status_changed_approx"],
+        true
+    );
+    s.connection()
+        .execute("UPDATE tasks SET status='open' WHERE id='known'", [])
+        .unwrap();
+    assert_eq!(
+        read_parent(&mut s)["child_status"]["children"][0]["status_changed_approx"],
+        false
+    );
+}
+
+#[test]
+fn bearings_marks_children_omitted_by_the_shared_budget() {
+    let (_temp, mut s) = fleet();
+    // The first parent fills the budget exactly; another parent is omitted.
+    for n in 0..20 {
+        child(&mut s, &format!("child-{n}"), "cleanup");
+    }
+    child(&mut s, "last-child", "repair");
+    s.connection()
+        .execute(
+            "UPDATE tasks SET status='done' WHERE parent IS NOT NULL",
+            [],
+        )
+        .unwrap();
+    let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap();
+    let statuses = bearings["child_statuses"].as_object().unwrap();
+    assert_eq!(
+        statuses
+            .values()
+            .map(|v| v["children"].as_array().unwrap().len())
+            .sum::<usize>(),
+        20
+    );
+    assert_eq!(bearings["child_statuses_more"], true);
+    assert!(
+        bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains("More child status omitted")
+    );
+}
+
 #[test]
 fn notes_replace_each_other_and_keep_only_recent_versions() {
     let (_temp, mut s) = fleet();
@@ -900,6 +1161,10 @@ fn bearings_name_open_tasks_with_no_update_for_the_ships_days_oldest_first() {
         ),
         "{text}"
     );
+    let stale_warning = text
+        .lines()
+        .find(|line| line.contains("open tasks have had no update"))
+        .unwrap();
     for other in [
         "finished (",
         "deferred (",
@@ -908,7 +1173,7 @@ fn bearings_name_open_tasks_with_no_update_for_the_ships_days_oldest_first() {
         "repair (",
         "cleanup (",
     ] {
-        assert!(!text.contains(other), "{other}: {text}");
+        assert!(!stale_warning.contains(other), "{other}: {text}");
     }
     assert_eq!(bearings["stale_tasks"], 2);
     // The threshold is the ship's `first_mate.stale_task_days`.

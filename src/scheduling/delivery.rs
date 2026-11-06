@@ -190,7 +190,7 @@ fn claim(store: &Store, ship: &str, holder: Option<&str>, mode: &str) -> Result<
     Ok(None)
 }
 
-fn prompt(work: &Scheduled, attention: &Value) -> String {
+fn prompt(store: &Store, work: &Scheduled, attention: &Value) -> Result<String> {
     // Only state a reading we actually measured; a headless handoff has none.
     let mut attention = crate::attention::line(attention)
         .map(|line| format!("{line}\n"))
@@ -198,7 +198,12 @@ fn prompt(work: &Scheduled, attention: &Value) -> String {
     if let Some(resumed_by) = &work.resumed_by {
         attention = format!("Resumed: {resumed_by}\n{attention}");
     }
-    format!(
+    attention.push_str(&crate::context::child_status_text(
+        store,
+        &work.owner,
+        &format!("task:{}", work.task_id),
+    )?);
+    Ok(format!(
         "Scheduled work on task {} (revision {}). Offer {}.\n{}Prepared assignment:\n{}\n\nYou coordinate this task under its existing charter. Start a concrete step, delegate prepared child work, or complete the task with verified evidence. For a wait use task.defer with id, offer_id and wait {{kind: time|attention|task|request|remote|manual, reason, until_ms or ref}}. A prose note does not schedule resumption. Record your result in the task's note. Include work_offer: \"{}\" on agent.start, job.start, or errand.start for work under this task. Do not enqueue this task again while its claim or payload is live.\n",
         work.task_id,
         work.revision,
@@ -206,7 +211,7 @@ fn prompt(work: &Scheduled, attention: &Value) -> String {
         attention,
         work.brief,
         work.offer_id.as_deref().unwrap_or("")
-    )
+    ))
 }
 
 fn lease(store: &Store, args: &Value) -> Result<(String, String)> {
@@ -328,7 +333,7 @@ pub(super) fn poll(store: &Store, args: &Value) -> Result<Value> {
     let offered = claim(store, &ship, Some(&holder), mode)?;
     Ok(match offered {
         Some(work) if mode == "hosted" => {
-            json!({"offer":{"id":work.offer_id,"task_id":work.task_id,"revision":work.revision,"prompt":prompt(&work, &attention)},"state":"offered"})
+            json!({"offer":{"id":work.offer_id,"task_id":work.task_id,"revision":work.revision,"prompt":prompt(store, &work, &attention)?},"state":"offered"})
         }
         Some(work) => {
             json!({"offer":null,"state":"focused_handoff","task_id":work.task_id,"offer_id":work.offer_id})
@@ -452,7 +457,7 @@ fn start_headless(store: &mut Store, work: &mut Scheduled) -> Result<()> {
             profile.as_object_mut().unwrap().remove("config");
             profile.as_object_mut().unwrap().remove("tool_bundles");
         }
-        let mut args = json!({"id":id,"work_offer":id,"task_id":work.task_id,"manifest":profile["manifest"],"options":profile["options"],"wake":prompt(work, &Value::Null)});
+        let mut args = json!({"id":id,"work_offer":id,"task_id":work.task_id,"manifest":profile["manifest"],"options":profile["options"],"wake":prompt(store, work, &Value::Null)?});
         for key in ["tool_bundles", "config"] {
             if let Some(value) = profile.get(key) {
                 args[key] = value.clone();

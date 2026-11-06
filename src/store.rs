@@ -51,6 +51,21 @@ impl std::fmt::Display for InactiveAuthority {
 }
 impl std::error::Error for InactiveAuthority {}
 
+// Materialize the grouped history once, then join by task identity and current
+// status. A correlated audit lookup here holds the migration's write lock for
+// O(tasks * audit) work and can outlast concurrent openers' busy timeout.
+const RECOVER_TASK_STATUS_TIMES: &str = "
+    WITH history AS MATERIALIZED (
+      SELECT json_extract(payload,'$.id') AS id,
+        CASE kind WHEN 'task.create' THEN 'open'
+          ELSE json_extract(payload,'$.status') END AS status,
+        MAX(time_ms) AS time_ms
+      FROM audit WHERE kind IN ('task.create','task.update')
+      GROUP BY 1, 2
+    )
+    UPDATE tasks SET status_changed_ms=history.time_ms, status_changed_approx=1
+      FROM history WHERE tasks.id=history.id AND tasks.status=history.status;";
+
 pub struct Store {
     home: PathBuf,
     connection: Connection,
@@ -268,6 +283,7 @@ impl Store {
             &connection,
             rusqlite::TransactionBehavior::Immediate,
         )?;
+        let mut recover_status_times = false;
         for (table, column, declaration) in [
             ("approvals", "approver", "TEXT"),
             ("approvals", "expires_ms", "INTEGER"),
@@ -276,6 +292,13 @@ impl Store {
             ("events", "time_ms", "INTEGER"),
             // A ship's backlog order: open tasks with a rank start first.
             ("tasks", "rank", "INTEGER"),
+            // Durable status time: audit history can be pruned independently.
+            ("tasks", "status_changed_ms", "INTEGER"),
+            (
+                "tasks",
+                "status_changed_approx",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
             // The ships a task is shared with, as JSON: empty (NULL) unless the
             // owner sets it, so nothing becomes visible on upgrade.
             ("tasks", "shared_with", "TEXT"),
@@ -292,7 +315,21 @@ impl Store {
                 migrate.execute_batch(&format!(
                     "ALTER TABLE {table} ADD COLUMN {column} {declaration};"
                 ))?;
+                if table == "tasks" && column == "status_changed_ms" {
+                    recover_status_times = true;
+                }
+                if table == "tasks" && column == "status_changed_approx" {
+                    // Upgrade the previous trigger to clear the legacy marker
+                    // on the next real status edge.
+                    migrate.execute_batch("DROP TRIGGER IF EXISTS task_status_changed;")?;
+                }
             }
+        }
+        if recover_status_times {
+            // Same-status updates are audited and old scheduler edges were
+            // not, so recovered times are approximate. Pruned history stays
+            // null; no upgrade-time timestamp is invented.
+            migrate.execute_batch(RECOVER_TASK_STATUS_TIMES)?;
         }
         // A block card's tap records an approval with source 'block', which
         // the table's first check refused. SQLite cannot change a check, so
@@ -320,7 +357,23 @@ impl Store {
         // `fleet.snapshot` finds a ship's open tasks by owner and status.
         migrate.execute_batch(
             "CREATE INDEX IF NOT EXISTS event_recipient ON events(json_extract(payload,'$.to'),seq) WHERE kind='message';
-             CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(owner, status);",
+             CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(owner, status);
+             CREATE INDEX IF NOT EXISTS tasks_parent_status_time ON tasks(parent, status_changed_ms DESC, id);
+             -- Status changes also come from scheduling, not just task.update.
+             -- Capture every real edge atomically; same-status writes and
+             -- custody/rank changes must not make a child look newly changed.
+             -- Use SQLite's wall clock so external SQL writers also work; unlike
+             -- Store::now_ms this clock cannot use the test-only thread freeze.
+             CREATE TRIGGER IF NOT EXISTS task_status_created AFTER INSERT ON tasks
+             WHEN NEW.status_changed_ms IS NULL BEGIN
+               UPDATE tasks SET status_changed_ms=CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)
+                 WHERE id=NEW.id;
+             END;
+             CREATE TRIGGER IF NOT EXISTS task_status_changed AFTER UPDATE OF status ON tasks
+             WHEN NEW.status<>OLD.status BEGIN
+               UPDATE tasks SET status_changed_ms=CAST((julianday('now')-2440587.5)*86400000 AS INTEGER),
+                 status_changed_approx=0 WHERE id=NEW.id;
+             END;",
         )?;
         // Keep receipts on the existing approval row. An extra table (and its
         // primary-key index) increases schema-load work on every fresh SQLite
@@ -623,4 +676,78 @@ pub fn required<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
         .and_then(Value::as_str)
         .filter(|v| !v.is_empty())
         .ok_or_else(|| anyhow::anyhow!("{name} is required"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_status_recovery_groups_audit_once_before_joining_tasks() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE tasks(id TEXT PRIMARY KEY,status TEXT,status_changed_ms INTEGER,
+               status_changed_approx INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE audit(seq INTEGER PRIMARY KEY,time_ms INTEGER,kind TEXT,payload TEXT);
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5000)
+             INSERT INTO audit(time_ms,kind,payload) SELECT x,'mail.send','{}' FROM n;
+             INSERT INTO tasks(id,status) VALUES('a','done'),('b','open'),('c','running'),('pruned','done');
+             INSERT INTO audit(time_ms,kind,payload) VALUES
+               (100,'task.create','{\"id\":\"b\"}'),
+               (101,'task.update','{\"id\":\"a\",\"status\":\"done\"}'),
+               (102,'task.update','{\"id\":\"a\",\"status\":\"done\"}'),
+               (103,'task.update','{\"id\":\"a\",\"status\":\"open\"}'),
+               (104,'task.update','{\"id\":\"c\",\"status\":\"open\"}');"
+        ).unwrap();
+        let plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {RECOVER_TASK_STATUS_TIMES}"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            plan.iter()
+                .filter(|line| line.contains("SCAN audit"))
+                .count(),
+            1,
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().any(|line| line.contains("MATERIALIZE history")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.contains("CORRELATED")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("SEARCH tasks USING INDEX")),
+            "{plan:?}"
+        );
+        connection.execute_batch(RECOVER_TASK_STATUS_TIMES).unwrap();
+        let rows = connection
+            .prepare("SELECT id,status_changed_ms,status_changed_approx FROM tasks ORDER BY id")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("a".into(), Some(102), true),
+                ("b".into(), Some(100), true),
+                ("c".into(), None, false),
+                ("pruned".into(), None, false),
+            ]
+        );
+    }
 }

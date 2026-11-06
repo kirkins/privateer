@@ -76,7 +76,8 @@ pub fn init(store: &Store) -> Result<()> {
          CREATE TABLE IF NOT EXISTS merges(id TEXT PRIMARY KEY, ship TEXT NOT NULL,
            task_id TEXT NOT NULL, repo TEXT NOT NULL, pr INTEGER NOT NULL,
            head_sha TEXT NOT NULL, record TEXT NOT NULL, created_ms INTEGER NOT NULL);
-         CREATE INDEX IF NOT EXISTS merge_pr ON merges(repo, pr, created_ms);",
+         CREATE INDEX IF NOT EXISTS merge_pr ON merges(repo, pr, created_ms);
+         CREATE INDEX IF NOT EXISTS merge_task ON merges(task_id, created_ms DESC, id);",
     )?;
     // Checked and added under the write lock so concurrent opens cannot both
     // add it. A review is `gate` (review.start) or `errand` (errand.start).

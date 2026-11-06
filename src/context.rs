@@ -229,10 +229,116 @@ fn note_get(store: &Store, args: &Value) -> Result<Value> {
         json!({"ship": ship, "focus": focus, "notes": notes, "pins": pins(store, ship, focus)?});
     // Crew read their task's note; its assignment comes with it.
     if let Some(("task", id)) = focus.split_once(':') {
+        out["child_status"] = child_status(store, ship, focus)?.unwrap_or(Value::Null);
         out["assignment"] = current_note(store, ship, &format!("assignment:{id}"))?
             .map_or(Value::Null, |note| note["body"].clone());
     }
     Ok(out)
+}
+
+/// Current direct children, independent of commentary in the parent's note.
+/// Only the parent's owner can read this projection; a handed-off child's
+/// status remains visible through its parent, not its private notes or logs.
+/// Unknown legacy status times stay null rather than claiming a fresh change.
+pub(crate) fn child_status(store: &Store, ship: &str, focus: &str) -> Result<Option<Value>> {
+    child_status_limit(store, ship, focus, 20)
+}
+
+fn child_status_limit(
+    store: &Store,
+    ship: &str,
+    focus: &str,
+    limit: usize,
+) -> Result<Option<Value>> {
+    let Some(id) = focus.strip_prefix("task:") else {
+        return Ok(None);
+    };
+    if !store.task(id).is_ok_and(|task| task["owner"] == ship) {
+        return Ok(None);
+    }
+    let mut statement = store.connection().prepare(
+        "SELECT id, status, status_changed_ms, status_changed_approx FROM tasks WHERE parent=?1
+         ORDER BY status_changed_ms DESC, id LIMIT ?2",
+    )?;
+    let mut children = statement
+        .query_map(params![id, limit as i64 + 1], |r| {
+            Ok(
+                json!({"id": r.get::<_, String>(0)?, "status": r.get::<_, String>(1)?,
+                "status_changed_ms": r.get::<_, Option<i64>>(2)?,
+                "status_changed_approx": r.get::<_, bool>(3)?}),
+            )
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let more = children.len() > limit;
+    children.truncate(limit);
+    for child in &mut children {
+        let id = child["id"].as_str().unwrap_or_default();
+        // Project just closing facts, never review commentary or launch args.
+        let merge = store
+            .connection()
+            .query_row(
+                "SELECT repo, pr, head_sha, json_extract(record,'$.merge_sha'), created_ms
+             FROM merges WHERE task_id=?1 ORDER BY created_ms DESC, id LIMIT 1",
+                [id],
+                |r| {
+                    Ok(
+                        json!({"repo": r.get::<_, String>(0)?, "pr": r.get::<_, i64>(1)?,
+                "head_sha": r.get::<_, String>(2)?, "merge_sha": r.get::<_, Option<String>>(3)?,
+                "created_ms": r.get::<_, i64>(4)?}),
+                    )
+                },
+            )
+            .optional()?;
+        child["closing_evidence"] = json!({"task_done": child["status"] == "done", "merge": merge});
+    }
+    Ok(Some(json!({"children": children, "more": more})))
+}
+
+/// Fresh facts ride even a warm wake; prose is commentary, never repaired.
+pub(crate) fn child_status_text(store: &Store, ship: &str, focus: &str) -> Result<String> {
+    Ok(child_status(store, ship, focus)?
+        .map(|status| render_child_status(focus, &status))
+        .unwrap_or_default())
+}
+
+fn render_child_status(focus: &str, status: &Value) -> String {
+    let Some(children) = status["children"].as_array().filter(|c| !c.is_empty()) else {
+        return String::new();
+    };
+    let mut text = format!("Direct children of {focus} (facts; notes are commentary):\n");
+    for child in children {
+        let time = child["status_changed_ms"].as_i64().map_or_else(
+            || "unknown".to_owned(),
+            |ms| {
+                format!(
+                    "{}{}",
+                    if child["status_changed_approx"] == true {
+                        "~"
+                    } else {
+                        ""
+                    },
+                    crate::routes::utc_time(ms)
+                )
+            },
+        );
+        let merge = &child["closing_evidence"]["merge"];
+        let evidence = merge["pr"].as_i64().map_or_else(String::new, |pr| {
+            let sha = merge["merge_sha"]
+                .as_str()
+                .or_else(|| merge["head_sha"].as_str())
+                .unwrap_or("");
+            format!(" PR#{pr} {}", clip(sha, 12))
+        });
+        text.push_str(&format!(
+            "- {} [{}] {time}{evidence}\n",
+            child["id"].as_str().unwrap_or(""),
+            child["status"].as_str().unwrap_or("")
+        ));
+    }
+    if status["more"] == true {
+        text.push_str("...more children; read note.get for this task.\n");
+    }
+    text
 }
 
 /// A focus's pinned facts, by key.
@@ -365,6 +471,28 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             ))
         },
     )?;
+    // Hosted first mates read bearings instead of the headless wake prompt.
+    // Match its bounded open-task list, including finished children.
+    let mut parents = store.connection().prepare(&format!(
+        "SELECT id FROM tasks WHERE owner=?1 AND status NOT IN ('done','cancelled')
+         ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'blocked' THEN 1 ELSE 2 END, {BACKLOG_ORDER} LIMIT 20"
+    ))?;
+    let parent_ids = parents
+        .query_map([ship], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut child_statuses = serde_json::Map::new();
+    let mut remaining = 20;
+    let mut child_statuses_more = false;
+    for id in parent_ids {
+        let focus = format!("task:{id}");
+        if let Some(status) = child_status_limit(store, ship, &focus, remaining)? {
+            child_statuses_more |= status["more"] == true;
+            if let Some(children) = status["children"].as_array().filter(|c| !c.is_empty()) {
+                remaining -= children.len();
+                child_statuses.insert(focus, status);
+            }
+        }
+    }
     let owed = lines(
         "SELECT id, sender, body FROM mail WHERE recipient=?1 AND state='open' ORDER BY seq LIMIT 10",
         &|r| {
@@ -492,6 +620,14 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             }
         }
     }
+    for (focus, status) in &child_statuses {
+        text.push_str(&render_child_status(focus, status));
+    }
+    if child_statuses_more {
+        text.push_str(
+            "More child status omitted (20-child bearings limit); read note.get for each parent.\n",
+        );
+    }
     if !refused.is_empty() {
         text.push_str("Recent outbound mail refused, never delivered (recipient repeatedly unlisted; check its destination before resending):\n");
         for item in &refused {
@@ -588,7 +724,8 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
     Ok(json!({
         "ship": ship, "unacknowledged_mail": unacknowledged, "open_tasks": tasks,
         "stale_unacknowledged_mail": stale_mail,
-        "backlog": backlog(store, ship)?,
+        "backlog": backlog(store, ship)?, "child_statuses": child_statuses,
+        "child_statuses_more": child_statuses_more,
         "requests_owed": owed, "requests_owing": owing, "knowledge": knowledge,
         "idle_tasks": idle, "stale_tasks": stale.map(|s| s.total), "attention": attention, "scheduling": scheduling,
         "capacity_waits": waits, "refused_mail": refused, "text": text,
@@ -676,6 +813,7 @@ fn digest(store: &Store, args: &Value) -> Result<Value> {
     match focus.split_once(':') {
         Some(("task", id)) => {
             out["task"] = store.task(id)?;
+            out["child_status"] = child_status(store, ship, focus)?.unwrap_or(Value::Null);
             let mut statement = store.connection().prepare(
                 "SELECT seq, kind, issue_key, payload FROM events WHERE task_id=?1 ORDER BY seq DESC LIMIT ?2",
             )?;

@@ -1926,6 +1926,151 @@ fn wakes_group_mail_by_focus_carry_handoff_notes_and_run_under_the_focus_task() 
 }
 
 #[test]
+fn fresh_and_warm_parent_wakes_show_finished_children_beside_stale_commentary() {
+    for cache_window in [0, 300] {
+        let mut fleet = Fleet::new(json!({"batch_secs":0,"max_delay_secs":0,
+            "retry_backoff_secs":0,"cache_window_secs":cache_window}));
+        fleet.mode("no-action");
+        fleet.ok(
+            "charter.put",
+            json!({"id":"fleet","actions":["inspect","spawn","message"]}),
+            None,
+        );
+        fleet.ok(
+            "task.create",
+            json!({"id":"index","parent":"infra-repair","owner":"infra","title":"Repair index"}),
+            None,
+        );
+        fleet.ok("note.put", json!({"ship":"infra","focus":"task:infra-repair","body":"The index child is running."}), None);
+        fleet.send(
+            json!({"id":"q1","from":"apps","to":"infra","kind":"request",
+            "task_id":"infra-repair","body":"Start the repair?"}),
+        );
+        fleet.tick();
+        fleet.settle();
+        fleet.ok(
+            "task.update",
+            json!({"id":"index","actor":"infra","status":"done"}),
+            None,
+        );
+        let facts = fleet.ok(
+            "note.get",
+            json!({"ship":"infra","focus":"task:infra-repair"}),
+            None,
+        );
+        fleet.send(
+            json!({"id":"q2","from":"apps","to":"infra","kind":"request",
+            "task_id":"infra-repair","body":"Is the index ready?"}),
+        );
+        let woke = Fleet::infra(&fleet.tick());
+        assert_eq!(
+            woke["mode"],
+            if cache_window == 0 { "fresh" } else { "resume" }
+        );
+        fleet.settle();
+        let prompt = fleet.prompts().pop().unwrap();
+        assert!(
+            prompt.contains("Direct children of task:infra-repair"),
+            "{prompt}"
+        );
+        assert_eq!(
+            prompt
+                .matches("Direct children of task:infra-repair")
+                .count(),
+            1,
+            "{prompt}"
+        );
+        assert!(prompt.contains("- index [done] "), "{prompt}");
+        assert!(!prompt.contains("\"closing_evidence\""), "{prompt}");
+        if cache_window == 0 {
+            assert!(prompt.contains("The index child is running."), "{prompt}");
+        }
+        let after = fleet.ok(
+            "note.get",
+            json!({"ship":"infra","focus":"task:infra-repair"}),
+            None,
+        );
+        assert_eq!(after["notes"], facts["notes"]);
+    }
+}
+
+#[test]
+fn twenty_children_leave_room_for_mail_in_fresh_and_warm_wakes() {
+    for cache_window in [0, 300] {
+        let mut fleet = Fleet::new(json!({"batch_secs":0,"max_delay_secs":0,
+            "retry_backoff_secs":0,"cache_window_secs":cache_window}));
+        fleet.mode("no-action");
+        fleet.ok(
+            "charter.put",
+            json!({"id":"fleet","actions":["inspect","spawn","message"]}),
+            None,
+        );
+        for n in 0..20 {
+            let id = format!("repair-child-{n:02}");
+            fleet.ok(
+                "task.create",
+                json!({"id":id,"parent":"infra-repair","owner":"infra","title":"Repair index"}),
+                None,
+            );
+            fleet.ok(
+                "task.update",
+                json!({"id":id,"actor":"infra","status":"done"}),
+                None,
+            );
+            fleet
+                .store
+                .connection()
+                .execute(
+                    "INSERT INTO merges(id,ship,task_id,repo,pr,head_sha,record,created_ms)
+                 VALUES(?1,'infra',?1,'example/repairs',?2,?3,?4,1)",
+                    rusqlite::params![
+                        id,
+                        n + 1,
+                        "a".repeat(40),
+                        json!({"merge_sha":"b".repeat(40)}).to_string()
+                    ],
+                )
+                .unwrap();
+        }
+        fleet.send(
+            json!({"id":"first","from":"apps","to":"infra","kind":"request",
+            "task_id":"infra-repair","body":"Start?"}),
+        );
+        fleet.tick();
+        fleet.settle();
+        // Exercise the total wake budget without crossing the independent
+        // per-message body limit (2000 chars).
+        for n in 1..=4 {
+            let body = format!("{} MAIL-END-MARKER-{n}", "mail ".repeat(300));
+            fleet.send(
+                json!({"id":format!("second-{n}"),"from":"apps","to":"infra","kind":"request",
+                "task_id":"infra-repair","body":body}),
+            );
+        }
+        let woke = Fleet::infra(&fleet.tick());
+        assert_eq!(
+            woke["mode"],
+            if cache_window == 0 { "fresh" } else { "resume" }
+        );
+        fleet.settle();
+        let prompt = fleet.prompts().pop().unwrap();
+        let wake = &prompt[prompt.find("Wake wake-").unwrap()..];
+        assert!(wake.len() < 16_384, "wake size: {}", wake.len());
+        for n in 1..=4 {
+            assert!(wake.contains(&format!("MAIL-END-MARKER-{n}")), "{wake}");
+        }
+        assert_eq!(
+            wake.matches("Direct children of task:infra-repair").count(),
+            1,
+            "{wake}"
+        );
+        assert_eq!(wake.matches(" [done] ").count(), 20, "{wake}");
+        assert_eq!(wake.matches("PR#").count(), 20, "{wake}");
+        assert!(!wake.contains("\"closing_evidence\""), "{wake}");
+    }
+}
+
+#[test]
 fn a_warm_single_focus_session_is_resumed_with_only_the_new_mail() {
     let mut fleet = Fleet::new(now_settings());
     fleet.ok(
