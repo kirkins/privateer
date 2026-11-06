@@ -240,6 +240,13 @@ fn note_get(store: &Store, args: &Value) -> Result<Value> {
 /// Only the parent's owner can read this projection; a handed-off child's
 /// status remains visible through its parent, not its private notes or logs.
 /// Unknown legacy status times stay null rather than claiming a fresh change.
+/// A child whose scheduled execution has a live fault carries that fault
+/// (state 'fault' in its schedule record) beside its task status, so an open
+/// or running line never hides it. The mark clears when the schedule leaves
+/// the fault (re-defer or re-enqueue), and a child that closes (done or
+/// cancelled) never carries it, whatever its record still holds: the
+/// projection's own status check drops the mark, as the needs observation
+/// does, whether or not the closing status superseded the fault.
 pub(crate) fn child_status(store: &Store, ship: &str, focus: &str) -> Result<Option<Value>> {
     child_status_limit(store, ship, focus, 20)
 }
@@ -257,15 +264,40 @@ fn child_status_limit(
         return Ok(None);
     }
     let mut statement = store.connection().prepare(
-        "SELECT id, status, status_changed_ms, status_changed_approx FROM tasks WHERE parent=?1
-         ORDER BY status_changed_ms DESC, id LIMIT ?2",
+        "SELECT t.id, t.status, t.status_changed_ms, t.status_changed_approx,
+           json_extract(s.record,'$.state')='fault' AND t.status NOT IN ('done','cancelled'),
+           CASE WHEN json_extract(s.record,'$.state')='fault'
+                 AND t.status NOT IN ('done','cancelled')
+                THEN json_extract(s.record,'$.reason') END,
+           CASE WHEN json_extract(s.record,'$.state')='fault'
+                 AND t.status NOT IN ('done','cancelled')
+                THEN json_extract(s.record,'$.faulted_ms') END
+         FROM tasks t LEFT JOIN task_schedule s ON s.task_id=t.id WHERE t.parent=?1
+         ORDER BY t.status_changed_ms DESC, t.id LIMIT ?2",
     )?;
     let mut children = statement
         .query_map(params![id, limit as i64 + 1], |r| {
+            // Null unless the child's schedule sits in a live fault: an
+            // unclosed task whose schedule state is 'fault'.
+            let fault = if r.get::<_, Option<i64>>(4)? == Some(1) {
+                // Read defensively: a reason that is missing or not a string
+                // still marks, just without reason text, and a long one is
+                // capped like a parked ask's reason.
+                let reason = match r.get::<_, Option<rusqlite::types::Value>>(5)? {
+                    Some(rusqlite::types::Value::Text(reason)) => {
+                        Value::String(reason.chars().take(1000).collect())
+                    }
+                    _ => Value::Null,
+                };
+                json!({"reason": reason, "faulted_ms": r.get::<_, Option<i64>>(6)?})
+            } else {
+                Value::Null
+            };
             Ok(
                 json!({"id": r.get::<_, String>(0)?, "status": r.get::<_, String>(1)?,
-                "status_changed_ms": r.get::<_, Option<i64>>(2)?,
-                "status_changed_approx": r.get::<_, bool>(3)?}),
+            "status_changed_ms": r.get::<_, Option<i64>>(2)?,
+            "status_changed_approx": r.get::<_, bool>(3)?,
+            "scheduling_fault": fault}),
             )
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -329,8 +361,15 @@ fn render_child_status(focus: &str, status: &Value) -> String {
                 .unwrap_or("");
             format!(" PR#{pr} {}", clip(sha, 12))
         });
+        // The marker is short; the fault's reason is a JSON fact beside it,
+        // so one line per child stays one line.
+        let fault = if child["scheduling_fault"].is_object() {
+            ", sched fault"
+        } else {
+            ""
+        };
         text.push_str(&format!(
-            "- {} [{}] {time}{evidence}\n",
+            "- {} [{}{fault}] {time}{evidence}\n",
             child["id"].as_str().unwrap_or(""),
             child["status"].as_str().unwrap_or("")
         ));

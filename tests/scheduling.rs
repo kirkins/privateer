@@ -670,18 +670,25 @@ fn faulted(fleet: &mut Fleet) {
     enqueue(fleet);
     let offer = poll(fleet, true)["offer"].clone();
     assert!(offer.is_object(), "{offer}");
+    expire_to_fault(fleet, "infra-repair");
+}
+
+/// The task's offered claim expires without acknowledgment, as an
+/// unacknowledged hosted offer leaves it: the task stays open, and the fault
+/// is live.
+fn expire_to_fault(fleet: &mut Fleet, id: &str) {
     fleet
         .store
         .connection()
         .execute(
-            "UPDATE task_schedule SET record=json_set(record,'$.lease_until_ms',0)",
-            [],
+            "UPDATE task_schedule SET record=json_set(record,'$.lease_until_ms',0) WHERE task_id=?1",
+            [id],
         )
         .unwrap();
     for _ in 0..3 {
         assert!(poll(fleet, true)["offer"].is_null());
     }
-    assert_eq!(status(fleet, "infra-repair")["state"], "fault");
+    assert_eq!(status(fleet, id)["state"], "fault");
 }
 
 /// The captain's needs, as runtime.needs lists this fleet's schedule faults.
@@ -749,6 +756,175 @@ fn a_fault_followed_by_a_typed_wait_is_cleared() {
         "blocked"
     );
     assert!(fault_needs(&mut fleet).is_empty());
+}
+
+/// A child whose scheduled execution has a live fault must not read as a
+/// plain open or running line beside its parent's notes: the line carries a
+/// short mark, the JSON carries the fault's reason, and both clear when the
+/// schedule leaves the fault, by a typed wait or a fresh enqueue.
+#[test]
+fn a_faulted_child_is_marked_on_its_parents_lines_until_resolved() {
+    let mut fleet = Fleet::new(json!({}));
+    for (id, parent) in [("plan", None), ("mark", Some("plan"))] {
+        call(
+            &mut fleet,
+            "task.create",
+            json!({"id":id,"parent":parent,"charter_id":"fleet","owner":"infra",
+                "title":"Fault-marked repair work"}),
+        );
+    }
+    attend(&mut fleet);
+    let enqueue = |fleet: &mut Fleet| {
+        call(
+            fleet,
+            "task.enqueue",
+            json!({"id":"mark","brief":"Run the isolated fixture and verify it."}),
+        )
+    };
+    enqueue(&mut fleet);
+    assert!(poll(&mut fleet, true)["offer"].is_object());
+    expire_to_fault(&mut fleet, "mark");
+    let read = call(
+        &mut fleet,
+        "note.get",
+        json!({"ship":"infra","focus":"task:plan"}),
+    );
+    let child = &read["child_status"]["children"][0];
+    assert_eq!(child["id"], "mark", "{read}");
+    assert_eq!(child["status"], "open");
+    assert_eq!(
+        child["scheduling_fault"]["reason"],
+        "Execution claim expired without proven completion or a typed wait"
+    );
+    assert!(child["scheduling_fault"]["faulted_ms"].as_i64().unwrap() > 0);
+    let digest = call(
+        &mut fleet,
+        "focus.digest",
+        json!({"ship":"infra","focus":"task:plan"}),
+    );
+    assert_eq!(digest["child_status"], read["child_status"]);
+    let bearings = call(&mut fleet, "ship.bearings", json!({"ship":"infra"}));
+    assert_eq!(
+        bearings["child_statuses"]["task:plan"],
+        read["child_status"]
+    );
+    assert!(
+        bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains("- mark [open, sched fault]"),
+        "{}",
+        bearings["text"]
+    );
+    // A typed wait resolves the fault: the mark clears with it.
+    call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"mark","wait":{"kind":"time","reason":"The owner holds it",
+            "until_ms":privateer::store::Store::now_ms() + 100_000}}),
+    );
+    let deferred = call(
+        &mut fleet,
+        "note.get",
+        json!({"ship":"infra","focus":"task:plan"}),
+    );
+    assert_eq!(
+        deferred["child_status"]["children"][0]["scheduling_fault"],
+        json!(null)
+    );
+    let bearings = call(&mut fleet, "ship.bearings", json!({"ship":"infra"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(text.contains("- mark [blocked]"), "{text}");
+    assert!(!text.contains("sched fault"), "{text}");
+    // A fresh fault marks the line again, and a re-enqueue clears it.
+    enqueue(&mut fleet);
+    assert!(poll(&mut fleet, true)["offer"].is_object());
+    expire_to_fault(&mut fleet, "mark");
+    assert!(
+        call(
+            &mut fleet,
+            "note.get",
+            json!({"ship":"infra","focus":"task:plan"})
+        )["child_status"]["children"][0]["scheduling_fault"]["reason"]
+            .as_str()
+            .is_some()
+    );
+    enqueue(&mut fleet);
+    let requeued = call(
+        &mut fleet,
+        "note.get",
+        json!({"ship":"infra","focus":"task:plan"}),
+    );
+    assert_eq!(
+        requeued["child_status"]["children"][0]["scheduling_fault"],
+        json!(null)
+    );
+    assert_eq!(requeued["child_status"]["children"][0]["status"], "open");
+    let bearings = call(&mut fleet, "ship.bearings", json!({"ship":"infra"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("- mark [open]") && !text.contains("sched fault"),
+        "{text}"
+    );
+}
+
+/// A child that closes while its fault was never cleared must not carry
+/// the mark: a live job in its tree keeps its claim, so the closing status
+/// cannot supersede the fault, and the line drops the mark through its own
+/// closing-status check anyway, like the needs observation.
+#[test]
+fn a_closed_child_keeps_no_fault_mark_even_where_the_record_holds_it() {
+    let mut fleet = Fleet::new(json!({}));
+    for (id, parent) in [("plan", None), ("mark", Some("plan"))] {
+        call(
+            &mut fleet,
+            "task.create",
+            json!({"id":id,"parent":parent,"charter_id":"fleet","owner":"infra",
+                "title":"Fault-marked repair work"}),
+        );
+    }
+    attend(&mut fleet);
+    call(
+        &mut fleet,
+        "task.enqueue",
+        json!({"id":"mark","brief":"Run the isolated fixture and verify it."}),
+    );
+    assert!(poll(&mut fleet, true)["offer"].is_object());
+    expire_to_fault(&mut fleet, "mark");
+    // A live job in the child's tree keeps its claim, so the closing status
+    // below cannot supersede the fault out of the schedule record.
+    fleet
+        .store
+        .connection()
+        .execute(
+            "INSERT INTO jobs(id,record) VALUES('live',?1)",
+            [json!({"task_id":"mark","status":"running"}).to_string()],
+        )
+        .unwrap();
+    call(
+        &mut fleet,
+        "task.update",
+        json!({"id":"mark","actor":"infra","status":"done"}),
+    );
+    assert_eq!(
+        schedule_record(&mut fleet, "mark")["state"],
+        "fault",
+        "the live job kept the fault in the record"
+    );
+    let read = call(
+        &mut fleet,
+        "note.get",
+        json!({"ship":"infra","focus":"task:plan"}),
+    );
+    assert_eq!(
+        read["child_status"]["children"][0]["scheduling_fault"],
+        json!(null),
+        "{read}"
+    );
+    let bearings = call(&mut fleet, "ship.bearings", json!({"ship":"infra"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(text.contains("- mark [done]"), "{text}");
+    assert!(!text.contains("sched fault"), "{text}");
 }
 
 /// The stored schedule record, as one JSON value.
