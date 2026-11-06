@@ -216,12 +216,16 @@ fn terminal_premise_notifies_each_open_ask_once_and_keeps_its_decision_unchanged
         let home = store.home().to_path_buf();
         drop(store);
         let mut store = Store::open(&home).unwrap();
-        dispatch(
-            &mut store,
-            "task.update",
-            json!({"id":"main","actor":"apps","status":status}),
-        )
-        .unwrap();
+        // Terminal tasks cannot be updated again; neither startup nor the
+        // refused replay should create another premise notice.
+        assert!(
+            dispatch(
+                &mut store,
+                "task.update",
+                json!({"id":"main","actor":"apps","status":status}),
+            )
+            .is_err()
+        );
         assert_eq!(notices(&store), 2);
         // Display-only staleness must not replace the captain's actual answer.
         send(&mut store,json!({"from":"captain","to":"apps","kind":"reply","correlation":"open-decision","body":"Yes"})).unwrap();

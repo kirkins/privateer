@@ -1231,10 +1231,15 @@ fn terminal_premise_wakes_the_requester_once_through_ordinary_mail() {
             "open"
         );
         let count = fleet.wakes().len();
-        fleet.ok(
-            "task.update",
-            json!({"id":"infra-repair","actor":"infra","status":status}),
-            Some("infra"),
+        assert!(
+            !fleet
+                .run(
+                    "task.update",
+                    json!({"id":"infra-repair","actor":"infra","status":status}),
+                    Some("infra"),
+                )
+                .status
+                .success()
         );
         assert_eq!(
             Fleet::infra(&fleet.tick())["skipped"],
