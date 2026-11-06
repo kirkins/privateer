@@ -429,6 +429,7 @@ def check_attachment_put_and_fallback() -> None:
     assert fallback["body"].splitlines()[0].endswith("kept.bin"), fallback
     assert "files" not in (fallback.get("payload") or {}), fallback
     assert got["kept"], got
+    assert "unknown door command" in got["quiet"][0] and "couldn't hand" in got["quiet"][0], got["quiet"]
     assert "File kept as a reference" in got["quiet"][-1], got["quiet"]
     refusal = got["refusal"]
     warned = "⚠️ couldn't hand notes.bin to ops: cannot reach ship macops"
@@ -1073,7 +1074,7 @@ for layout in ("\v", "\f", "\x85"):
     for text in (layout + "hello", "hello" + layout, "a" + layout + "b"):
         adapter().on_update(update(5, text))
         assert latest()["body"] == text.replace(layout, "\n")
-for text in ("\u2028a\u2029", "< & _ 🚢 e\u0301 漢"):
+for text in ("\u2028a\u2029", "a\u2028b\u2029c", "< & _ 🚢 e\u0301 漢"):
     adapter().on_update(update(6, text)); assert latest()["body"] == text
 for text, position in (("\x1bhello", 1), ("hello\x1b", 6), ("a\x1bb", 2)):
     before = len(runtime.mail)
@@ -1081,6 +1082,11 @@ for text, position in (("\x1bhello", 1), ("hello\x1b", 6), ("a\x1bb", 2)):
     assert len(runtime.mail) == before
     assert "U+001B" in notices[-1] and f"character {position}" in notices[-1]
     assert "hello" not in notices[-1]
+for point in list(range(32)) + list(range(127, 160)):
+    if point in (9, 10, 11, 12, 13, 133): continue
+    before = len(runtime.mail)
+    adapter().on_update(update(8, "a" + chr(point) + "b"))
+    assert len(runtime.mail) == before and f"U+{point:04X}" in notices[-1]
 # Joining is only for near-cap consecutive plain text. A short tail ends the
 # group without a delay; two short instructions are never coalesced.
 for parts in (["a" * 3500, " tail"], ["🚢" * 1750, "漢" * 3500, "e\u0301 "]):

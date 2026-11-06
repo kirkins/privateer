@@ -1322,12 +1322,10 @@ class Door:
                 stored = self.runtime.call(
                     "file.put", {"to": ship, "name": saved, "content_file": dest}, timeout=120)
             except RuntimeError as e:
-                # An older runtime has no file.put at all; that alone falls back
-                # quietly. Any other refusal loses the file for a ship on a
-                # linked machine, so the captain hears about it first.
-                if "unknown door command" not in str(e):
-                    self.say(f"⚠️ couldn't hand {saved} to {ship}: {e}; kept at {dest}",
-                             reply_to=msg_id)
+                # Even an older runtime's missing file.put is visible: the
+                # fallback path may be unreadable on a linked machine.
+                self.say(f"⚠️ couldn't hand {saved} to {ship}: {e}; kept at {dest}",
+                         reply_to=msg_id)
                 tg.log("telegram outcome=file_put_failed")
         if stored and stored.get("file_id"):
             # The runtime fills the path when the mail lands, and the mail must
