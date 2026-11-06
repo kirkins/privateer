@@ -1214,7 +1214,7 @@ fn terminal_premise_wakes_the_requester_once_through_ordinary_mail() {
         );
         fleet.ok(
             "task.update",
-            json!({"id":"infra-repair","owner":"infra","status":status}),
+            json!({"id":"infra-repair","actor":"infra","status":status}),
             Some("infra"),
         );
         let woke = Fleet::infra(&fleet.tick());
@@ -1233,7 +1233,7 @@ fn terminal_premise_wakes_the_requester_once_through_ordinary_mail() {
         let count = fleet.wakes().len();
         fleet.ok(
             "task.update",
-            json!({"id":"infra-repair","owner":"infra","status":status}),
+            json!({"id":"infra-repair","actor":"infra","status":status}),
             Some("infra"),
         );
         assert_eq!(

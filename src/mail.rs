@@ -2360,9 +2360,11 @@ fn envelope(message: &Value) -> Value {
         // An old peer keeps the message and ignores the link; the follow-up's
         // own home is where the wake happens.
         "because_of",
-        "premise",
     ] {
         envelope[key] = message[key].clone();
+    }
+    if !message["premise"].is_null() {
+        envelope["premise"] = message["premise"].clone();
     }
     envelope
 }

@@ -31,7 +31,7 @@ fn premise_and_resolution_cross_the_existing_outbox_to_a_peer() {
     dispatch(
         &mut a,
         "task.update",
-        json!({"id":"work","owner":"apps","status":"cancelled"}),
+        json!({"id":"work","actor":"apps","status":"cancelled"}),
     )
     .unwrap();
     dispatch(&mut a, "mail.flush", json!({})).unwrap();
@@ -61,7 +61,7 @@ fn failed_notice_rolls_back_task_outcome_and_can_retry_without_loss() {
         dispatch(
             &mut store,
             "task.update",
-            json!({"id":"main","owner":"apps","status":"done"})
+            json!({"id":"main","actor":"apps","status":"done"})
         )
         .is_err()
     );
@@ -81,7 +81,7 @@ fn failed_notice_rolls_back_task_outcome_and_can_retry_without_loss() {
     dispatch(
         &mut store,
         "task.update",
-        json!({"id":"main","owner":"apps","status":"done"}),
+        json!({"id":"main","actor":"apps","status":"done"}),
     )
     .unwrap();
     assert_eq!(notices(&store), 1);
@@ -147,6 +147,10 @@ fn accepts_typed_premises_and_refuses_malformed_missing_or_foreign_tasks() {
 fn terminal_premise_notifies_each_open_ask_once_and_keeps_its_decision_unchanged_across_restart() {
     for status in ["done", "cancelled"] {
         let (_temp, mut store) = fleet();
+        {
+            let _pinned = Pinned::pin(&store);
+            privateer::fleet::register("apps", store.home(), "captain").unwrap();
+        }
         for (id, kind) in [
             ("open-request", "request"),
             ("open-decision", "decision"),
@@ -168,7 +172,7 @@ fn terminal_premise_notifies_each_open_ask_once_and_keeps_its_decision_unchanged
         dispatch(
             &mut store,
             "task.update",
-            json!({"id":"main","owner":"apps","status":status}),
+            json!({"id":"main","actor":"apps","status":status}),
         )
         .unwrap();
         assert_eq!(notices(&store), 2);
@@ -201,13 +205,21 @@ fn terminal_premise_notifies_each_open_ask_once_and_keeps_its_decision_unchanged
             .unwrap()
             .to_string();
         assert!(waiting.contains("premise_outcome"));
+        let inbox = dispatch(&mut store, "mail.inbox", json!({"address":"apps"})).unwrap();
+        let through = inbox["messages"].as_array().unwrap().last().unwrap()["seq"].clone();
+        dispatch(
+            &mut store,
+            "mail.ack",
+            json!({"address":"apps","through_seq":through}),
+        )
+        .unwrap();
         let home = store.home().to_path_buf();
         drop(store);
         let mut store = Store::open(&home).unwrap();
         dispatch(
             &mut store,
             "task.update",
-            json!({"id":"main","owner":"apps","status":status}),
+            json!({"id":"main","actor":"apps","status":status}),
         )
         .unwrap();
         assert_eq!(notices(&store), 2);
@@ -225,7 +237,7 @@ fn already_terminal_premise_is_recorded_and_notified_in_the_send_transaction() {
     dispatch(
         &mut store,
         "task.update",
-        json!({"id":"main","owner":"apps","status":"cancelled"}),
+        json!({"id":"main","actor":"apps","status":"cancelled"}),
     )
     .unwrap();
     let args = json!({"id":"late","from":"apps","to":"captain","kind":"request","body":"Review","premise":{"kind":"task","ref":"main"}});
@@ -244,7 +256,7 @@ fn task_link_closure_takes_precedence_over_premise_wake() {
     dispatch(
         &mut store,
         "task.update",
-        json!({"id":"main","owner":"apps","status":"done"}),
+        json!({"id":"main","actor":"apps","status":"done"}),
     )
     .unwrap();
     assert_eq!(notices(&store), 0);
