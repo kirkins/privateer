@@ -1,3 +1,5 @@
+#[path = "mail/premise.rs"]
+mod premise;
 mod support;
 
 use privateer::store::{Caller, Store};

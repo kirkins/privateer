@@ -371,6 +371,7 @@ fn locked_optional_table_has_no_wait_and_does_not_poison_mail_transaction() {
         );
         let writer = Connection::open(&uri).unwrap();
         writer.execute_batch("CREATE TABLE mail(seq INTEGER PRIMARY KEY,id TEXT,sender TEXT,recipient TEXT,kind TEXT,correlation TEXT,task_id TEXT,request_kind TEXT,body TEXT,payload TEXT,urgency TEXT,deadline_ms INTEGER,created_ms INTEGER,state TEXT,answered_by TEXT,answered_ms INTEGER,ended_by TEXT,ended_ms INTEGER,end_reason TEXT,delivery TEXT,delivery_attempts INTEGER,delivery_error TEXT,delivered_ms INTEGER,because_of TEXT); CREATE TABLE mail_cursor(address TEXT PRIMARY KEY,through_seq INTEGER); CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT);").unwrap();
+        crate::mail::upgrade_columns(&writer).unwrap();
         init(&writer).unwrap();
         bind(&writer, "00000000-0000-4000-8000-00000000000a").unwrap();
         snapshot(&writer, "binding").unwrap();

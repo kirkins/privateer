@@ -211,6 +211,36 @@ pub(crate) struct HomeFact {
     pub pending: bool,
 }
 
+/// The immutable mail projection used both when pinning source content and
+/// when replay checks the current home row. Keep the premise itself: changing
+/// what an ask depends on is a content change. Its outcome is mutable lifecycle
+/// bookkeeping and must not invalidate the original digest, even when null.
+/// Omit an absent premise to preserve the exact projection (and digest) pinned
+/// by releases before premises existed.
+pub(crate) fn immutable_content(mut row: Value) -> Value {
+    if row["premise"].is_null() {
+        row.as_object_mut().unwrap().remove("premise");
+    }
+    for key in [
+        "seq",
+        "state",
+        "answered_by",
+        "answered_ms",
+        "ended_by",
+        "ended_ms",
+        "end_reason",
+        "delivery",
+        "delivery_attempts",
+        "delivery_error",
+        "delivered_ms",
+        "remote_end_state",
+        "premise_outcome",
+    ] {
+        row.as_object_mut().unwrap().remove(key);
+    }
+    row
+}
+
 fn fact(conn: &Connection, id: &str, new: Option<&Provenance>) -> Result<Option<HomeFact>> {
     let row = conn
         .query_row(
@@ -233,23 +263,7 @@ fn fact(conn: &Connection, id: &str, new: Option<&Provenance>) -> Result<Option<
     // Do not replicate mutable attachment/delivery bookkeeping as immutable
     // content. Freeze the payload when capture starts, including correlation
     // and both conversation participants; dormant observations only pin origin.
-    let mut content = row.clone();
-    for key in [
-        "seq",
-        "state",
-        "answered_by",
-        "answered_ms",
-        "ended_by",
-        "ended_ms",
-        "end_reason",
-        "delivery",
-        "delivery_attempts",
-        "delivery_error",
-        "delivered_ms",
-        "remote_end_state",
-    ] {
-        content.as_object_mut().unwrap().remove(key);
-    }
+    let content = immutable_content(row.clone());
     let old: Option<(String, String)> = conn
         .query_row(
             "SELECT provenance,content FROM mail_source_origin WHERE id=?1",

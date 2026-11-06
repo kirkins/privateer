@@ -128,7 +128,18 @@ impl Item {
             body: ask
                 .map(|a| a.body.clone())
                 .filter(|b| !b.is_empty())
-                .or_else(|| decision_question.and(text("question"))),
+                .or_else(|| decision_question.and(text("question")))
+                .map(|body| {
+                    let premise = crate::mail::premise::display(
+                        &raw["premise"],
+                        raw["premise_outcome"].as_str(),
+                    );
+                    if body.ends_with(&premise) {
+                        body
+                    } else {
+                        format!("{body}{premise}")
+                    }
+                }),
             step: ask.and_then(|a| a.step.clone()),
             report: ask.and_then(|a| a.report.clone()),
             options,

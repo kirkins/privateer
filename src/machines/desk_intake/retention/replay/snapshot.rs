@@ -124,25 +124,7 @@ fn current_content(c: &Connection, id: &str) -> Result<Option<Value>> {
             crate::mail::message,
         )
         .optional()?;
-    Ok(row.map(|mut row| {
-        for key in [
-            "seq",
-            "state",
-            "answered_by",
-            "answered_ms",
-            "ended_by",
-            "ended_ms",
-            "end_reason",
-            "delivery",
-            "delivery_attempts",
-            "delivery_error",
-            "delivered_ms",
-            "remote_end_state",
-        ] {
-            row.as_object_mut().unwrap().remove(key);
-        }
-        row
-    }))
+    Ok(row.map(source::immutable_content))
 }
 
 pub(super) fn native_now(

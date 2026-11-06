@@ -96,6 +96,8 @@ pub fn init(store: &Store) -> Result<()> {
     Ok(())
 }
 
+pub(crate) mod premise;
+
 #[cfg(test)]
 mod upgrade_tests;
 
@@ -112,6 +114,8 @@ const UPGRADE_COLUMNS: &[(&str, &str)] = &[
     ("remote_end_state", "TEXT"),
     // The request a follow-up is raised because of; see ROUTINE_MAIL.
     ("because_of", "TEXT"),
+    ("premise", "TEXT"),
+    ("premise_outcome", "TEXT"),
     // How often a peer refused a wait notice; see `waits::refused`.
     ("delivery_refusals", "INTEGER NOT NULL DEFAULT 0"),
     // The linked machine that delivered the captain's mail here, so the
@@ -143,6 +147,7 @@ pub(crate) fn upgrade_columns(conn: &rusqlite::Connection) -> Result<()> {
     tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS mail_pending ON mail(delivery, seq) WHERE delivery='pending';
          CREATE INDEX IF NOT EXISTS mail_because_of ON mail(because_of) WHERE because_of IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS mail_premise_ref ON mail(json_extract(premise,'$.ref')) WHERE premise IS NOT NULL;
          CREATE TABLE IF NOT EXISTS mail_delivery_retry(peer TEXT PRIMARY KEY,
            failures INTEGER NOT NULL, next_attempt_ms INTEGER NOT NULL, last_attempt_ms INTEGER NOT NULL);",
     )?;
@@ -163,6 +168,7 @@ fn upgrade_ready(conn: &rusqlite::Connection) -> Result<bool> {
     for (kind, name) in [
         ("index", "mail_pending"),
         ("index", "mail_because_of"),
+        ("index", "mail_premise_ref"),
         ("table", "mail_delivery_retry"),
     ] {
         if !conn.query_row(
@@ -507,7 +513,7 @@ pub(crate) fn find(store: &Store, id: &str) -> Result<Option<Value>> {
     Ok(by_id(store, id)?.map(|m| annotate(m, Store::now_ms())))
 }
 
-pub(crate) const COLUMNS: &str = "seq,id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,answered_by,answered_ms,delivery,delivery_attempts,delivery_error,delivered_ms,ended_by,ended_ms,end_reason,because_of";
+pub(crate) const COLUMNS: &str = "seq,id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,answered_by,answered_ms,delivery,delivery_attempts,delivery_error,delivered_ms,ended_by,ended_ms,end_reason,because_of,premise,premise_outcome";
 
 pub(crate) fn message(r: &Row) -> rusqlite::Result<Value> {
     let payload: String = r.get(9)?;
@@ -526,6 +532,8 @@ pub(crate) fn message(r: &Row) -> rusqlite::Result<Value> {
         "ended_by": r.get::<_, Option<String>>(20)?, "ended_ms": r.get::<_, Option<i64>>(21)?,
         "end_reason": r.get::<_, Option<String>>(22)?,
         "because_of": r.get::<_, Option<String>>(23)?,
+        "premise": r.get::<_, Option<String>>(24)?.and_then(|p| serde_json::from_str::<Value>(&p).ok()),
+        "premise_outcome": r.get::<_, Option<String>>(25)?,
     }))
 }
 
@@ -547,6 +555,7 @@ pub(crate) fn annotate(mut message: Value, now: i64) -> Value {
             .as_i64()
             .is_some_and(|deadline| deadline < now);
     message["overdue"] = json!(overdue);
+    message["premise_stale"] = json!(!message["premise_outcome"].is_null());
     message
 }
 
@@ -856,6 +865,7 @@ pub(crate) fn close_task(store: &Store, task: &str, status: &str) -> Result<()> 
             &format!("linked task {task} is {status}"),
         )?;
     }
+    premise::resolve_task(store, task, status)?;
     Ok(())
 }
 
@@ -1769,6 +1779,11 @@ fn send_with_bound(
     let body = body.as_str();
     validate_body(from, body)?;
     let opens = matches!(kind, "request" | "decision");
+    let premise = premise::parse(args, kind)?;
+    ensure!(
+        payload.get("premise_changed").is_none(),
+        "payload.premise_changed is runtime-owned"
+    );
     bind(&mut payload, opens)?;
     let deadline_ms = match args.get("reply_within_secs").filter(|v| !v.is_null()) {
         Some(v) => {
@@ -1985,6 +2000,12 @@ fn send_with_bound(
             && existing["kind"] == kind
             && existing["correlation"] == json!(correlation)
             && existing["because_of"] == json!(because_of)
+            && existing["premise"]
+                == premise
+                    .as_deref()
+                    .map(serde_json::from_str::<Value>)
+                    .transpose()?
+                    .unwrap_or(Value::Null)
             && existing["task_id"] == json!(task_id)
             && existing["request_kind"] == json!(request_kind)
             && existing["body"] == body
@@ -1997,6 +2018,7 @@ fn send_with_bound(
         report_queued_delivery(&mut existing, local_transport);
         return Ok(existing);
     }
+    premise::owned(store, premise.as_deref(), from)?;
     confirm_stow(store, &payload)?;
     if let Some(task) = task_id {
         let linked = store.task(task)?;
@@ -2097,8 +2119,8 @@ fn send_with_bound(
         )?;
     }
     tx.execute(
-        "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery,because_of)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+        "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery,because_of,premise)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         params![
             id,
             from,
@@ -2114,9 +2136,11 @@ fn send_with_bound(
             now,
             opens.then_some("open"),
             peer.as_ref().map(|_| "pending"),
-            because_of
+            because_of,
+            premise
         ],
     )?;
+    premise::resolve_sent(store, premise.as_deref())?;
     audit_captain_send(
         &tx,
         &json!({"id":id,"from":from,"to":to,"kind":kind,"body":body}),
@@ -2340,6 +2364,9 @@ fn envelope(message: &Value) -> Value {
         "because_of",
     ] {
         envelope[key] = message[key].clone();
+    }
+    if !message["premise"].is_null() {
+        envelope["premise"] = message["premise"].clone();
     }
     envelope
 }
@@ -3018,8 +3045,8 @@ fn record_copy(
         json!({})
     };
     let written = conn.execute(
-        "INSERT OR IGNORE INTO mail(id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,delivery,delivered_ms,because_of)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'delivered',?13,?14)",
+        "INSERT OR IGNORE INTO mail(id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,delivery,delivered_ms,because_of,premise)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'delivered',?13,?14,?15)",
         params![
             required(message, "id")?,
             required(message, "from")?,
@@ -3035,6 +3062,7 @@ fn record_copy(
             message["created_ms"].as_i64().unwrap_or(delivered_ms),
             delivered_ms,
             message["because_of"].as_str(),
+            premise::received(message, required(message, "kind")?),
         ],
     )?;
     if written == 1 {
@@ -3428,6 +3456,7 @@ fn deliver_inner(store: &Store, args: &Value, provenance: &source::Provenance) -
     }
     local_address(store, to)?;
     let correlation = optional_str(args, "correlation")?;
+    let premise = premise::received(args, kind);
     // A follow-up keeps its link where it was raised: the sender's home is
     // where its wake happens, and the other home only reads the message.
     let because_of = optional_str(args, "because_of")?;
@@ -3615,9 +3644,19 @@ fn deliver_inner(store: &Store, args: &Value, provenance: &source::Provenance) -
     {
         payload["approval"] = approval;
     }
+    if payload.get("premise_changed").is_some() {
+        // Never trust an attachment claimed by an unrecognized change.
+        if let Some(fields) = payload.as_object_mut() {
+            fields.remove("attached_to");
+            fields.remove("attached_ship");
+        }
+        if premise::delivered(store, from, to, kind, correlation, &payload)? {
+            payload["attached_to"] = json!(correlation);
+        }
+    }
     tx.execute(
-        "INSERT INTO mail(id,sender,recipient,kind,correlation,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery,delivered_ms,because_of,origin_machine)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'received',?11,?13,?14)",
+        "INSERT INTO mail(id,sender,recipient,kind,correlation,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery,delivered_ms,because_of,origin_machine,premise)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'received',?11,?13,?14,?15)",
         params![
             id,
             from,
@@ -3635,7 +3674,8 @@ fn deliver_inner(store: &Store, args: &Value, provenance: &source::Provenance) -
             // Only operator dispatch carries runtime-authenticated identity:
             // the gateway strips unlinked claims, and collect stamps it.
             // A local agent's envelope is not provenance.
-            via.filter(|_| matches!(store.caller(), Caller::Operator))
+            via.filter(|_| matches!(store.caller(), Caller::Operator)),
+            premise
         ],
     )?;
     audit_captain_send(
@@ -4012,6 +4052,7 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
             "kind",
             "correlation",
             "because_of",
+            "premise",
             "request_kind",
             "body",
             "payload",
@@ -4046,6 +4087,7 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
             "reply_within_secs",
             "correlation",
             "because_of",
+            "premise",
         ],
     ),
     ("mail.show", &["id"]),
