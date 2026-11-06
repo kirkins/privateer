@@ -173,18 +173,29 @@ def chat_kind(cfg: dict) -> str:
 
 
 def bot_identity(cfg):
-    """Stable identity without depending on getMe availability or logging secrets."""
+    """Set the token-derived id and refresh the optional username in background."""
     prefix = str(cfg.get("bot_token", "")).partition(":")[0]
     if not prefix.isascii() or not prefix.isdecimal():
         tg.log("telegram outcome=invalid_bot_identity")
         return False
     cfg["bot_id"] = int(prefix)
-    bot, err = tg.api(cfg, "getMe", {}, retries=2)
-    if err or not isinstance(bot, dict):
-        tg.log("telegram outcome=bot_username_unavailable")
-        bot = {}
-    cfg["bot_username"] = bot.get("username", "")
+    cfg["bot_username"] = ""
+
     return True
+
+
+def refresh_bot_username(cfg, stop):
+    """Keep retrying getMe off the polling thread with capped backoff."""
+    delay = 1
+    while not stop.is_set():
+        bot, err = tg.api(cfg, "getMe", {}, retries=2)
+        if not err and isinstance(bot, dict) and isinstance(bot.get("username"), str):
+            cfg["bot_username"] = bot["username"]
+            return
+        tg.log("telegram outcome=bot_username_unavailable")
+        if stop.wait(delay):
+            return
+        delay = min(delay * 2, 60)
 
 
 class Door:
@@ -352,6 +363,8 @@ class Door:
         if durable and self.update_id is not None:
             # Content-stable positive slots cannot collide with reserved negative
             # outcome slots or skip a different notice on a later attempt.
+            # Identical notice content intentionally shares a durable slot; duplicate
+            # notices in one update are harmless and should not be sent twice.
             slot = notice_key
             if slot is None:
                 identity = json.dumps(params, sort_keys=True, separators=(",", ":"))
@@ -662,7 +675,7 @@ class Door:
             except OSError:
                 tg.log("telegram outcome=inbox_cleanup_failed")
 
-    def send(self, args: dict, msg_id, label: str) -> bool:
+    def send(self, args: dict, msg_id, label: str, fallback_on_answered: bool = True) -> bool:
         """Mail from the captain, with what the chat sees about it."""
         if self.cfg.get("send_kind") in ("request", "notice") and args.get("kind") is None:
             args["kind"] = self.cfg["send_kind"]
@@ -723,7 +736,8 @@ class Door:
         except RuntimeError as e:
             if "Privateer did not answer" in str(e):
                 raise  # Uncertain commit: recover with the same mail id.
-            if "already answered" in str(e) and args.get("kind") == "reply":
+            if ("already answered" in str(e) and args.get("kind") == "reply"
+                    and fallback_on_answered):
                 # Answered elsewhere already: follow up instead of failing. A
                 # typed answer cannot go to a request, so it goes as plain words.
                 args = dict(args, kind="request")
@@ -948,12 +962,20 @@ class Door:
     def on_callback(self, query: dict) -> None:
         chat = ((query.get("message") or {}).get("chat") or {}).get("id")
         user = (query.get("from") or {}).get("id")
-        tg.api(self.cfg, "answerCallbackQuery", {"callback_query_id": query.get("id")}, retries=1)
+        def answer(text=None):
+            params = {"callback_query_id": query.get("id")}
+            if text:
+                params["text"] = text
+            tg.api(self.cfg, "answerCallbackQuery", params, retries=1)
+
         if not self.authorized(chat, user):
+            answer()
             tg.log(f"ignoring a button from chat={chat} user={user}")
             return
         data = query.get("data") or ""
         msg = query.get("message") or {}
+        if not data.startswith("d:"):
+            answer()
         if data.startswith("to:"):
             ship = data[3:]
             tg.write_state(TARGET, {"ship": ship})
@@ -999,7 +1021,7 @@ class Door:
             _, key, index = data.split(":", 2)
             decision = tg.read_state(DECISIONS, {}).get(key)
             if not decision:
-                self.say("⚠️ that decision is no longer known; reply to its message instead.")
+                answer("Already answered")
                 return
             choice = decision["options"][int(index)]
             args = {"to": decision["from"], "kind": "reply", "correlation": decision["mail"],
@@ -1007,8 +1029,11 @@ class Door:
             option_id = (decision.get("ids") or [None] * len(decision["options"]))[int(index)]
             if option_id:
                 args["payload"] = {"answer": {"option_id": option_id}}
-            if not self.send(args, msg.get("message_id"), f"decision: {choice}"):
+            if not self.send(args, msg.get("message_id"), f"decision: {choice}",
+                             fallback_on_answered=False):
+                answer("Already answered")
                 return
+            answer()
             # An answered card keeps no buttons, even when later mail edits it.
             cards = tg.read_state(CARDS, {})
             if decision["mail"] in cards:
@@ -1416,14 +1441,13 @@ class Door:
                             reason = "text is too large for the mail envelope"
                 except UnicodeDecodeError:
                     reason = "document is not valid UTF-8"
-        if reason:
-            self.say(f"📎 File kept as a reference: {reason}.", reply_to=msg_id, quiet=True)
         if stored and stored.get("file_id"):
             try:
                 os.unlink(dest)
             except OSError:
                 tg.log("telegram outcome=inbox_cleanup_failed")
-        self.send(args, msg_id, f"file {saved}")
+        if self.send(args, msg_id, f"file {saved}") and reason:
+            self.say(f"📎 File kept as a reference: {reason}.", reply_to=msg_id, quiet=True)
 
     def handle_voice(self, msg: dict, msg_id, reply_to) -> None:
         import stt
@@ -1718,6 +1742,8 @@ def main() -> int:
     door = Door(hello, cfg, runtime)
     door.group = kind != "private"
     stop = threading.Event()
+    threading.Thread(target=refresh_bot_username, args=(cfg, stop),
+                     name="telegram-bot-identity", daemon=True).start()
     threading.Thread(target=poll_telegram, args=(cfg, events, stop),
                      name="telegram-poller", daemon=True).start()
     tg.log(f"door {hello.get('door')} up; plain messages go to {door.recipient() or 'nobody yet'}")
