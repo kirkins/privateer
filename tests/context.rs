@@ -207,14 +207,22 @@ fn child_status_times_track_real_edges_including_scheduler_writes() {
     );
 }
 
-/// One schedule row a hand-written rendering test needs. Only the fields
-/// the child lines read are set: the dispatcher's real record format,
-/// including how a fault is stored, is covered in tests/scheduling.rs.
-fn schedule_row(s: &mut Store, record: &Value) {
+/// One schedule row the store's readers accept, with the fields under test
+/// layered on. The dispatcher's real record format, including how a fault
+/// is stored, is covered in tests/scheduling.rs.
+fn schedule_row(s: &mut Store, id: &str, fields: Value) {
+    let mut record = json!({"task_id":id,"owner":"infra","revision":2,
+        "brief":"Run the isolated fixture","state":"waiting","not_before_ms":0,
+        "attempts":1,"created_ms":1,"last_checked_ms":2,"lease_until_ms":0});
+    if let Value::Object(fields) = fields {
+        for (key, value) in fields {
+            record[key] = value;
+        }
+    }
     s.connection()
         .execute(
             "INSERT INTO task_schedule(task_id,record) VALUES(?1,?2)",
-            rusqlite::params![record["task_id"].as_str().unwrap(), record.to_string()],
+            rusqlite::params![id, record.to_string()],
         )
         .unwrap();
 }
@@ -223,8 +231,7 @@ fn schedule_row(s: &mut Store, record: &Value) {
 /// marks an open or running child with the fault's reason as a JSON fact, a
 /// row that left the fault or never faulted does not, and a closed child
 /// never carries the mark, whatever its row still holds. A fault with no
-/// reason still marks, a reason that is not a string renders no reason
-/// without failing the read, and a long reason is capped.
+/// reason still marks, and a long reason is capped.
 #[test]
 fn child_lines_render_a_live_schedule_fault_row() {
     let (temp, mut s) = fleet();
@@ -234,7 +241,6 @@ fn child_lines_render_a_live_schedule_fault_row() {
         ("plain", "open"),
         ("closed", "done"),
         ("silent", "open"),
-        ("odd", "open"),
         ("long", "open"),
     ] {
         child(&mut s, id, "repair");
@@ -245,41 +251,25 @@ fn child_lines_render_a_live_schedule_fault_row() {
         )
         .unwrap();
     }
-    let row = |id: &str, extra: Value| {
-        let mut record = json!({"task_id":id,"state":"fault"});
-        if let Value::Object(fields) = extra {
-            for (key, value) in fields {
-                record[key] = value;
-            }
-        }
-        record
-    };
     schedule_row(
         &mut s,
-        &row(
-            "runner",
-            json!({"faulted_ms":2,
+        "runner",
+        json!({"state":"fault","faulted_ms":2,
             "reason":"Coordinator ended without completion, live child work or a typed wait"}),
-        ),
     );
-    schedule_row(&mut s, &json!({"task_id":"held","state":"waiting"}));
+    schedule_row(&mut s, "held", json!({}));
     schedule_row(
         &mut s,
-        &row(
-            "closed",
-            json!({"faulted_ms":3,
+        "closed",
+        json!({"state":"fault","faulted_ms":3,
             "reason":"Execution claim expired without proven completion or a typed wait"}),
-        ),
     );
-    schedule_row(&mut s, &row("silent", json!({"faulted_ms":4})));
-    schedule_row(&mut s, &row("odd", json!({"faulted_ms":5,"reason":7})));
+    schedule_row(&mut s, "silent", json!({"state":"fault","faulted_ms":4}));
     schedule_row(
         &mut s,
-        &row(
-            "long",
-            json!({"faulted_ms":6,
+        "long",
+        json!({"state":"fault","faulted_ms":6,
             "reason":"Coordinator ended without completion. ".repeat(30)}),
-        ),
     );
     let read = read_parent(&mut s);
     let lines = read["child_status"]["children"]
@@ -293,14 +283,10 @@ fn child_lines_render_a_live_schedule_fault_row() {
         json!({"reason":"Coordinator ended without completion, live child work or a typed wait",
             "faulted_ms":2})
     );
-    // A fault with no reason, or one that is not a string, still marks.
+    // A fault with no reason still marks.
     assert_eq!(
         lines["silent"]["scheduling_fault"],
         json!({"reason":null,"faulted_ms":4})
-    );
-    assert_eq!(
-        lines["odd"]["scheduling_fault"],
-        json!({"reason":null,"faulted_ms":5})
     );
     let capped = lines["long"]["scheduling_fault"]["reason"]
         .as_str()
@@ -331,7 +317,6 @@ fn child_lines_render_a_live_schedule_fault_row() {
     };
     assert!(line("runner").starts_with("- runner [running, sched fault] "));
     assert!(line("silent").starts_with("- silent [open, sched fault] "));
-    assert!(line("odd").starts_with("- odd [open, sched fault] "));
     assert!(line("long").starts_with("- long [open, sched fault] "));
     assert!(line("held").starts_with("- held [blocked] "));
     assert!(line("plain").starts_with("- plain [open] "));
@@ -341,6 +326,34 @@ fn child_lines_render_a_live_schedule_fault_row() {
     drop(s);
     let mut s = Store::open(&temp.path().join("home")).unwrap();
     assert_eq!(read_parent(&mut s), read);
+}
+
+/// A reason that is not a string must not fail the child-line read: the
+/// mark still shows, without reason text. The runtime's own writers keep a
+/// reason a string, so this row is malformed on purpose, and the schedule
+/// snapshot would refuse it; the child-line projection reads it anyway.
+#[test]
+fn a_non_string_fault_reason_still_marks_the_child_line() {
+    let (_temp, mut s) = fleet();
+    child(&mut s, "odd", "repair");
+    schedule_row(
+        &mut s,
+        "odd",
+        json!({"state":"fault","faulted_ms":5,"reason":7}),
+    );
+    let read = read_parent(&mut s);
+    assert_eq!(
+        read["child_status"]["children"][0]["scheduling_fault"],
+        json!({"reason":null,"faulted_ms":5}),
+        "{read}"
+    );
+    let digest = dispatch(
+        &mut s,
+        "focus.digest",
+        json!({"ship":"infra","focus":"task:repair"}),
+    )
+    .unwrap();
+    assert_eq!(digest["child_status"], read["child_status"]);
 }
 
 #[test]
