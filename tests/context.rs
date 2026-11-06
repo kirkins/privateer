@@ -207,6 +207,92 @@ fn child_status_times_track_real_edges_including_scheduler_writes() {
     );
 }
 
+/// The schedule record a dispatcher stores, as one JSON row.
+fn schedule_row(s: &mut Store, record: &Value) {
+    s.connection()
+        .execute(
+            "INSERT INTO task_schedule(task_id,record) VALUES(?1,?2)",
+            rusqlite::params![record["task_id"].as_str().unwrap(), record.to_string()],
+        )
+        .unwrap();
+}
+
+/// A child whose scheduled execution sits in a live fault is marked beside
+/// its task status with the fault's reason as a JSON fact, and a schedule
+/// that left the fault (re-deferred here) or never faulted reads plain.
+#[test]
+fn a_live_schedule_fault_marks_the_child_line_with_its_reason() {
+    let (temp, mut s) = fleet();
+    child(&mut s, "runner", "repair");
+    child(&mut s, "held", "repair");
+    child(&mut s, "plain", "repair");
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"id":"runner","actor":"infra","status":"running"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"id":"held","actor":"infra","status":"blocked"}),
+    )
+    .unwrap();
+    let base = |id: &str, state: &str, reason: &str| {
+        json!({"task_id":id,"owner":"infra","revision":2,"brief":"Run the isolated fixture",
+            "state":state,"not_before_ms":0,"offer_id":null,"holder":null,"job_id":null,
+            "profile":null,"charter_hash":null,"attempts":1,"created_ms":1,
+            "last_checked_ms":2,"lease_until_ms":0,"reason":reason})
+    };
+    // One live fault, one wait that resolved a fault (re-deferred).
+    let mut faulted = base(
+        "runner",
+        "fault",
+        "Coordinator ended without completion, live child work or a typed wait",
+    );
+    faulted["faults"] = json!(1);
+    faulted["faulted_ms"] = json!(2);
+    schedule_row(&mut s, &faulted);
+    let mut waiting = base("held", "waiting", "The owner holds it");
+    waiting["wait"] =
+        json!({"kind":"time","reason":"The owner holds it","until_ms":9_000_000_000_000i64});
+    schedule_row(&mut s, &waiting);
+    let read = read_parent(&mut s);
+    let lines = read["child_status"]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["id"].as_str().unwrap().to_owned(), c.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        lines["runner"]["scheduling_fault"],
+        json!({"reason":"Coordinator ended without completion, live child work or a typed wait",
+            "faulted_ms":2})
+    );
+    assert_eq!(lines["held"]["scheduling_fault"], Value::Null);
+    assert_eq!(lines["plain"]["scheduling_fault"], Value::Null);
+    let digest = dispatch(
+        &mut s,
+        "focus.digest",
+        json!({"ship":"infra","focus":"task:repair"}),
+    )
+    .unwrap();
+    assert_eq!(digest["child_status"], read["child_status"]);
+    let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap();
+    assert_eq!(
+        bearings["child_statuses"]["task:repair"],
+        read["child_status"]
+    );
+    let text = bearings["text"].as_str().unwrap();
+    assert!(text.contains("- runner [running, sched fault]"), "{text}");
+    assert!(text.contains("- held [blocked]"), "{text}");
+    assert!(text.contains("- plain [open]"), "{text}");
+    // The mark is durable fact, not a derived hint: it survives a restart.
+    drop(s);
+    let mut s = Store::open(&temp.path().join("home")).unwrap();
+    assert_eq!(read_parent(&mut s), read);
+}
+
 #[test]
 fn legacy_child_times_are_recovered_once_without_inventing_missing_history() {
     let (temp, mut s) = fleet();
