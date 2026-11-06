@@ -5,14 +5,20 @@ use anyhow::{Result, ensure};
 use serde_json::Value;
 use std::path::PathBuf;
 
-fn correlated_home<F>(members: &[(String, PathBuf)], to: &str, correlation: &str,
-                      mut find: F) -> Result<Option<PathBuf>>
+fn correlated_home<F>(
+    members: &[(String, PathBuf)],
+    to: &str,
+    correlation: &str,
+    mut find: F,
+) -> Result<Option<PathBuf>>
 where
     F: FnMut(&PathBuf, &str) -> Result<Option<Value>>,
 {
     let mut found = None;
     for (_, home) in members {
-        let Some(original) = find(home, correlation)? else { continue };
+        let Some(original) = find(home, correlation)? else {
+            continue;
+        };
         let captain = crate::mail::CAPTAIN;
         if !((original["from"] == to && original["to"] == captain)
             || (original["from"] == captain && original["to"] == to))
@@ -78,8 +84,10 @@ mod tests {
             }
             Ok(None)
         };
-        assert_eq!(correlated_home(&members, "remote", "mail-1", find).unwrap(),
-                   Some(PathBuf::from("first")));
+        assert_eq!(
+            correlated_home(&members, "remote", "mail-1", find).unwrap(),
+            Some(PathBuf::from("first"))
+        );
 
         let ambiguous = |home: &PathBuf, _id: &str| -> Result<Option<Value>> {
             if home == Path::new("broken") {
