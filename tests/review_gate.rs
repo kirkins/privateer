@@ -1171,6 +1171,14 @@ fn review_record_binds_pr_wording_but_ignores_issue_numbers_and_file_paths() {
     for (brief, reply) in [
         ("Review PR 41 at head", "VERDICT: APPROVE"),
         ("Review head", "Reviewed PR: 41\nVERDICT: APPROVE"),
+        (
+            "Review https://forge.example/acme/widget/pull/41 at head",
+            "VERDICT: APPROVE",
+        ),
+        (
+            "Review head",
+            "Reviewed https://forge.example/acme/widget/pulls/41/files\nVERDICT: APPROVE",
+        ),
     ] {
         let f = Fleet::new();
         f.routes(opus_errands());
@@ -1193,9 +1201,9 @@ fn review_record_binds_pr_wording_but_ignores_issue_numbers_and_file_paths() {
     let id = finished_plain_errand(
         &f,
         &format!(
-            "Review PR 774 (#772) at head {head}. Inspect src/review.rs, docs/x.md and/or tests/review_gate.rs."
+            "Review PR 774 (#772) at head {head}. Inspect src/review.rs, docs/x.md and/or tests/review_gate.rs. See https://docs.rs/anyhow/latest/anyhow/."
         ),
-        "Checked src/review.rs, docs/x.md and/or tests/review_gate.rs. See issue #772.\nFINDING nit src/lib.rs:1 spelling\nVERDICT: APPROVE",
+        "Checked src/review.rs, docs/x.md and/or tests/review_gate.rs. See issue #772 and https://doc.rust-lang.org/std/path/struct.Path.html.\nFINDING nit src/lib.rs:1 spelling\nVERDICT: APPROVE",
     );
     let row = f.json(
         Some("engineering"),
@@ -1245,6 +1253,76 @@ fn imported_author_exclusion_uses_the_saved_model_not_todays_route() {
     );
     assert!(notes.contains("crew-writer"), "{merged}");
     assert!(notes.contains("claude-opus-5-5"), "{merged}");
+}
+
+#[test]
+fn imported_unknown_models_keep_the_author_exclusion_warning() {
+    for identity in ["", "claude/-/-", "claude/-/opus"] {
+        let f = Fleet::new();
+        f.routes(opus_errands());
+        let head = f.commit("feature", &[], "Fix");
+        f.pr(79, &head, "feature");
+        let id = finished_plain_errand(
+            &f,
+            &format!("Review PR 79 at head {head}"),
+            "VERDICT: APPROVE",
+        );
+        let db = rusqlite::Connection::open(f.home().join("privateer.sqlite")).unwrap();
+        db.execute(
+            "UPDATE errands SET model_route=?1 WHERE id=?2",
+            [identity, &id],
+        )
+        .unwrap();
+        let row = f.json(
+            Some("engineering"),
+            "review.record",
+            json!({"errand_id": id, "pr": 79, "head_sha": head}),
+        );
+        assert_eq!(row["route_model"], "", "{identity}: {row}");
+        assert!(!f.root.join("adapter.log").exists());
+        let merged = f.json(
+            Some("engineering"),
+            "pr.merge",
+            json!({"task_id": "fix", "pr": 79}),
+        );
+        assert_eq!(merged["review"]["id"], row["id"]);
+        assert!(
+            merged["notes"]
+                .to_string()
+                .contains("its model cannot be named"),
+            "{identity}: {merged}"
+        );
+    }
+}
+
+#[test]
+fn review_record_binds_urls_on_the_clones_forge_host() {
+    let f = Fleet::new();
+    f.routes(opus_errands());
+    let head = f.commit("feature", &[], "Fix");
+    let id = finished_plain_errand(
+        &f,
+        &format!("Review PR 80 at head {head}"),
+        "VERDICT: APPROVE",
+    );
+    f.git(
+        &f.clone_dir(),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@forge.example:acme/widget.git",
+        ],
+    );
+    let db = rusqlite::Connection::open(f.home().join("privateer.sqlite")).unwrap();
+    let args = json!({"errand_id": id, "pr": 80, "head_sha": head});
+    db.execute("UPDATE errands SET verdict='See https://forge.example/acme/other\nVERDICT: APPROVE' WHERE id=?1", [&id]).unwrap();
+    let error = f.refused(Some("engineering"), "review.record", args.clone());
+    assert!(error.contains("names repository acme/other"), "{error}");
+    db.execute("UPDATE errands SET verdict='See https://forge.example/acme/widget and https://docs.rs/anyhow/latest\nVERDICT: APPROVE' WHERE id=?1", [&id]).unwrap();
+    let row = f.json(Some("engineering"), "review.record", args);
+    assert_eq!(row["repo"], "acme/widget");
+    assert!(!f.root.join("adapter.log").exists());
 }
 
 #[test]

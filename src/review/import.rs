@@ -26,8 +26,24 @@ fn exact_head(brief: &str, reply: &str, head: &str) -> Result<()> {
     Ok(())
 }
 
-/// Bind explicit PR wording in the saved evidence, not bare #N references
-/// that may name an issue (for example, "PR 774 (#772)").
+fn evidence_tokens(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && !"-._/#:".contains(c))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('.'))
+}
+
+fn http_url(token: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = token.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let (authority, path) = rest.split_once('/')?;
+    let host = authority.rsplit('@').next()?.split(':').next()?;
+    (!host.is_empty()).then_some((host, path))
+}
+
+/// Bind explicit PR wording and pull URLs in the saved evidence, not bare
+/// #N references that may name an issue (for example, "PR 774 (#772)").
 fn exact_pr(brief: &str, reply: &str, number: u64) -> Result<()> {
     let check = |named: &str| -> Result<()> {
         ensure!(
@@ -37,6 +53,17 @@ fn exact_pr(brief: &str, reply: &str, number: u64) -> Result<()> {
         Ok(())
     };
     for text in [brief, reply] {
+        for (_, path) in evidence_tokens(text).filter_map(http_url) {
+            let parts: Vec<_> = path.split('/').collect();
+            for pair in parts.windows(2) {
+                if ["pull", "pulls"].contains(&pair[0])
+                    && !pair[1].is_empty()
+                    && pair[1].bytes().all(|b| b.is_ascii_digit())
+                {
+                    check(pair[1])?;
+                }
+            }
+        }
         let words: Vec<_> = text
             .split(|c: char| !c.is_ascii_alphanumeric())
             .filter(|s| !s.is_empty())
@@ -61,9 +88,10 @@ fn exact_pr(brief: &str, reply: &str, number: u64) -> Result<()> {
     Ok(())
 }
 
-/// Only unambiguous repository forms bind: forge URLs, explicit repo or
-/// repository wording, and owner/name#N. Bare two-segment paths are not evidence.
-fn exact_repo(brief: &str, reply: &str, repo: &str) -> Result<()> {
+/// Only unambiguous repository forms bind: URLs on the clone's forge host or
+/// with pull/issue paths, explicit repo wording, and owner/name#N (N may name an
+/// issue and is not compared). Bare two-segment paths are not evidence.
+fn exact_repo(brief: &str, reply: &str, repo: &str, forge_host: Option<&str>) -> Result<()> {
     let check = |named: &str| -> Result<()> {
         ensure!(
             named.eq_ignore_ascii_case(repo),
@@ -82,18 +110,17 @@ fn exact_repo(brief: &str, reply: &str, repo: &str) -> Result<()> {
             })
     };
     for text in [brief, reply] {
-        let tokens: Vec<_> = text
-            .split(|c: char| !c.is_ascii_alphanumeric() && !"-._/#:".contains(c))
-            .filter(|s| !s.is_empty())
-            .collect();
+        let tokens: Vec<_> = evidence_tokens(text).collect();
         for (i, token) in tokens.iter().enumerate() {
-            let token = token.trim_end_matches('.');
-            if let Some((scheme, rest)) = token.split_once("://")
-                && (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
-            {
-                let parts: Vec<_> = rest.split('/').collect();
-                if parts.len() >= 3 && !parts[0].is_empty() {
-                    let named = format!("{}/{}", parts[1], parts[2]);
+            if let Some((host, path)) = http_url(token) {
+                let parts: Vec<_> = path.split('/').collect();
+                if parts.len() >= 2
+                    && (forge_host.is_some_and(|h| h.eq_ignore_ascii_case(host))
+                        || parts
+                            .iter()
+                            .any(|p| ["pull", "pulls", "issues"].contains(p)))
+                {
+                    let named = format!("{}/{}", parts[0], parts[1]);
                     if is_repo(&named) {
                         check(&named)?;
                     }
@@ -242,7 +269,9 @@ pub(super) fn record(store: &Store, args: &Value) -> Result<Value> {
         &json!({"task_id": task, "repo": requested_repo}),
         None,
     )?;
-    exact_repo(brief, reply, &clone.repo)?;
+    let origin = pr::git(&clone.dir, &["remote", "get-url", "origin"])?;
+    let forge_host = pr::repo_of_url(&origin).and_then(|(host, _)| host);
+    exact_repo(brief, reply, &clone.repo, forge_host.as_deref())?;
     let findings =
         filter::findings_lenient(reply, &clone.dir, &crate::credentials::stored_values()?)
             .map_err(|why| anyhow::anyhow!("refused by the filter: {why}"))?;
@@ -311,23 +340,43 @@ mod tests {
 
     #[test]
     fn repository_evidence_and_finding_paths() {
-        assert!(exact_repo("Review acme/widget", "", "acme/widget").is_ok());
+        let check = |brief, reply| exact_repo(brief, reply, "acme/widget", Some("forge.example"));
+        assert!(check("Review acme/other", "").is_ok());
         // Bare paths, including ones that could also be repo names, never bind.
         assert!(
-            exact_repo(
+            check(
                 "Review acme/other src/review.rs docs/x.md and/or",
-                "See tests/review_gate.rs",
-                "acme/widget"
+                "See tests/review_gate.rs"
             )
             .is_ok()
         );
-        for text in ["repo acme/other", "RePo: acme/other", "acme/other#42"] {
-            assert!(exact_repo(text, "", "acme/widget").is_err());
-            assert!(exact_repo("", text, "acme/other").is_ok());
+        for text in [
+            "repo acme/other",
+            "RePo: acme/other",
+            "acme/other#42",
+            "Repository: acme/other.",
+            "https://github.com/acme/other/pull/42",
+            "https://forge.example/acme/other",
+            "https://FORGE.example:3000/acme/other",
+            "http://elsewhere.example/acme/other/pulls/42",
+            "https://elsewhere.example/acme/other/issues/42",
+        ] {
+            assert!(check(text, "").is_err(), "{text}");
+            assert!(check("", text).is_err(), "{text}");
+            assert!(exact_repo("", text, "acme/other", Some("forge.example")).is_ok());
         }
-        assert!(exact_repo("", "Repository: acme/other.", "acme/widget").is_err());
-        assert!(exact_repo("https://github.com/acme/other/pull/42", "", "acme/widget").is_err());
-        assert!(exact_repo("", "- FINDING nit src/lib.rs:1 spelling", "acme/widget").is_ok());
+        for text in [
+            "https://docs.rs/anyhow/latest/anyhow/",
+            "https://doc.rust-lang.org/std/path/struct.Path.html",
+            "https://forge.example.evil/acme/other",
+            "- FINDING nit src/lib.rs:1 spelling",
+        ] {
+            assert!(check(text, "").is_ok(), "{text}");
+            assert!(check("", text).is_ok(), "{text}");
+        }
+        assert!(exact_repo("https://docs.rs/anyhow/latest", "", "acme/widget", None).is_ok());
+        // The suffix may name an issue, not the reviewed pull request.
+        assert!(check("acme/widget#999", "").is_ok());
     }
 
     #[test]
@@ -338,6 +387,8 @@ mod tests {
             "pr: 42",
             "pull request 42",
             "Pull Request #42",
+            "https://forge.example/acme/widget/pull/42",
+            "https://forge.example/acme/widget/pulls/42/files",
         ] {
             assert!(exact_pr(text, "", 42).is_ok());
             assert!(exact_pr("", text, 41).is_err());
@@ -346,6 +397,7 @@ mod tests {
         assert!(exact_pr("PR 774 (#772)", "See issue #771", 774).is_ok());
         assert!(exact_pr("PR 42", "PR: 41", 42).is_err());
         assert!(exact_pr("Review it", "", 42).is_ok());
+        assert!(exact_pr("https://forge.example/acme/widget/issues/41", "", 42).is_ok());
     }
 
     #[test]

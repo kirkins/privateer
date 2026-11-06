@@ -1252,7 +1252,10 @@ fn coverage(
             let name = review["route_name"].as_str().unwrap_or_default();
             if let Ok(authors) = &authors {
                 let why = if review["kind"] == "imported" {
-                    crate::crew_routes::reviewer_exclusion(review["route_model"].as_str(), authors)
+                    let model = review["route_model"]
+                        .as_str()
+                        .and_then(|model| crate::routes::model_key(&format!("-/-/{model}")));
+                    crate::crew_routes::reviewer_exclusion(model.as_deref(), authors)
                 } else {
                     policy.as_ref().and_then(|policy| {
                         crate::crew_routes::order_reviewers(&[name.to_owned()], policy, authors)

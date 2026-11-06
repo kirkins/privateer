@@ -140,7 +140,7 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
 
 /// The host and `owner/name` a remote address names: scp-like, URL or a
 /// local path, whose last two segments are taken.
-fn repo_of_url(url: &str) -> Option<(Option<String>, String)> {
+pub(super) fn repo_of_url(url: &str) -> Option<(Option<String>, String)> {
     let url = url.trim().trim_end_matches('/');
     let url = url.strip_suffix(".git").unwrap_or(url);
     let (host, path) = if let Some((_, rest)) = url.split_once("://") {

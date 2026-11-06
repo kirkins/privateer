@@ -21,12 +21,15 @@ filter as an errand review. An approval with a must-fix finding is refused.
 SHA exactly; missing or conflicting full SHAs are refused rather than guessed.
 Short SHAs in the evidence are not head evidence and are ignored, even if a
 matching full SHA also appears. Explicit `PR N`, `PR #N`, `PR: N`,
-`pull request N` and `pull request #N` references (case-insensitive) in the
-brief or reply must match `pr`. Bare `#N` references are ignored so that
-`PR 774 (#772)` can cite an issue. Repository evidence must match the selected
-clone: only forge URLs, `repo owner/name`, `repository owner/name`, and
-`owner/name#N` bind. Bare two-segment tokens such as `src/review.rs`, `docs/x.md`
-and `and/or` are ignored, including outside `FINDING` lines.
+`pull request N` and `pull request #N` references (case-insensitive), and
+forge URLs containing `/pull/N` or `/pulls/N`, in the brief or reply must match
+`pr`. Bare `#N` references are ignored so that `PR 774 (#772)` can cite an issue.
+Repository evidence must match the selected clone: URLs on the clone's forge
+host or with `/pull/`, `/pulls/` or `/issues/` paths, `repo owner/name`,
+`repository owner/name`, and `owner/name#N` bind. In `owner/name#N`, N is not
+compared with `pr` because it may name an issue. Other URLs (such as docs.rs
+and doc.rust-lang.org) and bare two-segment tokens such as `src/review.rs`,
+`docs/x.md` and `and/or` are ignored, including outside `FINDING` lines.
 For example, the saved brief can say `Review repo acme/widget PR #42 at head <full sha>`.
 Failed, unfinished or resumed (non-fresh) errands and another ship's errands
 are refused.
@@ -44,6 +47,8 @@ Legacy imports with unknown tier and other weaker approvals are reported as
 approvals that do not cover. Non-imported reviews retain their current-route
 coverage rules. Imported approvals retain the author-exclusion warning: the
 saved reviewer model is compared with the crew authors, not today's route model.
+An unknown or bare-alias model retains the same "its model cannot be named"
+exclusion warning as a live review.
 
 ## Historical setup kit
 
