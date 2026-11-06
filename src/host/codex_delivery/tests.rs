@@ -94,6 +94,9 @@ fn codex_delivery_grant_and_revoke_are_the_captains_alone() {
     );
 }
 
+// Hosted delivery uses Linux process identity/pidfds; folder() refuses on
+// macOS before starting the adapter. Test that explicit status separately.
+#[cfg(target_os = "linux")]
 #[test]
 fn codex_delivery_status_exposes_durable_pre_spawn_refusal_without_spending_or_resetting() {
     let mut f = Fixture::new();
@@ -132,6 +135,60 @@ fn codex_delivery_status_exposes_durable_pre_spawn_refusal_without_spending_or_r
     assert_eq!(report["runner"]["pre_spawn_fence"], refusal);
     assert_eq!(report["runner"]["diagnostic"], refusal["diagnostic"]);
     assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn codex_delivery_status_explicitly_reports_unsupported_host() {
+    let mut f = Fixture::new();
+    let report = f
+        .agent("attended.codex.status", json!({"ship": "alpha"}))
+        .unwrap();
+    assert_eq!(report["runner"]["unavailable"], true, "{report}");
+    assert_eq!(
+        report["runner"]["reason"],
+        "hosted Codex delivery is Linux-only"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_delivery_status_reports_missing_launch_and_failed_adapter() {
+    let mut f = Fixture::new();
+    fs::remove_file(f.dir.join("launch.json")).unwrap();
+    let report = f
+        .agent("attended.codex.status", json!({"ship": "alpha"}))
+        .unwrap();
+    assert_eq!(report["runner"]["unavailable"], true, "{report}");
+    assert_eq!(report["runner"]["reason"], "no local attended Codex launch");
+
+    // An invalid launch makes the real adapter refuse (or, if Python is
+    // absent, its spawn fails). Neither failure may silently drop runner.
+    fs::write(f.dir.join("launch.json"), b"not JSON").unwrap();
+    let report = f
+        .agent("attended.codex.status", json!({"ship": "alpha"}))
+        .unwrap();
+    assert_eq!(report["runner"]["unavailable"], true, "{report}");
+    assert!(!report["runner"]["reason"].as_str().unwrap().is_empty());
+}
+
+#[test]
+fn codex_delivery_status_reports_non_local_ship() {
+    let mut f = Fixture::new();
+    fs::write(f.store.home().join("config.json"), br#"{"ship":"beta"}"#).unwrap();
+    let report = f
+        .agent("attended.codex.status", json!({"ship": "alpha"}))
+        .unwrap();
+    assert_eq!(report["runner"]["unavailable"], true, "{report}");
+    let reason = report["runner"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(if cfg!(target_os = "linux") {
+            "ship folder"
+        } else {
+            "Linux-only"
+        }),
+        "{report}"
+    );
 }
 
 #[test]

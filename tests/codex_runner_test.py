@@ -1370,6 +1370,41 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(runner.tick(self.registry), {"tick": "idle"})
         self.assert_not_invoked()
 
+    def test_malformed_pre_spawn_events_do_not_block_refusal_or_recovery(self):
+        self.settle_setup_offer()
+        self.prepare(after=1, reserve=False)
+        spent = self.grant["spent"]
+        self.loaded_sessions = []
+        with self.assertRaises(runner.LoadedThreadRefused):
+            self.runner.dispatch()
+        refusal = self.runner.ledger.read()["runner"]["pre_spawn_fence"]
+        cleared = {"diagnostic": runner.PRE_SPAWN_FENCE_REFUSED, "state": "cleared", "at_ms": 1}
+        malformed = [None, {}, "bad", 1, [None], ["bad"], [{}],
+                     [{**refusal, "context": []}], [{**refusal, "at_ms": True}],
+                     [{**cleared, "state": "unknown"}], [{**cleared, "at_ms": -1}],
+                     [cleared, {**cleared, "unexpected": "field"}]]
+        for entry in malformed:
+            with self.subTest(entry=entry):
+                self.mutate(lambda v: v["runner"].update(pre_spawn_fence_events=entry))
+                a = runner.accounting(self.runner.ledger.read())
+                self.assertEqual(a["pre_spawn_fence_events"], [])
+                self.assertEqual(a["pre_spawn_fence"], refusal)
+                self.loaded_sessions = [self.session]
+                self.runner.refresh_pre_spawn_fence(self.record)
+                a = self.runner.ledger.read()["runner"]
+                self.assertNotIn("pre_spawn_fence", a)
+                self.assertEqual([e["state"] for e in a["pre_spawn_fence_events"]], ["cleared"])
+                self.loaded_sessions = []
+                with self.assertRaises(runner.LoadedThreadRefused):
+                    self.runner.dispatch()
+                a = runner.accounting(self.runner.ledger.read())
+                refusal = a["pre_spawn_fence"]
+                self.assertEqual(a["pre_spawn_fence_events"][1], refusal)
+                self.assertEqual(a["possibly_unattended_spent"], 0)
+                self.assertEqual(self.grant["spent"], spent)
+                self.assertNotIn("reservation", self.runner.ledger.read()["sessions"][self.session]["intent"])
+        self.assert_not_invoked()
+
     def test_sticky_pause_never_advertises_transient_recovery(self):
         self.loaded_sessions = []
         with self.assertRaises(runner.LoadedThreadRefused):

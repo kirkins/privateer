@@ -122,16 +122,18 @@ fn folder(store: &Store, ship: &str) -> Result<PathBuf> {
 /// Keep fleet/non-hosted status usable without requiring a local launch.
 fn delivery_status(store: &Store, ship: &str) -> Result<Value> {
     let mut result = status(store.connection(), ship)?;
-    if let Ok(folder) = folder(store, ship) {
+    // In particular, folder() refuses on macOS before Python is even started.
+    // An unsupported host, missing launch or failed child must be visible too.
+    let report = (|| -> Result<Value> {
+        let folder = folder(store, ship)?;
         let launch = folder.join(".codex/privateer-attended/launch.json");
-        if launch.exists() {
-            result["runner"] =
-                match adapter(&folder, ["codex_runner.py", "status"], &launch, &json!({})) {
-                    Ok(report) => report,
-                    Err(_) => json!({"unavailable": true}),
-                };
-        }
-    }
+        ensure!(launch.exists(), "no local attended Codex launch");
+        adapter(&folder, ["codex_runner.py", "status"], &launch, &json!({}))
+    })();
+    result["runner"] = match report {
+        Ok(report) => report,
+        Err(error) => json!({"unavailable": true, "reason": format!("{error:#}")}),
+    };
     Ok(result)
 }
 

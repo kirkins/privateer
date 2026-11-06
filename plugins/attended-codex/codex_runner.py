@@ -258,6 +258,25 @@ def presence_check(presence, record):
             "hosted presence changed or expired")
 
 
+def valid_pre_spawn_fence(refusal):
+    context = refusal.get("context") if isinstance(refusal, dict) else None
+    facts = refusal.get("facts") if isinstance(refusal, dict) else None
+    return (isinstance(context, dict)
+            and set(context) == {"generation", "callback_generation", "session", "holder"}
+            and all(isinstance(v, str) and v for v in context.values())
+            and isinstance(facts, dict)
+            and set(facts) == {"loaded_count", "threads_in_cwd", "bound_uuid_loaded",
+                               "cursor_state", "cwd_thread_is_bound"}
+            and all(facts[k] is None or type(facts[k]) is int and facts[k] >= 0
+                    for k in ("loaded_count", "threads_in_cwd"))
+            and all(facts[k] is None or type(facts[k]) is bool
+                    for k in ("bound_uuid_loaded", "cwd_thread_is_bound"))
+            and facts["cursor_state"] in ("missing", "null", "non-null")
+            and refusal.get("diagnostic") == PRE_SPAWN_FENCE_REFUSED
+            and refusal.get("clears_when") == FENCE_CLEARS_WHEN
+            and type(refusal.get("at_ms")) is int and refusal["at_ms"] >= 0)
+
+
 def accounting(value):
     result = value.setdefault("runner", {"possibly_unattended_spent": 0, "declines": 0,
                                          "accepted_through": 0, "retry_after_ms": 0,
@@ -285,24 +304,17 @@ def accounting(value):
     if refusal is not None:
         # A corrupt optional diagnostic is absent, not an exception that kills
         # every tick/status. It never authorizes a spawn: dispatch fences anew.
-        context = refusal.get("context") if isinstance(refusal, dict) else None
-        facts = refusal.get("facts") if isinstance(refusal, dict) else None
-        valid = (isinstance(context, dict)
-                 and set(context) == {"generation", "callback_generation", "session", "holder"}
-                 and all(isinstance(v, str) and v for v in context.values())
-                 and isinstance(facts, dict)
-                 and set(facts) == {"loaded_count", "threads_in_cwd", "bound_uuid_loaded",
-                                    "cursor_state", "cwd_thread_is_bound"}
-                 and all(facts[k] is None or type(facts[k]) is int and facts[k] >= 0
-                         for k in ("loaded_count", "threads_in_cwd"))
-                 and all(facts[k] is None or type(facts[k]) is bool
-                         for k in ("bound_uuid_loaded", "cwd_thread_is_bound"))
-                 and facts["cursor_state"] in ("missing", "null", "non-null")
-                 and refusal.get("diagnostic") == PRE_SPAWN_FENCE_REFUSED
-                 and refusal.get("clears_when") == FENCE_CLEARS_WHEN
-                 and type(refusal.get("at_ms")) is int and refusal["at_ms"] >= 0)
-        if not valid:
+        if not valid_pre_spawn_fence(refusal):
             result.pop("pre_spawn_fence", None)
+    events = result.setdefault("pre_spawn_fence_events", [])
+    if not (isinstance(events, list) and all(
+            valid_pre_spawn_fence(event) or (
+                isinstance(event, dict) and set(event) == {"diagnostic", "state", "at_ms"}
+                and event["diagnostic"] == PRE_SPAWN_FENCE_REFUSED and event["state"] == "cleared"
+                and type(event["at_ms"]) is int and event["at_ms"] >= 0)
+            for event in events)):
+        # Optional history cannot break recording the next refusal/recovery.
+        result["pre_spawn_fence_events"] = []
     return result
 
 
