@@ -247,6 +247,7 @@ fn fact(conn: &Connection, id: &str, new: Option<&Provenance>) -> Result<Option<
         "delivery_error",
         "delivered_ms",
         "remote_end_state",
+        "premise_outcome",
     ] {
         content.as_object_mut().unwrap().remove(key);
     }

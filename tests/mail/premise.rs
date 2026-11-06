@@ -1,0 +1,255 @@
+use super::*;
+
+#[test]
+fn premise_and_resolution_cross_the_existing_outbox_to_a_peer() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        ..
+    } = pair();
+    let repo = _temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    dispatch(
+        &mut a,
+        "charter.put",
+        json!({"id":"project","objective":"Deliver","repo":repo,"min_free_bytes":0}),
+    )
+    .unwrap();
+    dispatch(
+        &mut a,
+        "task.create",
+        json!({"id":"work","charter_id":"project","owner":"apps","title":"Deliver"}),
+    )
+    .unwrap();
+    let premise = json!({"kind":"task","ref":"work"});
+    send(&mut a,json!({"id":"peer-ask","from":"apps","to":"infra","kind":"request","body":"Review?","premise":premise})).unwrap();
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":"peer-ask"})).unwrap()["premise"],
+        premise
+    );
+    dispatch(
+        &mut a,
+        "task.update",
+        json!({"id":"work","owner":"apps","status":"cancelled"}),
+    )
+    .unwrap();
+    dispatch(&mut a, "mail.flush", json!({})).unwrap();
+    let ask = dispatch(&mut b, "mail.show", json!({"id":"peer-ask"})).unwrap();
+    assert_eq!(ask["state"], "open");
+    assert_eq!(ask["premise_outcome"], "cancelled");
+    assert_eq!(notices(&a), 1);
+    assert_eq!(notices(&b), 0);
+    dispatch(&mut a, "mail.flush", json!({})).unwrap();
+    let count: i64 = b
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM mail WHERE json_extract(payload,'$.premise_changed') IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn failed_notice_rolls_back_task_outcome_and_can_retry_without_loss() {
+    let (_temp, mut store) = fleet();
+    send(&mut store,json!({"id":"atomic","from":"apps","to":"captain","kind":"request","body":"Review?","premise":{"kind":"task","ref":"main"}})).unwrap();
+    store.connection().execute_batch("CREATE TRIGGER fail_premise BEFORE INSERT ON mail WHEN json_extract(NEW.payload,'$.premise_changed') IS NOT NULL BEGIN SELECT RAISE(ABORT,'notice failed'); END;").unwrap();
+    assert!(
+        dispatch(
+            &mut store,
+            "task.update",
+            json!({"id":"main","owner":"apps","status":"done"})
+        )
+        .is_err()
+    );
+    assert_eq!(notices(&store), 0);
+    assert_eq!(
+        dispatch(&mut store, "task.show", json!({"id":"main"})).unwrap()["status"],
+        "open"
+    );
+    assert!(
+        dispatch(&mut store, "mail.show", json!({"id":"atomic"})).unwrap()["premise_outcome"]
+            .is_null()
+    );
+    store
+        .connection()
+        .execute_batch("DROP TRIGGER fail_premise;")
+        .unwrap();
+    dispatch(
+        &mut store,
+        "task.update",
+        json!({"id":"main","owner":"apps","status":"done"}),
+    )
+    .unwrap();
+    assert_eq!(notices(&store), 1);
+}
+
+fn notices(store: &Store) -> i64 {
+    store.connection().query_row("SELECT count(*) FROM mail WHERE sender='crew' AND json_extract(payload,'$.premise_changed') IS NOT NULL", [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn accepts_typed_premises_and_refuses_malformed_missing_or_foreign_tasks() {
+    let (_temp, mut store) = fleet();
+    for (id, premise) in [
+        ("task-ask", json!({"kind":"task","ref":"main"})),
+        (
+            "pr-ask",
+            json!({"kind":"pr","repo":"acme/project","number":7}),
+        ),
+        (
+            "issue-ask",
+            json!({"kind":"issue","repo":"acme/project","number":8}),
+        ),
+    ] {
+        let args = json!({"id":id,"from":"apps","to":"captain","kind":"request","body":"Review this","premise":premise});
+        assert_eq!(send(&mut store, args.clone()).unwrap()["premise"], premise);
+        assert_eq!(send(&mut store, args).unwrap()["duplicate"], true);
+        assert!(send(&mut store,json!({"id":id,"from":"apps","to":"captain","kind":"request","body":"Review this","premise":{"kind":"task","ref":"main"},"payload":{"different":true}})).is_err());
+    }
+    for (premise, expected) in [
+        (
+            json!({"kind":"task","ref":"missing"}),
+            "premise task must exist",
+        ),
+        (json!({"kind":"pr","repo":"bad","number":1}), "premise repo"),
+        (
+            json!({"kind":"issue","repo":"acme/project","number":0}),
+            "premise number",
+        ),
+        (json!({"kind":"text","ref":"main"}), "premise must be"),
+    ] {
+        assert!(err(send(&mut store,json!({"from":"apps","to":"captain","kind":"decision","body":"Review this","premise":premise}))).contains(expected));
+    }
+    assert!(err(send(&mut store,json!({"from":"infra","to":"captain","kind":"request","body":"Review this","premise":{"kind":"task","ref":"main"}}))).contains("belong to the sender"));
+    assert!(err(send(&mut store,json!({"from":"apps","to":"captain","kind":"notice","body":"Review this","premise":{"kind":"task","ref":"main"}}))).contains("premise applies only"));
+    assert!(
+        send(
+            &mut store,
+            json!({"from":"apps","to":"captain","kind":"notice","payload":{"premise_changed":{}}})
+        )
+        .is_err()
+    );
+    let bearings = dispatch(&mut store, "ship.bearings", json!({"ship":"apps"}))
+        .unwrap()
+        .to_string();
+    assert!(
+        bearings.contains("pr acme/project#7 (not observed)"),
+        "{bearings}"
+    );
+    assert!(bearings.contains("issue acme/project#8 (not observed)"));
+}
+
+#[test]
+fn terminal_premise_notifies_each_open_ask_once_and_keeps_its_decision_unchanged_across_restart() {
+    for status in ["done", "cancelled"] {
+        let (_temp, mut store) = fleet();
+        for (id, kind) in [
+            ("open-request", "request"),
+            ("open-decision", "decision"),
+            ("answered", "request"),
+            ("withdrawn", "request"),
+            ("ended", "request"),
+        ] {
+            send(&mut store,json!({"id":id,"from":"apps","to":"captain","kind":kind,"body":"Still needed?","premise":{"kind":"task","ref":"main"}})).unwrap();
+        }
+        send(&mut store,json!({"from":"captain","to":"apps","kind":"reply","correlation":"answered","body":"Yes"})).unwrap();
+        dispatch(
+            &mut store,
+            "mail.withdraw",
+            json!({"id":"withdrawn","actor":"apps"}),
+        )
+        .unwrap();
+        dispatch(&mut store, "captain.dismiss", json!({"id":"ended"})).unwrap();
+        assert_eq!(notices(&store), 0);
+        dispatch(
+            &mut store,
+            "task.update",
+            json!({"id":"main","owner":"apps","status":status}),
+        )
+        .unwrap();
+        assert_eq!(notices(&store), 2);
+        for id in ["open-request", "open-decision"] {
+            let ask = dispatch(&mut store, "mail.show", json!({"id":id})).unwrap();
+            assert_eq!(ask["state"], "open");
+            assert_eq!(ask["premise_outcome"], status);
+            assert_eq!(ask["premise_stale"], true);
+            let text: String = store
+                .connection()
+                .query_row(
+                    "SELECT body FROM mail WHERE sender='crew' AND correlation=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                text.contains(&format!("premise task main is {status}")),
+                "{text}"
+            );
+        }
+        let bearings = dispatch(&mut store, "ship.bearings", json!({"ship":"apps"}))
+            .unwrap()
+            .to_string();
+        assert!(
+            bearings.contains(&format!("{status}; ask may be stale")),
+            "{bearings}"
+        );
+        let waiting = dispatch(&mut store, "captain.waiting", json!({}))
+            .unwrap()
+            .to_string();
+        assert!(waiting.contains("premise_outcome"));
+        let home = store.home().to_path_buf();
+        drop(store);
+        let mut store = Store::open(&home).unwrap();
+        dispatch(
+            &mut store,
+            "task.update",
+            json!({"id":"main","owner":"apps","status":status}),
+        )
+        .unwrap();
+        assert_eq!(notices(&store), 2);
+        // Display-only staleness must not replace the captain's actual answer.
+        send(&mut store,json!({"from":"captain","to":"apps","kind":"reply","correlation":"open-decision","body":"Yes"})).unwrap();
+        let ask = dispatch(&mut store, "mail.show", json!({"id":"open-decision"})).unwrap();
+        assert_eq!(ask["state"], "answered");
+        assert_eq!(ask["premise_outcome"], status);
+    }
+}
+
+#[test]
+fn already_terminal_premise_is_recorded_and_notified_in_the_send_transaction() {
+    let (_temp, mut store) = fleet();
+    dispatch(
+        &mut store,
+        "task.update",
+        json!({"id":"main","owner":"apps","status":"cancelled"}),
+    )
+    .unwrap();
+    let args = json!({"id":"late","from":"apps","to":"captain","kind":"request","body":"Review","premise":{"kind":"task","ref":"main"}});
+    assert_eq!(
+        send(&mut store, args.clone()).unwrap()["premise_outcome"],
+        "cancelled"
+    );
+    send(&mut store, args).unwrap();
+    assert_eq!(notices(&store), 1);
+}
+
+#[test]
+fn task_link_closure_takes_precedence_over_premise_wake() {
+    let (_temp, mut store) = fleet();
+    send(&mut store,json!({"id":"linked","from":"apps","to":"captain","kind":"request","body":"Review","task_id":"main","premise":{"kind":"task","ref":"main"}})).unwrap();
+    dispatch(
+        &mut store,
+        "task.update",
+        json!({"id":"main","owner":"apps","status":"done"}),
+    )
+    .unwrap();
+    assert_eq!(notices(&store), 0);
+    assert_eq!(
+        dispatch(&mut store, "mail.show", json!({"id":"linked"})).unwrap()["state"],
+        "task_done"
+    );
+}

@@ -451,6 +451,9 @@ class Door:
         if report is not None:
             line = report_line(report)
             body = f"{body}\n\n{line}" if body else line
+        premise = premise_text(mail)
+        if premise:
+            body = f"{body}\n\n{premise}"
         if event.get("step"):
             # The exact thing only the captain can do, ahead of the request's words.
             body = f"**Your hands:** {event['step']}\n\n{body}"
@@ -1542,6 +1545,18 @@ def decision_text(decision: dict, body: str) -> str:
     if body:
         parts.append(body)
     return "\n\n".join(part for part in parts if part)
+
+
+def premise_text(mail: dict) -> str:
+    premise = mail.get("premise")
+    if not isinstance(premise, dict):
+        return ""
+    if premise.get("kind") == "task":
+        label = f"task {premise.get('ref', '?')}"
+    else:
+        label = f"{premise.get('kind', '?')} {premise.get('repo', '?')}#{premise.get('number', '?')} (not observed)"
+    outcome = mail.get("premise_outcome")
+    return f"Premise: {label}" + (f" — {outcome}; this ask may be stale. No answer or approval was changed." if outcome else "")
 
 
 def privileged_of(mail: dict) -> dict | None:

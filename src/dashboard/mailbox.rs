@@ -172,11 +172,15 @@ impl Mailbox {
                 {
                     let id = m["id"].as_str().context("mail without id")?;
                     let seq = m["seq"].as_i64().context("mail without sequence")?;
-                    let body = m["body"].as_str().unwrap_or("");
+                    let body = format!(
+                        "{}{}",
+                        m["body"].as_str().unwrap_or(""),
+                        crate::mail::premise::display(&m["premise"], m["premise_outcome"].as_str())
+                    );
                     let preview = if body.is_empty() {
                         m["payload"].to_string()
                     } else {
-                        body.into()
+                        body.clone()
                     };
                     rows.insert(
                         seq,

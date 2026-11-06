@@ -483,6 +483,8 @@ fn observe(
                 item["mail_kind"] = message["kind"].clone();
                 item["urgency"] = message["urgency"].clone();
                 item["deadline_ms"] = message["deadline_ms"].clone();
+                item["premise"] = message["premise"].clone();
+                item["premise_outcome"] = message["premise_outcome"].clone();
                 item["asked_ms"] = message["created_ms"].clone();
                 item["needs_hands"] = json!(payload.get("needs_hands").is_some());
             }

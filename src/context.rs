@@ -494,24 +494,36 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         }
     }
     let owed = lines(
-        "SELECT id, sender, body FROM mail WHERE recipient=?1 AND state='open' ORDER BY seq LIMIT 10",
+        "SELECT id, sender, body, premise, premise_outcome FROM mail WHERE recipient=?1 AND state='open' ORDER BY seq LIMIT 10",
         &|r| {
             Ok(format!(
-                "{} from {}: {}",
+                "{} from {}: {}{}",
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
-                clip(&r.get::<_, String>(2)?, LINE_CHARS)
+                clip(&r.get::<_, String>(2)?, LINE_CHARS),
+                crate::mail::premise::display(
+                    &r.get::<_, Option<String>>(3)?
+                        .and_then(|p| serde_json::from_str(&p).ok())
+                        .unwrap_or(Value::Null),
+                    r.get::<_, Option<String>>(4)?.as_deref()
+                )
             ))
         },
     )?;
     let owing = lines(
-        "SELECT id, recipient, body FROM mail WHERE sender=?1 AND state='open' ORDER BY seq LIMIT 10",
+        "SELECT id, recipient, body, premise, premise_outcome FROM mail WHERE sender=?1 AND state='open' ORDER BY seq LIMIT 10",
         &|r| {
             Ok(format!(
-                "{} to {}: {}",
+                "{} to {}: {}{}",
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
-                clip(&r.get::<_, String>(2)?, LINE_CHARS)
+                clip(&r.get::<_, String>(2)?, LINE_CHARS),
+                crate::mail::premise::display(
+                    &r.get::<_, Option<String>>(3)?
+                        .and_then(|p| serde_json::from_str(&p).ok())
+                        .unwrap_or(Value::Null),
+                    r.get::<_, Option<String>>(4)?.as_deref()
+                )
             ))
         },
     )?;

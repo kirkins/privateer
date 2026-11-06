@@ -1,3 +1,5 @@
+#[path = "mail/premise.rs"]
+mod premise;
 mod support;
 
 use privateer::store::{Caller, Store};
@@ -1813,7 +1815,7 @@ fn outgoing_mail_is_limited_by_its_normalized_wire_bytes() {
         let mut wire = json!({"id":mode,"from":"apps","to":"infra",
             "kind":"notice","body":"\"\\\n船","payload":{},"correlation":null,
             "request_kind":null,"urgency":"normal","deadline_ms":null,"created_ms":now,
-            "because_of":null});
+            "because_of":null,"premise":null});
         if mode == "generated-id" {
             args.as_object_mut().unwrap().remove("id");
             wire["id"] = json!("00000000-0000-0000-0000-000000000000");

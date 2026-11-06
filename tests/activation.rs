@@ -1201,6 +1201,50 @@ fn routine_notices_wait_for_the_next_real_wake() {
 }
 
 #[test]
+fn terminal_premise_wakes_the_requester_once_through_ordinary_mail() {
+    for status in ["done", "cancelled"] {
+        let mut fleet = Fleet::new(now_settings());
+        fleet.send(
+            json!({"id":"premise-ask","from":"infra","to":"captain","kind":"request",
+            "body":"Is this still needed?","premise":{"kind":"task","ref":"infra-repair"}}),
+        );
+        assert_eq!(
+            Fleet::infra(&fleet.tick())["skipped"],
+            "nothing wake-worthy"
+        );
+        fleet.ok(
+            "task.update",
+            json!({"id":"infra-repair","owner":"infra","status":status}),
+            Some("infra"),
+        );
+        let woke = Fleet::infra(&fleet.tick());
+        assert_eq!(woke["status"], "running", "{woke}");
+        assert_eq!(fleet.settle()["status"], "succeeded");
+        let prompt = fleet.prompts().last().unwrap().clone();
+        assert!(prompt.contains("premise-ask"), "{prompt}");
+        assert!(
+            prompt.contains(&format!("premise task infra-repair is {status}")),
+            "{prompt}"
+        );
+        assert_eq!(
+            fleet.ok("mail.show", json!({"id":"premise-ask"}), None)["state"],
+            "open"
+        );
+        let count = fleet.wakes().len();
+        fleet.ok(
+            "task.update",
+            json!({"id":"infra-repair","owner":"infra","status":status}),
+            Some("infra"),
+        );
+        assert_eq!(
+            Fleet::infra(&fleet.tick())["skipped"],
+            "nothing wake-worthy"
+        );
+        assert_eq!(fleet.wakes().len(), count);
+    }
+}
+
+#[test]
 fn a_correction_in_the_thread_of_an_open_follow_up_wakes_the_ship_that_raised_it() {
     // The stow incident, replayed: the machine is held for an update, a ship
     // asks it something, this ship answers and raises a follow-up on the
