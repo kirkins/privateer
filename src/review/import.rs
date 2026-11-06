@@ -26,19 +26,79 @@ fn exact_head(brief: &str, reply: &str, head: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn record(store: &Store, args: &Value) -> Result<Value> {
-    let ship = first_mate(store, "review.record")?;
-    let errand = required(args, "errand_id")?;
-    let number = pr_number(args)?;
-    let head = required(args, "head_sha")?;
-    ensure!(
-        head.len() == 40 && head.bytes().all(|b| b.is_ascii_hexdigit()),
-        "head_sha must be the full 40-character sha"
-    );
-    // The lock serializes retries and concurrent importers. In particular,
-    // checking the owner precedes returning an existing record.
-    let tx = store.write_transaction()?;
-    let saved: Value = tx.query_row(
+/// Bind every explicit PR reference in the saved evidence. A bare #N is
+/// deliberately treated as a PR reference rather than guessing its meaning.
+fn exact_pr(brief: &str, reply: &str, number: u64) -> Result<()> {
+    let check = |named: &str| -> Result<()> {
+        ensure!(
+            named.parse::<u64>().ok() == Some(number),
+            "the errand names PR #{named}, not requested PR #{number}"
+        );
+        Ok(())
+    };
+    for text in [brief, reply] {
+        for after in text.split('#').skip(1) {
+            let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+            if !digits.is_empty() {
+                check(&digits)?;
+            }
+        }
+        let words: Vec<_> = text
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .collect();
+        for words in words.windows(3) {
+            if words[0].eq_ignore_ascii_case("pull")
+                && words[1].eq_ignore_ascii_case("request")
+                && words[2].bytes().all(|b| b.is_ascii_digit())
+            {
+                check(words[2])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bare owner/name references outside structured findings are repository
+/// evidence, as are forge pull-request URLs. Finding paths are code paths.
+fn exact_repo(brief: &str, reply: &str, repo: &str) -> Result<()> {
+    let check = |named: &str| -> Result<()> {
+        ensure!(
+            named.eq_ignore_ascii_case(repo),
+            "the errand names repository {named}, not selected repository {repo}"
+        );
+        Ok(())
+    };
+    for line in brief.lines().chain(reply.lines()) {
+        if line
+            .trim_start()
+            .trim_start_matches("- ")
+            .starts_with("FINDING ")
+        {
+            continue;
+        }
+        for token in line.split(|c: char| !c.is_ascii_alphanumeric() && !"-._/".contains(c)) {
+            let token = token.trim_end_matches('.');
+            let parts: Vec<_> = token.split('/').collect();
+            if parts.len() == 2
+                && !parts[0].is_empty()
+                && parts[0]
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                && !parts[1].is_empty()
+            {
+                check(token)?;
+            } else if token.starts_with("//") && parts.len() >= 5 {
+                // The scheme's colon splits https://host/owner/name/... .
+                check(&format!("{}/{}", parts[3], parts[4]))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn saved_errand(conn: &rusqlite::Connection, errand: &str, ship: &str) -> Result<Value> {
+    let mut saved: Value = conn.query_row(
         "SELECT ship, task_id, brief, status, finished_ms, verdict, mode,
            route, model_route, route_why, route_info FROM errands WHERE id=?1",
         [errand],
@@ -52,30 +112,90 @@ pub(super) fn record(store: &Store, args: &Value) -> Result<Value> {
         })),
     ).optional()?.context("no such errand")?;
     ensure!(saved["ship"] == ship, "errand {errand} is not {ship}'s");
-    let existing = tx
+    // Only the runtime's durable verdict notice confirms settlement.
+    saved["confirmed"] = json!(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mail WHERE id=?1 AND sender=?2 AND recipient=?3
+           AND kind='notice' AND json_extract(payload,'$.errand')=?4
+           AND json_extract(payload,'$.status')='succeeded')",
+        params![format!("{errand}-verdict"), crate::mail::CREW, ship, errand],
+        |r| r.get::<_, bool>(0),
+    )?);
+    Ok(saved)
+}
+
+fn existing_record(
+    conn: &rusqlite::Connection,
+    errand: &str,
+    number: u64,
+    head: &str,
+    repo: Option<&str>,
+) -> Result<Option<Value>> {
+    let existing = conn
         .query_row(
             &format!("SELECT {COLUMNS} FROM reviews WHERE errand_id=?1"),
             [errand],
             row,
         )
         .optional()?;
-    if let Some(existing) = existing {
+    if let Some(existing) = &existing {
+        ensure!(
+            existing["pr"].as_u64() == Some(number) && existing["head_sha"] == head,
+            "errand {errand} already has a review for PR #{} at head {}",
+            existing["pr"],
+            existing["head_sha"].as_str().unwrap_or_default()
+        );
+        if let Some(repo) = repo {
+            ensure!(
+                existing["repo"]
+                    .as_str()
+                    .is_some_and(|r| r.eq_ignore_ascii_case(repo)),
+                "errand {errand} already has a review in repository {} for PR #{} at head {}",
+                existing["repo"],
+                existing["pr"],
+                existing["head_sha"]
+            );
+        }
+    }
+    Ok(existing)
+}
+
+pub(super) fn record(store: &Store, args: &Value) -> Result<Value> {
+    let ship = first_mate(store, "review.record")?;
+    let errand = required(args, "errand_id")?;
+    let number = pr_number(args)?;
+    let head = required(args, "head_sha")?;
+    let requested_repo = args
+        .get("repo")
+        .filter(|r| !r.is_null())
+        .map(|r| r.as_str().context("repo must be owner/name"))
+        .transpose()?;
+    ensure!(
+        head.len() == 40
+            && head
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "head_sha must be the full 40-character sha in lowercase hex"
+    );
+    // Read without a write lock: git subprocesses and credential filtering
+    // below can be slow. Recheck the evidence under the lock before insert.
+    let saved = saved_errand(store.connection(), errand, &ship)?;
+    if let Some(existing) =
+        existing_record(store.connection(), errand, number, head, requested_repo)?
+    {
         return Ok(existing);
     }
+    ensure!(
+        saved["mode"] == "fresh",
+        "only fresh errands may be imported, not resumed sessions"
+    );
     ensure!(
         saved["status"] == "succeeded" && saved["finished_ms"].is_i64(),
         "errand {errand} has not finished successfully"
     );
-    // Only the runtime's durable verdict notice confirms settlement. A
-    // user-written mail or an unconfirmed reply from a failed run cannot do so.
-    let confirmed: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM mail WHERE id=?1 AND sender=?2 AND recipient=?3
-           AND kind='notice' AND json_extract(payload,'$.errand')=?4
-           AND json_extract(payload,'$.status')='succeeded')",
-        params![format!("{errand}-verdict"), crate::mail::CREW, ship, errand],
-        |r| r.get(0),
-    )?;
-    ensure!(confirmed, "errand {errand} has no confirmed verdict mail");
+    ensure!(
+        saved["confirmed"] == true,
+        "errand {errand} has no confirmed verdict mail"
+    );
     let reply = saved["verdict"].as_str().context("errand has no verdict")?;
     ensure!(
         reply
@@ -87,11 +207,19 @@ pub(super) fn record(store: &Store, args: &Value) -> Result<Value> {
     );
     let verdict = filter::verdict(reply);
     ensure!(verdict != "none", "the errand has no final VERDICT line");
-    exact_head(saved["brief"].as_str().unwrap_or_default(), reply, head)?;
+    let brief = saved["brief"].as_str().unwrap_or_default();
+    exact_head(brief, reply, head)?;
+    exact_pr(brief, reply, number)?;
     let task = saved["task_id"].as_str().context("errand task")?;
     // Locating the clone reads only local git configuration; unlike
     // record_errand, this deliberately never reads a live PR or fetches it.
-    let (_, _, clone) = task_clone(store, &ship, &json!({"task_id": task}), None)?;
+    let (_, _, clone) = task_clone(
+        store,
+        &ship,
+        &json!({"task_id": task, "repo": requested_repo}),
+        None,
+    )?;
+    exact_repo(brief, reply, &clone.repo)?;
     let findings =
         filter::findings_lenient(reply, &clone.dir, &crate::credentials::stored_values()?)
             .map_err(|why| anyhow::anyhow!("refused by the filter: {why}"))?;
@@ -111,6 +239,15 @@ pub(super) fn record(store: &Store, args: &Value) -> Result<Value> {
     let model = crate::routes::model_key(identity).unwrap_or_default();
     let id = format!("review-{}", uuid::Uuid::new_v4());
     let now = Store::now_ms();
+    let tx = store.write_transaction()?;
+    let current = saved_errand(&tx, errand, &ship)?;
+    if let Some(existing) = existing_record(&tx, errand, number, head, requested_repo)? {
+        return Ok(existing);
+    }
+    ensure!(
+        current == saved,
+        "errand evidence changed during import; retry"
+    );
     tx.execute(
         "INSERT INTO reviews(id, ship, task_id, forge, repo, pr, base_ref, base_sha, head_ref,
            head_sha, head_tree, errand_id, route_name, route_identity, route_model, route_tier,
@@ -148,6 +285,25 @@ pub(super) fn record(store: &Store, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_evidence_and_finding_paths() {
+        assert!(exact_repo("Review acme/widget", "", "acme/widget").is_ok());
+        assert!(exact_repo("Review acme/other", "", "acme/widget").is_err());
+        assert!(exact_repo("", "Repository: acme/other.", "acme/widget").is_err());
+        assert!(exact_repo("https://github.com/acme/other/pull/42", "", "acme/widget").is_err());
+        assert!(exact_repo("", "- FINDING nit src/lib.rs:1 spelling", "acme/widget").is_ok());
+    }
+
+    #[test]
+    fn pr_references_must_all_agree() {
+        for text in ["#42", "PR #42", "pull request 42", "Pull Request #42"] {
+            assert!(exact_pr(text, "", 42).is_ok());
+            assert!(exact_pr("", text, 41).is_err());
+        }
+        assert!(exact_pr("Review #42", "Also #41", 42).is_err());
+        assert!(exact_pr("Review it", "", 42).is_ok());
+    }
 
     #[test]
     fn full_unambiguous_exact_head_evidence_only() {

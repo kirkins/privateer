@@ -1139,22 +1139,22 @@ fn review_record_imports_locally_once_and_covers_the_exact_merge_head() {
     assert!(row["imported_ms"].is_i64());
     assert!(row["posted_ms"].is_null());
     // Retry cannot retarget an already imported errand to another PR/head.
-    assert_eq!(
-        f.json(
-            Some("engineering"),
-            "review.record",
-            json!({"errand_id": id, "pr": 73, "head_sha": "b".repeat(40)})
-        ),
-        row
-    );
+    for retry in [
+        json!({"errand_id": id, "pr": 73, "head_sha": head}),
+        json!({"errand_id": id, "pr": 72, "head_sha": "b".repeat(40)}),
+    ] {
+        let error = f.refused(Some("engineering"), "review.record", retry);
+        assert!(error.contains("already has a review for PR #72"), "{error}");
+        assert!(error.contains(&head), "{error}");
+    }
     let listed = f.json(Some("engineering"), "review.list", json!({"pr": 72}));
     assert_eq!(listed["reviews"], json!([row.clone()]));
     assert!(
         !f.root.join("adapter.log").exists(),
         "import contacted the forge"
     );
-    // Coverage follows the existing merge rule (current tier-1 routes).
-    f.routes(opus_errands());
+    // Coverage follows the saved tier-1 model, even though today's route
+    // with the same name is tier 2 and no longer permits review.
     let merged = f.json(
         Some("engineering"),
         "pr.merge",
@@ -1164,6 +1164,118 @@ fn review_record_imports_locally_once_and_covers_the_exact_merge_head() {
     assert_eq!(merged["review"]["id"], row["id"]);
     assert_eq!(merged["review"]["kind"], "imported");
     assert_eq!(f.row(row["id"].as_str().unwrap())["post_state"], "none");
+}
+
+#[test]
+fn review_record_selects_a_local_repository_without_forge_contact() {
+    let f = Fleet::new();
+    f.routes(opus_errands());
+    let head = f.commit("feature", &[], "Fix");
+    let id = finished_plain_errand(
+        &f,
+        &format!("Review acme/widget PR #77 at head {head}"),
+        "VERDICT: APPROVE",
+    );
+    let other = f.root.join("engineering/projects/gadget");
+    fs::create_dir_all(&other).unwrap();
+    f.git(&other, &["init", "--quiet", "-b", "main"]);
+    f.git(
+        &other,
+        &["remote", "add", "origin", "/fictional/acme/gadget.git"],
+    );
+    f.git(&other, &["config", "privateer.forge", "github"]);
+    let args = json!({"errand_id": id, "pr": 77, "head_sha": head});
+    let error = f.refused(Some("engineering"), "review.record", args.clone());
+    assert!(error.contains("pass repo (owner/name)"), "{error}");
+    let mut selected = args;
+    selected["repo"] = json!("acme/missing");
+    let error = f.refused(Some("engineering"), "review.record", selected.clone());
+    assert!(error.contains("no clone of acme/missing"), "{error}");
+    selected["repo"] = json!("acme/gadget");
+    let error = f.refused(Some("engineering"), "review.record", selected.clone());
+    assert!(error.contains("names repository acme/widget"), "{error}");
+    selected["repo"] = json!("acme/widget");
+    let db = rusqlite::Connection::open(f.home().join("privateer.sqlite")).unwrap();
+    db.execute(
+        "UPDATE errands SET verdict='Reviewed acme/gadget\nVERDICT: APPROVE' WHERE id=?1",
+        [&id],
+    )
+    .unwrap();
+    let error = f.refused(Some("engineering"), "review.record", selected.clone());
+    assert!(error.contains("names repository acme/gadget"), "{error}");
+    db.execute(
+        "UPDATE errands SET verdict='VERDICT: APPROVE' WHERE id=?1",
+        [&id],
+    )
+    .unwrap();
+    let row = f.json(Some("engineering"), "review.record", selected.clone());
+    assert_eq!(row["repo"], "acme/widget");
+    assert_eq!(
+        f.json(Some("engineering"), "review.record", selected.clone()),
+        row
+    );
+    selected["repo"] = json!("acme/gadget");
+    let error = f.refused(Some("engineering"), "review.record", selected);
+    assert!(
+        error.contains("already has a review in repository"),
+        "{error}"
+    );
+    assert!(!f.root.join("adapter.log").exists());
+}
+
+#[test]
+fn imported_coverage_never_upgrades_saved_strength_from_a_renamed_route() {
+    for tier in [Some(2), None, Some(1)] {
+        let f = Fleet::new();
+        let uses = if tier == Some(1) {
+            vec!["implement"]
+        } else {
+            vec!["review"]
+        };
+        f.routes(json!({
+            "routes": {"opus": tiered("claude-sonnet-4-6", tier.unwrap_or(1), &uses)},
+            "errand": ["opus"]
+        }));
+        let head = f.commit("feature", &[], "Fix");
+        f.pr(76, &head, "feature");
+        let id = finished_plain_errand(
+            &f,
+            &format!("Review pull request 76 at head {head}"),
+            "VERDICT: APPROVE",
+        );
+        if tier.is_none() {
+            let db = rusqlite::Connection::open(f.home().join("privateer.sqlite")).unwrap();
+            db.execute("UPDATE errands SET route_info=NULL WHERE id=?1", [&id])
+                .unwrap();
+        }
+        // The same route name now names a different model with tier-1
+        // review permission. It must not strengthen the historical review.
+        f.routes(opus_errands());
+        let row = f.json(
+            Some("engineering"),
+            "review.record",
+            json!({"errand_id": id, "pr": 76, "head_sha": head}),
+        );
+        assert_eq!(row["route_tier"], json!(tier));
+        assert_eq!(row["route_model"], "claude-sonnet-4-6");
+        assert!(!f.root.join("adapter.log").exists());
+        let merged = f.json(
+            Some("engineering"),
+            "pr.merge",
+            json!({"task_id": "fix", "pr": 76}),
+        );
+        assert_eq!(merged["coverage"], "unreviewed", "{merged}");
+        assert!(merged["review"].is_null(), "{merged}");
+        let uncovered = &merged["approvals_not_covering"][0];
+        assert_eq!(uncovered["id"], row["id"], "{merged}");
+        assert_eq!(uncovered["route_model"], "claude-sonnet-4-6");
+        assert!(
+            uncovered["why"]
+                .as_str()
+                .unwrap()
+                .contains("saved tier 1 with review use")
+        );
+    }
 }
 
 #[test]
@@ -1217,9 +1329,41 @@ fn review_record_refuses_untrusted_or_ambiguous_errand_evidence_without_forge_ca
         json!({"errand_id": id, "pr": 74, "head_sha": &head[..7]}),
         "full 40-character",
     );
+    refuse(
+        json!({"errand_id": id, "pr": 74, "head_sha": "A".repeat(40)}),
+        "lowercase hex",
+    );
     // Mutate only the isolated fixture to exercise failed, incomplete and
     // foreign records without timing-dependent races against a supervisor.
     let db = rusqlite::Connection::open(f.home().join("privateer.sqlite")).unwrap();
+    db.execute("UPDATE errands SET mode='resume' WHERE id=?1", [&id])
+        .unwrap();
+    refuse(args.clone(), "only fresh errands");
+    db.execute("UPDATE errands SET mode='fresh' WHERE id=?1", [&id])
+        .unwrap();
+    for (brief, reply) in [
+        (format!("Review PR #73 at {head}"), "VERDICT: APPROVE"),
+        (
+            format!("Review head {head}"),
+            "Reviewed pull request 73\nVERDICT: APPROVE",
+        ),
+        (
+            format!("Review head {head}"),
+            "Reviewed #73\nVERDICT: APPROVE",
+        ),
+    ] {
+        db.execute(
+            "UPDATE errands SET brief=?2, verdict=?3 WHERE id=?1",
+            rusqlite::params![id, brief, reply],
+        )
+        .unwrap();
+        refuse(args.clone(), "names PR #73, not requested PR #74");
+    }
+    db.execute(
+        "UPDATE errands SET brief=?2, verdict='VERDICT: APPROVE' WHERE id=?1",
+        rusqlite::params![id, format!("Review head {head}")],
+    )
+    .unwrap();
     db.execute("UPDATE errands SET ship='navigation' WHERE id=?1", [&id])
         .unwrap();
     refuse(args.clone(), "is not engineering's");

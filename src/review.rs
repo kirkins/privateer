@@ -1050,9 +1050,10 @@ fn review_brief(review: &Value) -> Value {
 
 /// What a merge at the live head carries, and the coverage that makes.
 ///
-/// Only an APPROVE by a route that is a tier-1 review route in the routes
-/// file now covers the head or the commit it approved; any other approval
-/// of a carried commit is recorded as not covering, with why. A
+/// Only an APPROVE by a tier-1 review route covers the head or the commit
+/// it approved: imported reviews use their saved route strength and model,
+/// other reviews use the routes file now. Any other approval of a carried
+/// commit is recorded as not covering, with why. A
 /// CHANGES_REQUESTED at the merged head, or at a commit after the covering
 /// approval, is recorded and makes the coverage `changes_requested`; one
 /// the covering approval of the same commit finished after is superseded.
@@ -1097,21 +1098,35 @@ fn coverage(
             continue;
         }
         let name = review["route_name"].as_str().unwrap_or_default();
-        let route = policy
-            .as_ref()
-            .map(|p| &p["routes"][name])
-            .filter(|r| !name.is_empty() && r.is_object());
-        let why = match route {
-            None if name.is_empty() => {
-                Some("it ran on the first mate's own route, which is no review route".to_owned())
+        let why = if review["kind"] == "imported" {
+            let uses_review = review["route_uses"]
+                .as_array()
+                .is_some_and(|uses| uses.iter().any(|u| u == "review"));
+            if review["route_tier"].as_i64() == Some(1) && uses_review {
+                None
+            } else {
+                Some(format!(
+                    "imported route {name} (model {}) does not have saved tier 1 with review use: tier {}, uses {}",
+                    review["route_model"], review["route_tier"], review["route_uses"]
+                ))
             }
-            None => Some(format!("route {name} is not in the routes file now")),
-            Some(route) if !crate::crew_routes::meets(route, Some(&require)) => Some(format!(
-                "route {name} does not meet {} now: it is {}",
-                require.summary(),
-                crate::crew_routes::describe_strength(route)
-            )),
-            Some(_) => None,
+        } else {
+            let route = policy
+                .as_ref()
+                .map(|p| &p["routes"][name])
+                .filter(|r| !name.is_empty() && r.is_object());
+            match route {
+                None if name.is_empty() => Some(
+                    "it ran on the first mate's own route, which is no review route".to_owned(),
+                ),
+                None => Some(format!("route {name} is not in the routes file now")),
+                Some(route) if !crate::crew_routes::meets(route, Some(&require)) => Some(format!(
+                    "route {name} does not meet {} now: it is {}",
+                    require.summary(),
+                    crate::crew_routes::describe_strength(route)
+                )),
+                Some(_) => None,
+            }
         };
         match why {
             None => {
@@ -1235,7 +1250,9 @@ fn coverage(
         Some(review) => {
             let id = review["id"].as_str().unwrap_or_default();
             let name = review["route_name"].as_str().unwrap_or_default();
-            if let (Ok(authors), Some(policy)) = (&authors, &policy) {
+            if review["kind"] != "imported"
+                && let (Ok(authors), Some(policy)) = (&authors, &policy)
+            {
                 let order =
                     crate::crew_routes::order_reviewers(&[name.to_owned()], policy, authors);
                 if let Some((_, why)) = order.excluded.first() {
@@ -1376,7 +1393,7 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
 /// The argument keys of each command here; see `crate::Accepted`.
 pub(crate) const ACCEPTED: crate::Accepted = &[
     ("review.list", &["ship", "pr", "repo"]),
-    ("review.record", &["errand_id", "pr", "head_sha"]),
+    ("review.record", &["errand_id", "pr", "head_sha", "repo"]),
     (
         "review.start",
         &["task_id", "pr", "repo", "notes", "author_routes"],
