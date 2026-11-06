@@ -50,6 +50,112 @@ fn premise_and_resolution_cross_the_existing_outbox_to_a_peer() {
         )
         .unwrap();
     assert_eq!(count, 1);
+    let notice: (String, String) = b.connection().query_row(
+        "SELECT body,payload FROM mail WHERE json_extract(payload,'$.premise_changed') IS NOT NULL", [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert!(
+        notice
+            .0
+            .contains("the requester may reassess, withdraw or update it")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&notice.1).unwrap()["attached_to"],
+        "peer-ask"
+    );
+}
+
+#[test]
+fn unrecognized_premise_changes_remain_ordinary_mail_and_do_not_block_peer_queue() {
+    for case in [
+        "old-peer",
+        "mismatch",
+        "future-outcome",
+        "wrong-thread",
+        "wrong-sender",
+    ] {
+        let Pair {
+            _temp,
+            mut a,
+            mut b,
+            ..
+        } = pair();
+        let premise = json!({"kind":"task","ref":"work"});
+        let ask = json!({"id":"ask","from":"apps","to":"infra","kind":"request","body":"Review?","payload":{}});
+        seed_pending(&a, &ask, 1);
+        dispatch(&mut a, "mail.flush", json!({})).unwrap();
+        if case != "old-peer" {
+            b.connection()
+                .execute(
+                    "UPDATE mail SET premise=?1 WHERE id='ask'",
+                    [premise.to_string()],
+                )
+                .unwrap();
+        }
+        if case == "wrong-sender" {
+            b.connection()
+                .execute("UPDATE mail SET sender='infra' WHERE id='ask'", [])
+                .unwrap();
+        }
+        let change = json!({"ask":if case == "wrong-thread" {"other"} else {"ask"},
+            "premise":if case == "mismatch" {json!({"kind":"task","ref":"other"})} else {premise},
+            "outcome":if case == "future-outcome" {"superseded"} else {"done"}});
+        seed_pending(
+            &a,
+            &json!({"id":"change","from":"apps","to":"infra","kind":"notice","correlation":"ask","body":"Premise changed","payload":{"premise_changed":change,"attached_to":"ask","attached_ship":"apps"}}),
+            2,
+        );
+        seed_pending(
+            &a,
+            &json!({"id":"later","from":"apps","to":"infra","kind":"notice","body":"Queue still flows","payload":{}}),
+            3,
+        );
+        dispatch(&mut a, "mail.flush", json!({})).unwrap();
+        let received = dispatch(&mut b, "mail.show", json!({"id":"change"})).unwrap();
+        assert_eq!(received["payload"]["premise_changed"], change, "{case}");
+        assert!(received["payload"]["attached_to"].is_null(), "{case}");
+        assert!(received["payload"]["attached_ship"].is_null(), "{case}");
+        assert!(
+            dispatch(&mut b, "mail.show", json!({"id":"ask"})).unwrap()["premise_outcome"]
+                .is_null(),
+            "{case}"
+        );
+        dispatch(&mut b, "mail.show", json!({"id":"later"})).unwrap();
+        assert_eq!(
+            dispatch(&mut a, "mail.show", json!({"id":"change"})).unwrap()["delivery"],
+            "delivered",
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn future_premise_is_ignored_on_receive_but_refused_on_send() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        ..
+    } = pair();
+    let ask = json!({"id":"future","from":"apps","to":"infra","kind":"request","body":"Review?","premise":{"kind":"future","ref":"work"},"payload":{}});
+    assert!(err(send(&mut a, ask.clone())).contains("premise must be"));
+    seed_pending(&a, &ask, 1);
+    a.connection()
+        .execute(
+            "UPDATE mail SET premise=?1 WHERE id='future'",
+            [ask["premise"].to_string()],
+        )
+        .unwrap();
+    seed_pending(
+        &a,
+        &json!({"id":"later","from":"apps","to":"infra","kind":"notice","body":"Queue still flows","payload":{}}),
+        2,
+    );
+    dispatch(&mut a, "mail.flush", json!({})).unwrap();
+    let received = dispatch(&mut b, "mail.show", json!({"id":"future"})).unwrap();
+    assert!(received["premise"].is_null());
+    assert_eq!(received["body"], "Review?");
+    dispatch(&mut b, "mail.show", json!({"id":"later"})).unwrap();
 }
 
 #[test]

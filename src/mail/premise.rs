@@ -42,6 +42,12 @@ pub(super) fn parse(args: &Value, kind: &str) -> Result<Option<String>> {
     Ok(Some(serde_json::to_string(&premise)?))
 }
 
+/// Premise metadata is optional on receive: future kinds must not block a
+/// peer's delivery queue. Locally authored mail still uses strict `parse`.
+pub(super) fn received(args: &Value, kind: &str) -> Option<String> {
+    parse(args, kind).ok().flatten()
+}
+
 /// Rechecked under the send's writer lock. Remote task references are only
 /// shape-checked: the owning home, never a receiving home, observes them.
 pub(super) fn owned(store: &Store, premise: Option<&str>, sender: &str) -> Result<()> {
@@ -66,7 +72,7 @@ pub(super) fn resolve_task(store: &Store, task: &str, status: &str) -> Result<()
     }
     let mut stmt = store.connection().prepare(&format!(
         "SELECT {COLUMNS} FROM mail WHERE state='open' AND kind IN ('request','decision')
-         AND premise_outcome IS NULL AND json_extract(premise,'$.kind')='task'
+         AND premise IS NOT NULL AND premise_outcome IS NULL AND json_extract(premise,'$.kind')='task'
          AND json_extract(premise,'$.ref')=?1 AND COALESCE(delivery,'') <> 'received'"
     ))?;
     let asks = stmt
@@ -90,7 +96,9 @@ pub(super) fn resolve_task(store: &Store, task: &str, status: &str) -> Result<()
             store,
             &json!({"id":outcome_id(store,"premise-card")?,
             "from":ask["from"],"to":ask["to"],"kind":"notice","urgency":"low",
-            "correlation":id,"body":body,
+            "correlation":id,"body":format!(
+                "Ask {id}: premise task {task} is {status}. This ask may be stale; the requester may reassess, withdraw or update it. No answer or approval was changed."
+            ),
             "payload":{"premise_changed":change,"attached_to":id}}),
         )?;
         store.connection().execute(
@@ -120,34 +128,33 @@ pub(super) fn delivered(
     kind: &str,
     correlation: Option<&str>,
     payload: &Value,
-) -> Result<()> {
-    if let Some(change) = payload.get("premise_changed") {
-        ensure!(
-            kind == "notice" && correlation == change["ask"].as_str(),
-            "invalid premise_changed thread"
-        );
-        let outcome = change["outcome"]
-            .as_str()
-            .context("premise_changed outcome")?;
-        ensure!(
-            matches!(outcome, "done" | "cancelled"),
-            "invalid premise_changed outcome"
-        );
-        if let Some(ask) = by_id(store, correlation.unwrap_or_default())? {
-            ensure!(
-                ask["from"] == from
-                    && ask["to"] == to
-                    && ask["premise"] == change["premise"]
-                    && !ask["premise"].is_null(),
-                "premise_changed must name the sender's ask and premise"
-            );
-            store.connection().execute(
-                "UPDATE mail SET premise_outcome=COALESCE(premise_outcome,?2) WHERE id=?1",
-                params![correlation, outcome],
-            )?;
-        }
+) -> Result<bool> {
+    let Some(change) = payload.get("premise_changed") else {
+        return Ok(false);
+    };
+    let Some(ask_id) = correlation.filter(|id| Some(*id) == change["ask"].as_str()) else {
+        return Ok(false);
+    };
+    let outcome = change["outcome"].as_str();
+    if kind != "notice" || !matches!(outcome, Some("done" | "cancelled")) {
+        return Ok(false);
     }
-    Ok(())
+    if let Some(ask) = by_id(store, ask_id)?
+        && ask["from"] == from
+        && ask["to"] == to
+        && matches!(ask["kind"].as_str(), Some("request" | "decision"))
+        && ask["premise"] == change["premise"]
+        && !ask["premise"].is_null()
+    {
+        store.connection().execute(
+            "UPDATE mail SET premise_outcome=COALESCE(premise_outcome,?2) WHERE id=?1",
+            params![ask_id, outcome],
+        )?;
+        return Ok(true);
+    }
+    // An older receiver may have discarded the premise, or a newer sender
+    // may know an outcome we do not. Keep the notice as ordinary mail.
+    Ok(false)
 }
 
 pub(crate) fn display(premise: &Value, outcome: Option<&str>) -> String {
@@ -173,6 +180,29 @@ pub(crate) fn display(premise: &Value, outcome: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn idle_copies_ignore_unknown_premises_without_losing_mail() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("home")).unwrap();
+        for (id, premise) in [
+            ("future", json!({"kind":"future","ref":"work"})),
+            ("malformed", json!({"kind":"task","ref":12})),
+            ("known", json!({"kind":"task","ref":"work"})),
+        ] {
+            let mail = json!({"id":id,"from":"apps","to":"infra","kind":"request","body":"Keep this fact","premise":premise});
+            assert_eq!(
+                record_copy(store.connection(), &mail, 1, source::Provenance::Unresolved).unwrap(),
+                1
+            );
+            let stored = by_id(&store, id).unwrap().unwrap();
+            assert_eq!(stored["body"], "Keep this fact");
+            assert_eq!(
+                stored["premise"],
+                if id == "known" { premise } else { Value::Null }
+            );
+        }
+    }
+
     #[test]
     fn strict_typed_premises() {
         for p in [

@@ -557,6 +557,11 @@ class Door:
             card["also"].append(f"{sender} (same denial)")
             card["blocked"].extend(f"{sender} {item}" for item in
                                    (payload.get("decision") or {}).get("blocked") or [])
+        elif isinstance(payload.get("premise_changed"), dict):
+            change = payload["premise_changed"]
+            text = premise_text({"premise": change.get("premise"),
+                                 "premise_outcome": change.get("outcome")})
+            card["also"].append(f"{sender} ({mail.get('kind', 'notice')}): {text}")
         else:
             card["also"].append(f"{sender} ({mail.get('kind', 'notice')})")
         err = self.edit_card(card)

@@ -19,6 +19,11 @@ fn legacy_ask_survives_premise_migration() {
     )
     .unwrap();
     upgrade_columns(&h).unwrap();
+    let plan: String = h.query_row(
+        "EXPLAIN QUERY PLAN SELECT id FROM mail WHERE premise IS NOT NULL AND json_extract(premise,'$.ref')='work'",
+        [], |r| r.get(3),
+    ).unwrap();
+    assert!(plan.contains("mail_premise_ref"), "{plan}");
     assert_eq!(
         h.query_row("SELECT premise_outcome FROM mail", [], |r| r
             .get::<_, String>(0))
@@ -44,6 +49,7 @@ fn additive_upgrade_fast_path_checks_every_column_index_and_table() {
         match *column {
             "delivery" => h.execute_batch("DROP INDEX mail_pending").unwrap(),
             "because_of" => h.execute_batch("DROP INDEX mail_because_of").unwrap(),
+            "premise" => h.execute_batch("DROP INDEX mail_premise_ref").unwrap(),
             _ => (),
         }
         h.execute_batch(&format!("ALTER TABLE mail DROP COLUMN {column}"))
@@ -55,6 +61,7 @@ fn additive_upgrade_fast_path_checks_every_column_index_and_table() {
     for (kind, name) in [
         ("INDEX", "mail_pending"),
         ("INDEX", "mail_because_of"),
+        ("INDEX", "mail_premise_ref"),
         ("TABLE", "mail_delivery_retry"),
     ] {
         h.execute_batch(&format!("DROP {kind} {name}")).unwrap();

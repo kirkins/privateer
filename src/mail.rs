@@ -147,6 +147,7 @@ pub(crate) fn upgrade_columns(conn: &rusqlite::Connection) -> Result<()> {
     tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS mail_pending ON mail(delivery, seq) WHERE delivery='pending';
          CREATE INDEX IF NOT EXISTS mail_because_of ON mail(because_of) WHERE because_of IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS mail_premise_ref ON mail(json_extract(premise,'$.ref')) WHERE premise IS NOT NULL;
          CREATE TABLE IF NOT EXISTS mail_delivery_retry(peer TEXT PRIMARY KEY,
            failures INTEGER NOT NULL, next_attempt_ms INTEGER NOT NULL, last_attempt_ms INTEGER NOT NULL);",
     )?;
@@ -167,6 +168,7 @@ fn upgrade_ready(conn: &rusqlite::Connection) -> Result<bool> {
     for (kind, name) in [
         ("index", "mail_pending"),
         ("index", "mail_because_of"),
+        ("index", "mail_premise_ref"),
         ("table", "mail_delivery_retry"),
     ] {
         if !conn.query_row(
@@ -3060,7 +3062,7 @@ fn record_copy(
             message["created_ms"].as_i64().unwrap_or(delivered_ms),
             delivered_ms,
             message["because_of"].as_str(),
-            premise::parse(message, required(message, "kind")?)?,
+            premise::received(message, required(message, "kind")?),
         ],
     )?;
     if written == 1 {
@@ -3454,7 +3456,7 @@ fn deliver_inner(store: &Store, args: &Value, provenance: &source::Provenance) -
     }
     local_address(store, to)?;
     let correlation = optional_str(args, "correlation")?;
-    let premise = premise::parse(args, kind)?;
+    let premise = premise::received(args, kind);
     // A follow-up keeps its link where it was raised: the sender's home is
     // where its wake happens, and the other home only reads the message.
     let because_of = optional_str(args, "because_of")?;
@@ -3642,12 +3644,15 @@ fn deliver_inner(store: &Store, args: &Value, provenance: &source::Provenance) -
     {
         payload["approval"] = approval;
     }
-    premise::delivered(store, from, to, kind, correlation, &payload)?;
-    if payload.get("premise_changed").is_some()
-        && let Some(ask) = correlation
-        && by_id(store, ask)?.is_some()
-    {
-        payload["attached_to"] = json!(ask);
+    if payload.get("premise_changed").is_some() {
+        // Never trust an attachment claimed by an unrecognized change.
+        if let Some(fields) = payload.as_object_mut() {
+            fields.remove("attached_to");
+            fields.remove("attached_ship");
+        }
+        if premise::delivered(store, from, to, kind, correlation, &payload)? {
+            payload["attached_to"] = json!(correlation);
+        }
     }
     tx.execute(
         "INSERT INTO mail(id,sender,recipient,kind,correlation,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery,delivered_ms,because_of,origin_machine,premise)
