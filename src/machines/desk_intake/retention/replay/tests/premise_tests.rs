@@ -73,18 +73,17 @@ fn premise_is_pinned_but_resolution_does_not_change_native_replay_content() {
 fn pre_premise_pin_retains_native_witness_and_delta_after_restart() {
     let mut f = Fixture::new(false);
     f.send("ordinary");
-    let row = f
-        .h
-        .connection()
-        .query_row(
-            &format!(
-                "SELECT {} FROM mail WHERE id='ordinary'",
-                crate::mail::COLUMNS
-            ),
-            [],
-            crate::mail::message,
-        )
-        .unwrap();
+    let row =
+        f.h.connection()
+            .query_row(
+                &format!(
+                    "SELECT {} FROM mail WHERE id='ordinary'",
+                    crate::mail::COLUMNS
+                ),
+                [],
+                crate::mail::message,
+            )
+            .unwrap();
     // Build the old projection independently of immutable_content: these are
     // exactly the immutable keys emitted before premise columns existed.
     let mut pin = json!({});
@@ -106,15 +105,14 @@ fn pre_premise_pin_retains_native_witness_and_delta_after_restart() {
         pin[key] = row[key].clone();
     }
     let digest = crate::core::hash(&pin);
-    let saved: String = f
-        .h
-        .connection()
-        .query_row(
-            "SELECT content FROM mail_source_origin WHERE id='ordinary'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let saved: String =
+        f.h.connection()
+            .query_row(
+                "SELECT content FROM mail_source_origin WHERE id='ordinary'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
     // New pins must be byte-identical to the legacy layout too.
     assert_eq!(saved, pin.to_string());
     f.h.connection()
@@ -127,15 +125,14 @@ fn pre_premise_pin_retains_native_witness_and_delta_after_restart() {
     let home = f.dir.path().join("alpha");
     drop(f.h);
     f.h = Store::open(&home).unwrap();
-    let provenance: String = f
-        .h
-        .connection()
-        .query_row(
-            "SELECT provenance FROM mail_source_origin WHERE id='ordinary'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let provenance: String =
+        f.h.connection()
+            .query_row(
+                "SELECT provenance FROM mail_source_origin WHERE id='ordinary'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
     let source::Provenance::Origin(origin) = serde_json::from_str(&provenance).unwrap() else {
         panic!("expected native origin");
     };
