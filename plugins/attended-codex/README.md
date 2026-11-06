@@ -31,8 +31,9 @@ fence even while this diagnostic pauses mail; status itself is read-only and
 never contacts Codex. A refusal leaves the offer prepared, never uncertain,
 and never redirects it to another UUID. This is **non-sticky** and separate
 from `codex-loaded-thread-fence-lost-after-invocation`: post-spawn custody loss
-remains sticky, even after a later passing fence, rebind, or relaunch. This change
-adds no sticky-pause reset and closes no native atomic-admission race.
+remains sticky, even after a later passing fence, rebind, or relaunch. Only the
+explicit audited operator clear below can remove it; no native atomic-admission
+race is closed.
 
 The full runtime status lookup (including its local diagnostic adapter child)
 now runs **before** the dispatch fence. `reserve()` takes only that prefetched
@@ -51,7 +52,56 @@ remaining window can still be detected only after spawn and become the existing
 sticky `codex-loaded-thread-fence-lost-after-invocation` pause. The full status
 child is no longer in that window; an idle `/new` during that lookup is caught
 before reservation. This reduces the reviewed regression without claiming an
-atomic Codex watched-thread admission fence or adding a sticky reset.
+atomic Codex watched-thread admission fence.
+
+**Audited sticky-pause recovery (#765).** From the ship folder's own home,
+`attended.codex.status` lists every sticky name in `runner.diagnostics` and its
+exact clear argv in `runner.clear_pause` (replace the reason placeholder).
+The operator-only command is `attended.codex.clear_pause` with JSON fields
+`ship`, `holder`, `session`, `diagnostic` (one exact sticky name), and `reason`
+(nonblank, at most 512 UTF-8 bytes). For example, save this as a private JSON
+file outside the checkout, replace the illustrative session and reason with
+the values from status, then run the command as the operator:
+
+```json
+{"ship":"alpha","holder":"host:alpha","session":"11111111-1111-4111-8111-111111111111","diagnostic":"codex-loaded-thread-fence-lost-after-invocation","reason":"Closed the extra thread and verified the attended pane watches this UUID"}
+```
+
+```sh
+privateer --home /path/to/alpha/.privateer attended.codex.clear_pause --file /path/to/clear-pause.json
+```
+
+Agents are refused, just as for grant/resolve. The command requires the exact
+current hosted binding and holder, live presence, valid invalidation and custody
+fences, live pane/supervisor identities, the same native daemon, exactly the
+bound UUID in this cwd, qualified idle native state and a complete empty queue.
+It refuses an invocation/cleanup still in progress or a concurrent runner or
+binding change. Repair the underlying condition first; a clear is not an
+acknowledgment that it is acceptable to deliver to an unwatched thread.
+
+It clears only `codex-loaded-thread-fence-lost-after-invocation` or
+`codex-custody-lost-after-invocation`, only when named and still active.
+`runner.sticky_clear_audits` retains audit UUID, actor `operator`, OS uid,
+diagnostic, reason, timestamp, current launch/callback/session/holder context,
+custody epoch and the old loaded-thread reason. The audit and removal commit
+atomically; full storage refuses instead of evicting audits. Rust also records
+the ledger audit in the runtime audit log. SessionStart, relaunch, passing fences,
+receipts and status never clear a sticky entry. Every uncleared sticky withholds
+success reports, including after an old offer is positively settled.
+
+Clearing does **not** settle, acknowledge, abandon or replay an offer, restore a
+spent turn, reset declines, or bypass another pause. An uncertain attempt stays
+uncertain and charged; use the separate reconcile/resolve controls when needed.
+Delivery resumes only once all independent blockers are resolved, and only for
+eligible newer mail. Native queue observations are not atomic admission proof.
+
+**Known limit:** `codex-queue-cleanup-unproven` is shown with `supported:false`
+and an explicit refusal. This command cannot clear it: older cleanup failures
+saved no process identities, so an idle/empty Codex queue or hosted relaunch
+cannot prove an escaped payload stopped. The operator must independently inspect
+and confirm there is no stray Codex process for that ship. A supported audited
+process-remediation reset needs follow-up work; this command remains fail-closed
+and does not provide a force flag or silently discard that pause.
 
 ACT2 adds captain-only controls, each run from the ship folder's own home:
 `attended.codex.reconcile` and `attended.codex.resolve` (audited `abandon` or

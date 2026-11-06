@@ -137,6 +137,50 @@ fn codex_delivery_status_exposes_durable_pre_spawn_refusal_without_spending_or_r
     assert_eq!(fs::read(&path).unwrap(), original);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_delivery_status_names_sticky_clear_argv_and_unprovable_cleanup() {
+    let mut f = Fixture::new();
+    let launch = json!({"home": f.store.home(), "ship": "alpha", "holder": "host:alpha",
+        "session": SESSION, "control": "/opt/privateer"});
+    fs::write(f.dir.join("launch.json"), launch.to_string()).unwrap();
+    let sticky = json!([
+        "codex-loaded-thread-fence-lost-after-invocation",
+        "codex-custody-lost-after-invocation",
+        "codex-queue-cleanup-unproven"
+    ]);
+    let ledger = json!({"version": 1, "home": f.store.home(), "ship": "alpha", "sessions": {},
+        "runner": {"possibly_unattended_spent": 1, "declines": 0, "accepted_through": 0,
+            "retry_after_ms": 0, "human_paused": false, "sticky": sticky}});
+    let path = f.dir.join("receipts.json");
+    fs::write(&path, ledger.to_string()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let original = fs::read(&path).unwrap();
+    let report = f
+        .agent("attended.codex.status", json!({"ship": "alpha"}))
+        .unwrap();
+    assert_eq!(report["runner"]["diagnostics"], sticky);
+    assert_eq!(report["runner"]["paused"], true);
+    let commands = report["runner"]["clear_pause"].as_array().unwrap();
+    assert_eq!(commands.len(), 3);
+    for (index, command) in commands.iter().enumerate() {
+        assert_eq!(command["diagnostic"], sticky[index]);
+        assert_eq!(command["argv"][3], "attended.codex.clear_pause");
+        let request: Value = serde_json::from_str(command["argv"][5].as_str().unwrap()).unwrap();
+        assert_eq!(request["diagnostic"], sticky[index]);
+        assert_eq!(request["session"], SESSION);
+        assert_eq!(request["holder"], "host:alpha");
+    }
+    assert_eq!(commands[2]["supported"], false);
+    assert!(
+        commands[2]["refusal"]
+            .as_str()
+            .unwrap()
+            .contains("no saved process identities")
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn codex_delivery_status_explicitly_reports_unsupported_host() {
@@ -471,6 +515,7 @@ fn codex_delivery_operator_controls_refuse_agents_and_bad_resolutions() {
     for command in [
         "attended.codex.reconcile",
         "attended.codex.resolve",
+        "attended.codex.clear_pause",
         "attended.codex.session",
     ] {
         let error = f.agent(command, json!({"ship": "alpha"})).unwrap_err();
@@ -513,6 +558,35 @@ fn codex_delivery_reconcile_runs_the_real_runner_and_reports_its_refusal() {
         format!("{error:#}").contains("adapter refused: no current hosted Codex binding"),
         "{error:#}"
     );
+}
+
+// The clear command uses the same real, isolated adapter boundary as resolve.
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_delivery_clear_pause_validates_and_runs_the_real_adapter() {
+    let mut f = Fixture::new();
+    let request = json!({"ship": "alpha", "holder": "host:alpha", "session": SESSION,
+        "diagnostic": "codex-loaded-thread-fence-lost-after-invocation", "reason": "restored watched UUID"});
+    for (key, value, expected) in [
+        ("diagnostic", json!("unknown"), "sticky pause"),
+        ("reason", json!(" "), "1..512 bytes"),
+        ("reason", json!("é".repeat(257)), "1..512 bytes"),
+        ("session", json!("not-a-uuid"), "canonical lowercase UUID"),
+    ] {
+        let mut bad = request.clone();
+        bad[key] = value;
+        let error = f.operator("attended.codex.clear_pause", bad).unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+    }
+    if Path::new(PYTHON).exists() {
+        let error = f
+            .operator("attended.codex.clear_pause", request)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("adapter refused: no current hosted Codex binding"),
+            "{error:#}"
+        );
+    }
 }
 
 // Hosted Codex delivery is Linux-only: on macOS these controls refuse first.

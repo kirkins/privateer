@@ -1221,6 +1221,32 @@ state change, and Rust audits it. It also reaches an older UUID's outstanding
 offer (whose pane is gone) under current custody. The answer warns that late
 native admission remains possible; nothing cancels a queued item or acks mail.
 
+**Sticky runner pause recovery (#765).** `attended.codex.clear_pause
+{ship, holder, session, diagnostic, reason}` is a separate operator-only control,
+not an offer resolution. Status lists sticky names and exact clear argv with an
+explicit reason placeholder. It revalidates current binding, holder, live lease,
+both local fences, pane/supervisor pidfds and daemon identity, and requires a
+passing loaded-thread/cwd fence, qualified idle native thread and complete empty
+queue. RPCs run outside flock; local fences and unchanged runner state are
+rechecked under flock. An invoking offer/cleanup refuses. The command clears only
+the named active thread-fence or custody-loss diagnostic and commits a pinned
+`runner.sticky_clear_audits` entry (audit id, operator actor and uid, name, reason,
+time, launch/callback/session/holder context, custody epoch and prior fence reason)
+with the removal. Ledger capacity refuses rather than evicts audits. Rust also
+audits the result. No SessionStart, relaunch, receipt or later passing fence clears
+a sticky entry, and any uncleared sticky withholds success reports. Attempts,
+watermarks, uncertain state, suppression and charged budgets are unchanged; there
+is no replay, refund, implicit resolution or force flag. Other blockers still
+apply. This adds no atomic native watched-thread admission fence.
+
+`codex-queue-cleanup-unproven` deliberately refuses: there are no saved process
+identities with which to prove that an escaped payload exited. Status explains
+the refusal and requires independent operator confirmation that no stray Codex
+process remains for that ship. Supported process-remediation reset is follow-up
+work, not an idle-queue/relaunch inference. See the
+[operator recovery example](../../plugins/attended-codex/README.md) and tests in
+`tests/codex_runner_test.py` and `src/host/codex_delivery/tests.rs`.
+
 **Created sessions** (`attended.codex.session {ship}`, operator only). Fixture
 evidence on 0.166.0: a zero-turn legacy `thread/start` writes no rollout, and
 `codex resume <UUID>` refuses with `no rollout found`. Native

@@ -2527,8 +2527,12 @@ class QueueFixtureHttpTests(unittest.TestCase):
 
 
 # The dormant queue boundary shares this admitted suite, but no launcher imports it.
-from codex_runner_test import RunnerTests
-from codex_reserve_test import ReserveTests
+if __package__:
+    from .codex_runner_test import RunnerTests
+    from .codex_reserve_test import ReserveTests
+else:
+    from codex_runner_test import RunnerTests
+    from codex_reserve_test import ReserveTests
 
 if __name__ == "__main__":
     unittest.main()

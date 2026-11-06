@@ -492,9 +492,10 @@ class Runner:
                       or diagnostics_pause(a) or "budget_exhausted" in a)
             eligible = False
             handles = None
+            record = snapshot or {}
             try:
                 record = load(self.registry)
-                require(THREAD_FENCE_LOST not in a["sticky"], "loaded-thread custody lost after invocation")
+                require(not a["sticky"], "uncleared sticky runner pause")
                 require(expected is None or record == expected, "superseded observation")
                 require(record == snapshot and record["session"] == session and record["state"] == "bound"
                         and record.get("hosted") is True, "stale report")
@@ -530,6 +531,7 @@ class Runner:
                     "diagnostic": ("codex-uncertain-" + intent["nonce"]) if uncertain else (
                         diagnostic(a) or ("codex-turn-budget-exhausted" if "budget_exhausted" in a else None)),
                     "diagnostics": list(a["sticky"]),
+                    "clear_pause": clear_pause_commands(record, a),
                     "pre_spawn_fence": copy.deepcopy(a.get("pre_spawn_fence")),
                     "pause_reason": a.get("thread_fence_reason") or (
                         FENCE_CLEARS_WHEN if a.get("pre_spawn_fence") and not a["sticky"]
@@ -965,6 +967,95 @@ def resolve_control(path, request):
             "warning": LATE}
 
 
+def clear_pause_commands(record, a):
+    """Exact argv, with an explicit reason placeholder; status never resets."""
+    return [{"diagnostic": name, "supported": name != "codex-queue-cleanup-unproven",
+             "refusal": ("cleanup cannot be proved: no saved process identities; operator must independently "
+                         "confirm no stray Codex process for this ship; supported remediation needs follow-up"
+                         if name == "codex-queue-cleanup-unproven" else None),
+             "argv": [record.get("control", "privateer"), "--home", record.get("home"), "attended.codex.clear_pause",
+                      "--json", encode({"ship": record.get("ship"), "holder": record.get("holder"),
+                                        "session": record.get("session"), "diagnostic": name,
+                                        "reason": "REPLACE with the operator's recovery reason"})]}
+            for name in a["sticky"]]
+
+
+def clear_pause_control(path, request):
+    """Operator-only Rust entry: verify recovery, then clear just one sticky.
+
+    Native RPCs precede flock. Local fences are checked again under flock;
+    none of this claims an atomic native watched-thread admission fence.
+    An uncertain offer stays uncertain and its turn stays charged.
+    """
+    runner = bound_runner(path)
+    record = load(runner.registry)
+    require(isinstance(request, dict) and request.get("ship") == record["ship"]
+            and request.get("holder") == record["holder"]
+            and exact_uuid(request.get("session")) == record["session"],
+            "ship/holder/session is not the current binding")
+    name, reason = request.get("diagnostic"), request.get("reason")
+    require(name in STICKY, "diagnostic must name a runner sticky pause")
+    require(isinstance(reason, str) and reason.strip() and len(reason.encode()) <= 512,
+            "reason must be 1..512 bytes")
+    require(name != "codex-queue-cleanup-unproven",
+            "cleanup cannot be proved: no saved process identities; pause retained")
+    before = runner.ledger.read()
+    previous = copy.deepcopy(accounting(before))
+    require(name in previous["sticky"], "named sticky pause is not active")
+    def no_invoking(value):
+        require(all(offer.get("state") != "invoking"
+                    for state in value["sessions"].values()
+                    for offer in [state.get("intent", {}), *state.get("history", [])]),
+                "queue invocation/cleanup still in progress")
+    no_invoking(before)
+    lease = control(record, "ship.presence", {"ship": record["ship"]})
+    custody = load(runner.registry.with_name("custody.json"))
+    def local_check():
+        require(load(runner.registry) == record and record.get("state") == "bound"
+                and record.get("hosted") is True, "binding changed while clearing pause")
+        presence_check(lease, record)
+        require_fence(runner.registry, record)
+        custody_check(runner.registry, record, custody)
+        native_check(record, custody)
+    local_check()
+    handles = Handles(custody)
+    try:
+        with Daemon(record["codex_home"]) as daemon:
+            daemon_check(daemon, record, custody)
+            thread = loaded_thread(daemon, record)
+            require(thread.get("historyMode") == "legacy" and not thread.get("ephemeral")
+                    and thread.get("status") == {"type": "idle"}, "native thread not qualified idle")
+            queue = daemon.call("thread/queue/list", {"threadId": record["session"], "limit": 128})
+            require(isinstance(queue, dict) and queue.get("data") == []
+                    and "nextCursor" in queue and queue["nextCursor"] is None,
+                    "pending or unsupported native queue")
+            with locked(runner.registry.parent):
+                local_check()
+                handles.check()
+                daemon_check(daemon, record, custody)
+                value = runner.ledger.read()
+                a = accounting(value)
+                require(a == previous, "runner changed while clearing pause; inspect and retry")
+                no_invoking(value)
+                audit = {"id": str(uuid.uuid4()), "actor": "operator", "uid": os.getuid(),
+                         "diagnostic": name, "reason": reason, "at_ms": time.time_ns() // 1_000_000,
+                         "context": {key: record[key] for key in (
+                             "ship", "holder", "session", "generation", "callback_generation")},
+                         "custody_epoch": custody["epoch"],
+                         "previous_reason": a.get("thread_fence_reason") if name == THREAD_FENCE_LOST else None}
+                audits = a.setdefault("sticky_clear_audits", [])
+                require(isinstance(audits, list), "invalid sticky clear audit history")
+                audits.append(audit)  # Pinned; ledger size cap backpressures, never evicts audits.
+                a["sticky"] = [entry for entry in a["sticky"] if entry != name]
+                if name == THREAD_FENCE_LOST:
+                    a.pop("thread_fence_reason", None)
+                save(runner.ledger, value)  # Audit + clear commit together, or neither does.
+        return {"cleared": True, "diagnostic": name, "audit": audit,
+                "warning": "Only the named pause was cleared; attempts, charges and receipts are unchanged. " + LATE}
+    finally:
+        handles.close()
+
+
 def status_control(path):
     """Local durable diagnostics only: no daemon, presence, reservation or reset."""
     runner = Runner(path)
@@ -983,6 +1074,7 @@ def status_control(path):
                 "paused": uncertain or state.get("native_stop", False) or a["human_paused"]
                           or a["declines"] >= K or diagnostics_pause(a) or "budget_exhausted" in a,
                 "diagnostics": list(a["sticky"]), "pre_spawn_fence": a.get("pre_spawn_fence"),
+                "clear_pause": clear_pause_commands(record, a),
                 "pause_reason": a.get("thread_fence_reason") or (
                     FENCE_CLEARS_WHEN if a.get("pre_spawn_fence") and not a["sticky"]
                     else intent.get("pause_reason"))}
@@ -995,7 +1087,7 @@ def main(argv):
         except Exception:  # Bounded pass: diagnostics live in the ledger, not the pane.
             return 1
         return 0
-    if len(argv) == 3 and argv[1] in ("status", "reconcile", "resolve"):
+    if len(argv) == 3 and argv[1] in ("status", "reconcile", "resolve", "clear_pause"):
         # The Rust operator control's child: a bounded JSON request on stdin,
         # one JSON answer on stdout. No diagnostic reaches a pane.
         try:
@@ -1003,14 +1095,15 @@ def main(argv):
             if argv[1] == "status":
                 result = status_control(argv[2])
             else:
-                handler = reconcile_control if argv[1] == "reconcile" else resolve_control
+                handler = {"reconcile": reconcile_control, "resolve": resolve_control,
+                           "clear_pause": clear_pause_control}[argv[1]]
                 result = handler(argv[2], request)
             print(encode(result))
         except Exception as error:
             print(encode({"error": str(error)[:512] or type(error).__name__}))
             return 1
         return 0
-    print("usage: codex_runner.py tick|status|reconcile|resolve <launch.json>", file=sys.stderr)
+    print("usage: codex_runner.py tick|status|reconcile|resolve|clear_pause <launch.json>", file=sys.stderr)
     return 2
 
 
