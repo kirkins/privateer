@@ -230,11 +230,11 @@
       }
     },
     "reconnect": {
-      "dead_old_process_refused": true,
+      "old_process_confirmed_dead": true,
       "new_generation": true,
       "same_uuid": true,
       "accepted_through": 1,
-      "replayed": false,
+      "replay_attempted": false,
       "settings": {
         "model": "ship-model",
         "effort": "high"

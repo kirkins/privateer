@@ -20,7 +20,7 @@ import threading
 from types import SimpleNamespace
 import unittest
 import uuid
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
@@ -1569,6 +1569,9 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual((result["accepted_through"], result["acknowledged_through"]), (0, 0))
         self.assertNotIn("receipt", result["evidence"])
 
+    # The second-client, reconnect and navigation fixture tests below check
+    # flags recorded at capture time, not fresh native behavior. The real
+    # proof is the spike's own asserts plus deterministic binding/runner tests.
     def test_captured_pty_draft_and_second_client_are_not_receipts_or_attachment(self):
         captured = json.loads((ROOT / "tests/fixtures/codex-attended-pty.json").read_text())
         qualification, hooks = captured["qualification"], captured["hooks"]
@@ -1611,8 +1614,8 @@ class ReceiptTests(unittest.TestCase):
             self.assertEqual(argv[argv.index("--remote") + 1], "unix://" + launch["attach_daemon"]["socket"])
             self.assertEqual(argv[argv.index("--model") + 1], "ship-model")
             self.assertIn('model_reasoning_effort="high"', argv)
-        self.assertTrue(qualification["reconnect"]["dead_old_process_refused"])
-        self.assertFalse(qualification["reconnect"]["replayed"])
+        self.assertTrue(qualification["reconnect"]["old_process_confirmed_dead"])
+        self.assertFalse(qualification["reconnect"]["replay_attempted"])
         self.assertEqual(qualification["reconnect"]["accepted_through"], 1)
         navigation = qualification["navigation"]
         self.assertFalse(navigation["idle_callback"])
@@ -2430,6 +2433,46 @@ class ReceiptTests(unittest.TestCase):
         item = {"id": "alpha", "clientUserMessageId": "alpha-client", "input": [
             {"type": "text", "text": self.body, "text_elements": []}]}
         self.assertTrue(self.reconcile({"data": [item, item], "nextCursor": None})["paused"])
+
+
+class PtyFixtureCleanupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location("pty_fixture", ROOT / "scripts/codex-attended-pty-spike.py")
+        cls.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.module)
+
+    def test_failed_panes_do_not_skip_other_panes_or_daemon_cleanup(self):
+        for daemon_fails in (False, True):
+            with self.subTest(daemon_fails=daemon_fails), tempfile.TemporaryDirectory(
+                    prefix="codex-pty-cleanup-", dir=os.environ.get("TMPDIR", "/var/tmp")) as root:
+                fixture = self.module.Fixture.__new__(self.module.Fixture)
+                fixture.root = Path(root)
+                fixture.evidence = {}
+                fixture.gate_fd = 123  # Fake fixture: no native process/socket/FIFO.
+                fixture.server, fixture.worker = Mock(), Mock()
+                calls = []
+                def stop(label, fails=False):
+                    calls.append(label)
+                    if fails:
+                        raise RuntimeError(label)
+                fixture.panes = [SimpleNamespace(stop=lambda: stop("pane1", True)),
+                                 SimpleNamespace(stop=lambda: stop("pane2", True)),
+                                 SimpleNamespace(stop=lambda: stop("pane3"))]
+                def stop_daemon():
+                    stop("daemon", daemon_fails)
+                    fixture.evidence["daemon_exited_confirmed"] = True
+                fixture.stop_daemon = stop_daemon
+                with patch.object(self.module.os, "close") as close_gate:
+                    with self.assertRaisesRegex(RuntimeError, "daemon" if daemon_fails else "pane1"):
+                        fixture.close()
+                    close_gate.assert_called_once_with(fixture.gate_fd)
+                self.assertEqual(calls, ["pane1", "pane2", "pane3", "daemon"])
+                fixture.server.shutdown.assert_called_once_with()
+                fixture.server.server_close.assert_called_once_with()
+                fixture.worker.join.assert_called_once_with()
+                evidence = json.loads((fixture.root / "evidence.json").read_text())
+                self.assertEqual(evidence, {} if daemon_fails else {"daemon_exited_confirmed": True})
 
 
 class QueueFixtureHttpTests(unittest.TestCase):

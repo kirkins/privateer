@@ -459,8 +459,11 @@ trust_level = "trusted"
         assert self.thread()["modelProvider"] == "fixture"
         recovered = receipts.Ledger(self.registry, record["home"], "alpha").reconcile(self.session, nonce, queue)
         assert recovered["accepted_through"] == 1 and recovered["acknowledged_through"] == 0
-        self.evidence["qualification"]["reconnect"] = {"dead_old_process_refused": True,
-            "new_generation": True, "same_uuid": True, "accepted_through": 1, "replayed": False,
+        # Process death was asserted above; no dead-process dispatch or replay
+        # probe is attempted here. These fields do not claim delivery refusal
+        # or absence of a second native user_message.
+        self.evidence["qualification"]["reconnect"] = {"old_process_confirmed_dead": True,
+            "new_generation": True, "same_uuid": True, "accepted_through": 1, "replay_attempted": False,
             "settings": fresh["binding"]["settings"], "new_daemon": True,
             "prepare_argv": fresh["argv"], "attach_daemon": fresh["attach_daemon"]}
         self.wait(self.terminal)
@@ -494,9 +497,17 @@ trust_level = "trusted"
 
     def close(self):
         try:
-            for pane in self.panes:
-                pane.stop()
-            self.stop_daemon()
+            try:
+                errors = []
+                for pane in self.panes:
+                    try:
+                        pane.stop()
+                    except Exception as error:
+                        errors.append(error)
+                if errors:
+                    raise errors[0]
+            finally:
+                self.stop_daemon()
         finally:
             os.close(self.gate_fd)
             if self.server is not None:

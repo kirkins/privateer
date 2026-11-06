@@ -28,7 +28,8 @@ from codex_receipts import (FINAL, MAX_LEDGER, MAX_SESSIONS, Ledger, anchor, che
 from codex_socket import Daemon, LIMIT, load, process_identity, safe
 
 K = 3
-STICKY = ("codex-custody-lost-after-invocation", "codex-queue-cleanup-unproven")
+THREAD_FENCE_LOST = "codex-loaded-thread-fence-lost-after-invocation"
+STICKY = ("codex-custody-lost-after-invocation", "codex-queue-cleanup-unproven", THREAD_FENCE_LOST)
 
 
 def require(condition, message):
@@ -117,6 +118,24 @@ def daemon_check(daemon, record, custody):
             and executable(daemon.pid) == native["executable"], "daemon custody changed")
     info = safe(daemon.target, stat.S_ISSOCK, private=True)
     require((info.st_dev, info.st_ino) == (native["device"], native["inode"]), "daemon socket replaced")
+
+
+def loaded_thread(daemon, record):
+    """Single-thread-in-cwd custody, not an atomic native admission fence."""
+    session = record["session"]
+    loaded = daemon.call("thread/loaded/list", {"limit": 32})
+    require("nextCursor" in loaded and loaded["nextCursor"] is None
+            and isinstance(loaded.get("data"), list)
+            and len(loaded["data"]) <= 32 and session in loaded["data"], "thread not loaded")
+    # Idle /new has no SessionStart callback yet: the old UUID can remain
+    # loaded while the attended pane watches another thread. Only a trusted
+    # callback may rebind; never redirect the offer to a different UUID.
+    threads = [daemon.call("thread/read", {"threadId": identity})["thread"]
+               for identity in loaded["data"]]
+    matches = [thread for thread in threads if thread.get("cwd") == record["cwd"]]
+    require(len(matches) == 1, "concurrent Codex threads in this cwd are ambiguous")
+    require(matches[0].get("id") == session, "loaded thread for this cwd is not the bound UUID")
+    return matches[0]
 
 
 def exited(child):
@@ -416,6 +435,7 @@ class Runner:
             handles = None
             try:
                 record = load(self.registry)
+                require(THREAD_FENCE_LOST not in a["sticky"], "loaded-thread custody lost after invocation")
                 require(expected is None or record == expected, "superseded observation")
                 require(record == snapshot and record["session"] == session and record["state"] == "bound"
                         and record.get("hosted") is True, "stale report")
@@ -450,7 +470,8 @@ class Runner:
                     "grant_spent": grant.get("spent"), "grant_budget": grant.get("budget"),
                     "diagnostic": ("codex-uncertain-" + intent["nonce"]) if uncertain else (
                         diagnostic(a) or ("codex-turn-budget-exhausted" if "budget_exhausted" in a else None)),
-                    "diagnostics": list(a["sticky"])}
+                    "diagnostics": list(a["sticky"]),
+                    "pause_reason": a.get("thread_fence_reason") or intent.get("pause_reason")}
 
     def observe(self, acknowledged_through=0):
         """Read-only native evidence; no queue mutation and no enable path."""
@@ -528,12 +549,9 @@ class Runner:
         reserved(self.ledger.read()["sessions"].get(session, {}).get("intent", {}), record)
         custody = load(self.registry.with_name("custody.json"))
         with Daemon(record["codex_home"]) as daemon:
-            # Every RPC precedes flock. Native queue serializes an idle->busy race.
-            loaded = daemon.call("thread/loaded/list", {"limit": 32})
-            require(loaded.get("nextCursor") is None and isinstance(loaded.get("data"), list)
-                    and len(loaded["data"]) <= 32 and session in loaded["data"], "thread not loaded")
-            thread = daemon.call("thread/read", {"threadId": session})["thread"]
-            require(thread.get("id") == session and thread.get("cwd") == record["cwd"]
+            # RPCs outside flock. Native queue serializes an idle->busy race.
+            thread = loaded_thread(daemon, record)
+            require(thread.get("cwd") == record["cwd"]
                     and thread.get("historyMode") == "legacy" and not thread.get("ephemeral")
                     and thread.get("status") == {"type": "idle"}, "native thread not qualified idle")
             queue = daemon.call("thread/queue/list", {"threadId": session, "limit": 128})
@@ -630,7 +648,34 @@ class Runner:
         # No wait/RPC/report under project flock. English CLI output is discarded.
         cleaned = False
         try:
-            cleaned = drain(child)
+            try:
+                # Recheck after Popen and lock release: /new during presence,
+                # scanning or fsync may already have made admission unwatched.
+                # Do not require idle here: our child may have started a turn.
+                # Remaining window: /new after the final loaded-list snapshot
+                # (including during thread/read RPCs) can still precede native
+                # admission/promotion undetected; Codex has no atomic
+                # watched-thread admission fence.
+                # The dispatch connection's single observation deadline may
+                # be spent by the first fence, presence, scans, fsync and Popen.
+                # Give this fence its own deadline, but never accept a new
+                # daemon identity just because reconnecting succeeded.
+                with Daemon(record["codex_home"]) as fence_daemon:
+                    daemon_check(fence_daemon, record, custody)
+                    loaded_thread(fence_daemon, record)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                # Persist before draining. Later receipt/ack evidence may settle
+                # the offer, but neither it, unloading /new, nor restart may
+                # resume mail or publish success for this unwatched attempt.
+                with locked(self.registry.parent):
+                    value = self.ledger.read()
+                    a = accounting(value)
+                    a["thread_fence_reason"] = "loaded-thread custody unproven after invocation: " + str(error)
+                    if THREAD_FENCE_LOST not in a["sticky"]:
+                        a["sticky"].append(THREAD_FENCE_LOST)
+                    save(self.ledger, value)
+            finally:
+                cleaned = drain(child)
         finally:
             # Nonzero, timeout, success prose, and clean exit are all uncertain.
             # A later observer reconciles native evidence; no resend here.
@@ -652,7 +697,7 @@ class Runner:
 
 
 def tick(path):
-    """One supervisor pass. Every RPC precedes the project flock; one offer."""
+    """One supervisor pass. Every RPC is outside the project flock; one offer."""
     runner = Runner(path)
     record = load(runner.registry)
     if record.get("state") != "bound" or record.get("hosted") is not True:
