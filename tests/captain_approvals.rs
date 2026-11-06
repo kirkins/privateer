@@ -860,6 +860,50 @@ fn ship_or_hold() -> Value {
 }
 
 #[test]
+fn long_marked_answers_survive_without_granting_an_approval() {
+    let (_temp, mut store) = home();
+    for size in [4095, 4096, 4097] {
+        let id = format!("long-strike-{size}");
+        decision(&mut store, &id, ship_or_hold(), true).unwrap();
+        // The original has size UTF-16 units; safety markers add two more.
+        let body = format!("~🚢~{}", "漢".repeat(size - 2));
+        let answered = send(
+            &mut store,
+            json!({"from":"captain","to":"apps","kind":"reply",
+            "correlation":id,"body":body,"payload":{"answer":{"text":body}}}),
+        )
+        .unwrap();
+        assert_eq!(answered["body"], body);
+        assert_eq!(answered["payload"]["answer"]["text"], body);
+        assert_eq!(answered["payload"]["approval"]["recorded"], false);
+    }
+    decision(&mut store, "stored-answer", ship_or_hold(), true).unwrap();
+    let stored = "~See the full answer in captain-input.txt; no inline approval.~";
+    let answered = send(
+        &mut store,
+        json!({"from":"captain","to":"apps","kind":"reply",
+        "correlation":"stored-answer","body":stored,"payload":{"answer":{"text":stored}}}),
+    )
+    .unwrap();
+    assert_eq!(answered["payload"]["approval"]["recorded"], false);
+    assert!(rows(&mut store).is_empty());
+
+    decision(&mut store, "byte-bound", ship_or_hold(), true).unwrap();
+    let body = "x".repeat(40_000);
+    let error = send(
+        &mut store,
+        json!({"from":"captain","to":"apps","kind":"reply",
+        "correlation":"byte-bound","body":body,"payload":{"answer":{"text":body}}}),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("64 KiB"), "{error:#}");
+    assert_eq!(
+        dispatch(&mut store, "mail.show", json!({"id":"byte-bound"})).unwrap()["state"],
+        "open"
+    );
+}
+
+#[test]
 fn only_an_approving_option_of_a_decision_records() {
     let (_temp, mut store) = home();
     // An option flag needs payload.approves, and approves needs a flag.

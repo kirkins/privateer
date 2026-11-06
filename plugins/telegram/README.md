@@ -70,6 +70,65 @@ The last 5,000 terminal receipts keep only update ID, type, text/caption length,
 and outcome code; per-update logs contain no message text, filenames or paths.
 The intentional first-start setup-backlog skip is retained and recorded.
 
+### Long input
+
+Telegram's own single-message cap still applies (4096 characters; entity
+positions and this adapter's paste threshold count UTF-16 units). Privateer
+adds no 4096-character answer cap: decision replies keep all strikethrough
+markers, including around emoji, so formatting cannot turn a struck approval
+into a plain yes. Ordinary synthetic updates above that platform cap also
+forward. Whitespace at text and paste boundaries is preserved.
+
+Consecutive **plain-text** parts from the same authorized chat, **user and
+forum topic** join when the earlier part is at least 3500 UTF-16 units and the next arrives
+within `paste_join_seconds` (default 3, range 0–30; 0 disables; invalid values
+log a warning and fall back to 3). The threshold
+leaves modest room below Telegram's 4096 cap for client splitting. Both update
+arrival and Telegram message timestamps (when present) determine eligibility.
+Replies, commands (including unknown slash-leading text), formatting, edits
+and attachments never join. Short messages stay separate. A near-cap final
+part waits at most that window; a short tail sends immediately. Parts are
+concatenated **without** a separator: adding a newline could corrupt a word,
+URL or code split by a client. Membership freezes in the durable spool before
+sending; no member gets a terminal receipt until the joined submission commits
+or has a recorded visible refusal. Restart recovery reuses the same mail ID
+and group. Every part receives a confirmation and a reply mapping.
+
+The runtime's **64 KiB mail/envelope** and **1 MiB protocol line** safeguards
+remain. Before mailing, the adapter reserves 2 KiB for runtime-owned envelope
+fields and spills larger text whole to `file.put` as `captain-input.txt`; the
+short body names the stored file and `payload.files` carries its reference.
+No captain text is truncated. If a decision answer must spill, its full text
+and strike markers stay in that file; a deliberately non-affirmative inline
+answer cannot approve or choose an option on its behalf. File storage refusal
+is a visible, retried notice, not a partial mail. The file service's 50 MiB
+bound and Telegram bot download limit (20 MB, optionally lower via
+`max_file_mb`) still apply.
+
+UTF-8 documents with `.txt`, `.md`, `.markdown` or a plain-text/Markdown MIME
+type include their contents in the mail body alongside the stored reference
+while the envelope fits, behind a struck, non-affirmative reference-only header.
+Replies to asks never inline file text: only the captain's caption answers,
+so a file cannot supplement “thanks” into an approval. Binary, invalid UTF-8,
+control-containing and oversized documents remain file references with a visible
+reason sent separately to the captain, outside the approval-judged body. At text ingress,
+**VT (U+000B), FF (U+000C) and NEL (U+0085) normalize one-for-one to LF**;
+TAB, LF, CR and Unicode U+2028/U+2029 remain. Other Cc controls are refused
+with a bounded warning naming only the code point and its 1-based Unicode
+character position, never the rejected text. The runtime control policy is
+unchanged. Edits containing rejected controls are re-checked with a safe,
+non-affirmative replacement, so a validation refusal cannot leave an earlier
+approval standing.
+
+Only complete recognized slash-command tokens after optional leading whitespace
+dispatch as commands (Telegram's `bot_command` entity is preferred when supplied). Other
+slash-leading pastes, including literal `<`, `&` and `_`, are ordinary mail.
+Reaction and fallback-notice outcomes are logged without content; a missing
+reaction does not mean insertion failed. A send timeout is uncertain, retried
+with the same ID, never reported as “not sent”. Telegram refusal notices have
+bounded retries; if Telegram refuses all attempts, logs record exhaustion,
+not successful warning delivery.
+
 ## Using it
 
 - **A plain message** goes to the liaison as a request, so its answer comes back

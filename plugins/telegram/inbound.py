@@ -50,7 +50,12 @@ class Spool:
                     id INTEGER PRIMARY KEY, kind TEXT NOT NULL, length INTEGER NOT NULL,
                     outcome TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS checkpoint (id INTEGER PRIMARY KEY, offset INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS joins (
+                    member INTEGER PRIMARY KEY, leader INTEGER NOT NULL);
             """)
+            columns = {r[1] for r in db.execute("PRAGMA table_info(pending)")}
+            if "admitted_at" not in columns:
+                db.execute("ALTER TABLE pending ADD COLUMN admitted_at REAL NOT NULL DEFAULT 0")
 
     @contextlib.contextmanager
     def db(self):
@@ -79,9 +84,9 @@ class Spool:
                 return False
             for update in updates:
                 ident = update["update_id"]
-                db.execute("INSERT OR IGNORE INTO pending(id,data,initial_skip) SELECT ?,?,? WHERE NOT EXISTS "
+                db.execute("INSERT OR IGNORE INTO pending(id,data,initial_skip,admitted_at) SELECT ?,?,?,? WHERE NOT EXISTS "
                            "(SELECT 1 FROM receipts WHERE id=?)",
-                           (ident, json.dumps(update), int(initial_skip), ident))
+                           (ident, json.dumps(update), int(initial_skip), time.time(), ident))
             offset = max((u["update_id"] + 1 for u in updates), default=0)
             db.execute("INSERT INTO checkpoint VALUES(1,?) ON CONFLICT(id) DO UPDATE SET "
                        "offset=max(offset,excluded.offset)", (offset,))
@@ -92,10 +97,32 @@ class Spool:
             # Preserve order: a retry must not change the routing of earlier mail.
             return db.execute("SELECT * FROM pending WHERE outcome IS NULL ORDER BY id LIMIT 1").fetchone()
 
+    def following(self, ident):
+        with self.db() as db:
+            return db.execute("SELECT * FROM pending WHERE outcome IS NULL AND id>=? ORDER BY id",
+                              (ident,)).fetchall()
+
+    def joined(self, ident):
+        with self.db() as db:
+            return db.execute("SELECT p.* FROM pending p JOIN joins j ON j.member=p.id "
+                              "WHERE j.leader=? ORDER BY p.id", (ident,)).fetchall()
+
+    def join(self, ids):
+        # Freeze membership before any external effect. A crash reuses exactly
+        # this group, even if more updates arrive during recovery.
+        with self.db() as db:
+            db.executemany("INSERT INTO joins(member,leader) VALUES(?,?)",
+                           [(i, ids[0]) for i in ids])
+
     def begin(self, ident):
         with self.db() as db:
             db.execute("UPDATE pending SET attempts=attempts+1,next_at=? WHERE id=?",
                        (time.time() + RETRY_SECONDS, ident))
+
+    def defer(self, ident):
+        """A healthy paste wait is not a failed handling attempt."""
+        with self.db() as db:
+            db.execute("UPDATE pending SET attempts=attempts-1,next_at=0 WHERE id=?", (ident,))
 
     def submission(self, ident, args, msg_id, label):
         with self.db() as db:
@@ -117,13 +144,20 @@ class Spool:
 
     def finish(self, ident, outcome):
         with self.db() as db:
-            row = db.execute("SELECT data FROM pending WHERE id=?", (ident,)).fetchone()
-            kind, length = metadata(json.loads(row[0]))
-            db.execute("UPDATE pending SET outcome=? WHERE id=?", (outcome, ident))
-            db.execute("INSERT OR REPLACE INTO receipts VALUES(?,?,?,?)", (ident, kind, length, outcome))
+            rows = db.execute("SELECT id,data FROM pending WHERE id=? OR id IN "
+                              "(SELECT member FROM joins WHERE leader=?) ORDER BY id",
+                              (ident, ident)).fetchall()
+            facts = []
+            for row in rows:
+                kind, length = metadata(json.loads(row["data"]))
+                facts.append((row["id"], kind, length))
+                db.execute("UPDATE pending SET outcome=? WHERE id=?", (outcome, row["id"]))
+                db.execute("INSERT OR REPLACE INTO receipts VALUES(?,?,?,?)",
+                           (row["id"], kind, length, outcome))
             db.execute("DELETE FROM receipts WHERE id NOT IN (SELECT id FROM receipts ORDER BY id DESC LIMIT ?)",
                        (RECEIPTS,))
-        tg.log(f"inbound update_id={ident} type={kind} length={length} outcome={outcome}")
+        for member, kind, length in facts:
+            tg.log(f"inbound update_id={member} type={kind} length={length} outcome={outcome}")
         self.collect()
 
     def notice(self, ident, slot, params):
@@ -159,5 +193,6 @@ class Spool:
         with self.db() as db:
             db.execute("DELETE FROM notices WHERE done=1 AND update_id IN "
                        "(SELECT id FROM pending WHERE outcome IS NOT NULL)")
+            db.execute("DELETE FROM joins WHERE leader IN (SELECT id FROM pending WHERE outcome IS NOT NULL)")
             db.execute("DELETE FROM pending WHERE outcome IS NOT NULL AND NOT EXISTS "
                        "(SELECT 1 FROM notices WHERE update_id=pending.id)")

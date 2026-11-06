@@ -26,16 +26,19 @@ allowed_user_ids within it, is heard. Everything else is logged and dropped.
 
 import hashlib
 import json
+import math
 import os
 import queue
 import re
 import sys
 import threading
 import time
+import tempfile
 
 sys.dont_write_bytecode = True  # a release holds only its own files
 import tg
 import inbound
+import text_input
 
 POLL_SECONDS = 50
 TEXT_LIMIT = 3500           # Telegram caps a message at 4096; leave room for the header
@@ -169,10 +172,33 @@ def chat_kind(cfg: dict) -> str:
         return "group"
 
 
+def bot_identity(cfg):
+    """Stable identity without depending on getMe availability or logging secrets."""
+    prefix = str(cfg.get("bot_token", "")).partition(":")[0]
+    if not prefix.isascii() or not prefix.isdecimal():
+        tg.log("telegram outcome=invalid_bot_identity")
+        return False
+    cfg["bot_id"] = int(prefix)
+    bot, err = tg.api(cfg, "getMe", {}, retries=2)
+    if err or not isinstance(bot, dict):
+        tg.log("telegram outcome=bot_username_unavailable")
+        bot = {}
+    cfg["bot_username"] = bot.get("username", "")
+    return True
+
+
 class Door:
     def __init__(self, hello: dict, cfg: dict, runtime: Runtime):
         self.hello = hello
-        self.cfg = cfg
+        self.cfg = dict(cfg)
+        try:
+            window = float(cfg.get("paste_join_seconds", 3))
+            if not math.isfinite(window) or not 0 <= window <= 30:
+                raise ValueError
+        except (TypeError, ValueError):
+            tg.log("telegram config=paste_join_seconds outcome=invalid_defaulting_to_3")
+            window = 3
+        self.cfg["paste_join_seconds"] = window
         self.runtime = runtime
         self.pending: list[dict] = []
         self.sent = tg.read_state(SENT, [])
@@ -183,31 +209,41 @@ class Door:
         self.sender = None
         self.spool = inbound.Spool()
         self.update_id = None
-        self.notice_slot = 0
         self.outcome = "terminal_ignored"
 
-    def process_inbound(self) -> None:
+    def process_inbound(self) -> bool:
         """Own one durable update until handling or bounded terminal refusal."""
         row = self.spool.ready()
         if row is None or row["next_at"] > time.time():
-            return
+            return False
         update = json.loads(row["data"])
         self.update_id = row["id"]
-        self.notice_slot = 0
         self.outcome = "terminal_ignored"
         try:
             if row["initial_skip"]:
                 self.outcome = "terminal_initial_backlog"
             elif row["attempts"] >= inbound.ATTEMPTS:
                 self.outcome = "terminal_handler_error"
-                msg = update.get("message") or update.get("edited_message") or {}
+                query = update.get("callback_query") or {}
+                msg = update.get("message") or update.get("edited_message") or query.get("message") or {}
                 if self.authorized((msg.get("chat") or {}).get("id"),
-                                   (msg.get("from") or {}).get("id")):
-                    self.say("⚠️ Could not complete this update. It was not confirmed sent; "
-                             "please check with the ship before sending it again.",
-                             reply_to=msg.get("message_id"))
+                                   ((query or msg).get("from") or {}).get("id")):
+                    # Never reuse a handler's notice slot from an earlier attempt.
+                    committed = self.spool.result(self.update_id) is not None
+                    if committed:
+                        self.outcome = "mail_committed_confirmation_failed"
+                    status = ("The mail committed, but confirmation failed." if committed else
+                              "Delivery is uncertain; please check with the ship before resending.")
+                    self.say(f"⚠️ Could not complete this update. {status}",
+                             reply_to=msg.get("message_id"), notice_key=-1)
             else:
                 self.spool.begin(self.update_id)
+                if not row["submission"]:
+                    combined = self.paste_update(row, update)
+                    if combined is None:
+                        self.spool.defer(self.update_id)
+                        return False
+                    update = combined
                 if row["submission"]:
                     # The exact recipient/body/files were frozen before send.
                     self.send(*json.loads(row["submission"]))
@@ -219,8 +255,53 @@ class Door:
         except Exception:
             kind, length = inbound.metadata(update)
             tg.log(f"inbound update_id={self.update_id} type={kind} length={length} outcome=handler_retry")
+            return False  # Yield to runtime events even if a spool write keeps failing.
         finally:
             self.update_id = None
+        return True
+
+    def paste_update(self, row, update):
+        """Wait briefly for an obvious client split, then freeze durable members."""
+        rows = self.spool.joined(row["id"])
+        if not rows:
+            first = text_input.plain_part(update)
+            if not first or not self.authorized((first.get("chat") or {}).get("id"),
+                                                (first.get("from") or {}).get("id")):
+                return update
+            window = self.cfg["paste_join_seconds"]
+            if not window:
+                return update
+            rows = [row]
+            previous = first
+            following = self.spool.following(row["id"])[1:]
+            for candidate in following:
+                if text_input.units(previous["text"]) < text_input.PASTE_THRESHOLD:
+                    break
+                nxt = text_input.plain_part(json.loads(candidate["data"]))
+                if not nxt or candidate["initial_skip"] or candidate["submission"] or candidate["attempts"]:
+                    break
+                if ((nxt.get("chat") or {}).get("id") != (first.get("chat") or {}).get("id") or
+                    (nxt.get("from") or {}).get("id") != (first.get("from") or {}).get("id") or
+                    nxt.get("message_thread_id") != first.get("message_thread_id")):
+                    break
+                gap = nxt.get("date", candidate["admitted_at"]) - previous.get("date", rows[-1]["admitted_at"])
+                arrival_gap = candidate["admitted_at"] - rows[-1]["admitted_at"]
+                if not 0 <= gap <= window or not 0 <= arrival_gap <= window:
+                    break
+                rows.append(candidate)
+                previous = nxt
+            else:
+                # No following update yet: only a near-cap tail needs a wait.
+                if (text_input.units(previous["text"]) >= text_input.PASTE_THRESHOLD and
+                        time.time() < rows[-1]["admitted_at"] + window):
+                    return None
+            if len(rows) < 2:
+                return update
+            self.spool.join([r["id"] for r in rows])
+        # Concatenation preserves exact split boundaries, whitespace and order.
+        combined = dict(update, message=dict(update["message"]))
+        combined["message"]["text"] = "".join(json.loads(r["data"])["message"]["text"] for r in rows)
+        return combined
 
     def retry_notices(self) -> None:
         for row in self.spool.notices_ready():
@@ -244,12 +325,19 @@ class Door:
         except Exception:
             result, err = None, "send exception"
         self.spool.notice_result(row, (result or {}).get("message_id"), err)
+        outcome = "notice_failed" if err else "notice_sent"
+        tg.log(f"telegram update_id={row['update_id']} outcome={outcome}")
+        if row["slot"] <= -1000:
+            outcome = "confirmation_failed" if err else "confirmation_sent"
+            tg.log(f"telegram update_id={row['update_id']} outcome={outcome}")
         return (result or {}).get("message_id"), err
 
     # --- sending to Telegram ---------------------------------------------
 
     def say(self, text: str, reply_to=None, html: bool = False, markup: dict | None = None,
-            quiet: bool = False):
+            quiet: bool = False, durable: bool = True, notice_key=None):
+        if durable and not html:
+            text = text_input.bounded(text)
         params = {"chat_id": tg.chat_id(self.cfg), "text": text,
                   "disable_web_page_preview": "true"}
         if html:
@@ -261,9 +349,13 @@ class Door:
             params["reply_markup"] = json.dumps(markup)
         if quiet:
             params["disable_notification"] = "true"
-        if self.update_id is not None:
-            slot = self.notice_slot
-            self.notice_slot += 1
+        if durable and self.update_id is not None:
+            # Content-stable positive slots cannot collide with reserved negative
+            # outcome slots or skip a different notice on a later attempt.
+            slot = notice_key
+            if slot is None:
+                identity = json.dumps(params, sort_keys=True, separators=(",", ":"))
+                slot = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], "big") >> 1
             row = self.spool.notice(self.update_id, slot, params)
             return self.deliver_notice(row)
         result, err = tg.api(self.cfg, "sendMessage", params)
@@ -310,7 +402,7 @@ class Door:
         text = "\n".join(str(line) for line in event.get("lines") or [])
         pieces = tg.split_markdown(text, TEXT_LIMIT) or [text]
         for piece in pieces:
-            _, err = self.say(piece, quiet=not event.get("loud"))
+            _, err = self.say(piece, quiet=not event.get("loud"), durable=False)
             if err:
                 return err
         return ""
@@ -409,7 +501,7 @@ class Door:
             last = index == len(pieces) - 1
             message_id, err = self.say(text, reply_to=reply_to if index == 0 else None,
                                        html=True, markup=markup if last else None,
-                                       quiet=bool(event.get("quiet")))
+                                       quiet=bool(event.get("quiet")), durable=False)
             if err:
                 return err
             if last and typed and markup:
@@ -510,21 +602,116 @@ class Door:
 
     # --- captain messages in ---------------------------------------------
 
+    def ingress(self, text, msg_id):
+        text = text_input.normalize(text)
+        bad = text_input.rejected_control(text)
+        if bad:
+            position, point = bad
+            self.outcome = "terminal_control_refused"
+            self.say(f"⚠️ not sent: control U+{point:04X} at character {position} "
+                     "(1-based) is not allowed. Remove it and resend.", reply_to=msg_id, notice_key=-13)
+            return None
+        return text
+
+    def spill(self, args, msg_id, force=False):
+        """Retain oversized text in file.put; never infer approval from a summary."""
+        if not force and text_input.fits(args):
+            return args
+        body = args.get("body") or ""
+        answer = (args.get("payload") or {}).get("answer")
+        contents = body
+        if isinstance(answer, dict) and answer.get("text") not in (None, body):
+            contents += "\n\nFull decision answer:\n" + answer["text"]
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=tg.STATE_DIR,
+                                         prefix="captain-", suffix=".txt", delete=False) as f:
+            path = f.name
+            f.write(contents)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            stored = self.runtime.call("file.put", {"to": args.get("to") or self.recipient(),
+                                       "name": "captain-input.txt", "content_file": path}, timeout=120)
+            if not stored.get("file_id"):
+                raise RuntimeError("file.put returned no stored file reference")
+            args = dict(args)
+            payload = dict(args.get("payload") or {})
+            payload["files"] = list(payload.get("files") or []) + [{"file_id": stored["file_id"]}]
+            note = "~Full captain text is in stored file captain-input.txt (" + stored["file_id"] + "). No inline approval.~"
+            if answer is not None:
+                # A file reference must not approve, nor select an option on
+                # behalf of words too large to judge inline. All markers are
+                # retained in the file; the non-affirmative answer fails closed.
+                payload["answer"] = {"text": "~See the full answer in captain-input.txt; no inline approval.~"}
+            args.update(body=note, payload=payload)
+            if not text_input.fits(args):
+                raise RuntimeError("non-text mail metadata exceeds the envelope")
+            if self.update_id is not None:
+                self.spool.replace_submission(self.update_id, args, msg_id, "stored text")
+            return args
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                tg.log("telegram outcome=inbox_cleanup_failed")
+
     def send(self, args: dict, msg_id, label: str) -> None:
         """Mail from the captain, with what the chat sees about it."""
         if self.cfg.get("send_kind") in ("request", "notice") and args.get("kind") is None:
             args["kind"] = self.cfg["send_kind"]
         if self.update_id is not None:
             args = dict(args)
-            if not args.get("to") and self.recipient():
-                args["to"] = self.recipient()
-            identity = json.dumps([self.hello.get("door"), tg.chat_id(self.cfg), self.update_id])
+            if not args.get("to"):
+                to = self.recipient()
+                if not to:
+                    to = self.runtime.call("ships").get("recipient")
+                if not to:
+                    self.outcome = "terminal_refused"
+                    self.say("⚠️ not sent: no default recipient; use /to SHIP.", reply_to=msg_id, notice_key=-12)
+                    return
+                args["to"] = to
+            identity = json.dumps([self.cfg.get("bot_id"), self.hello.get("door"),
+                                   tg.chat_id(self.cfg), self.update_id])
             args = dict(args, id="telegram-" + hashlib.sha256(identity.encode()).hexdigest()[:32])
             args, msg_id, label = self.spool.submission(self.update_id, args, msg_id, label)
+        # Validate before spill too: a stored file must not bypass ingress policy.
+        args = dict(args)
+        body = self.ingress(args.get("body") or "", msg_id)
+        if body is None:
+            return
+        args["body"] = body
+        if isinstance((args.get("payload") or {}).get("answer"), dict):
+            payload = dict(args["payload"])
+            answer = dict(payload["answer"])
+            if "text" in answer:
+                text = self.ingress(answer["text"], msg_id)
+                if text is None:
+                    return
+                answer["text"] = text
+            payload["answer"] = answer
+            args["payload"] = payload
+        try:
+            original = args
+            args = self.spill(args, msg_id)
+            if args is not original:
+                label = "stored text"
+        except RuntimeError:
+            self.outcome = "terminal_file_put_refused"
+            self.say("⚠️ not sent: could not store the full text. Please retry or send it as a document.",
+                     reply_to=msg_id, notice_key=-11)
+            return
         try:
             result = self.spool.result(self.update_id) if self.update_id is not None else None
             if result is None:
-                result = self.runtime.call("send", args)
+                try:
+                    result = self.runtime.call("send", args)
+                except RuntimeError as error:
+                    if "message exceeds 64 KiB" not in str(error):
+                        raise
+                    # Runtime-added paths/topic fields may exceed our reserve.
+                    # This refusal is transactional, so spill and retry safely.
+                    args = self.spill(args, msg_id, force=True)
+                    label = "stored text"
+                    result = self.runtime.call("send", args)
         except RuntimeError as e:
             if "Privateer did not answer" in str(e):
                 raise  # Uncertain commit: recover with the same mail id.
@@ -552,15 +739,18 @@ class Door:
                     if "Privateer did not answer" in str(again):
                         raise
                     self.outcome = "terminal_refused"
-                    self.say(f"⚠️ not sent: {again}", reply_to=msg_id)
+                    self.say(f"⚠️ not sent: {again}", reply_to=msg_id, notice_key=-10)
                     return
             else:
                 self.outcome = "terminal_refused"
-                self.say(f"⚠️ not sent: {e}", reply_to=msg_id)
+                self.say(f"⚠️ not sent: {e}", reply_to=msg_id, notice_key=-10)
                 return
         if self.update_id is not None:
             self.spool.result(self.update_id, result)
         self.outcome = "mail_committed"
+        if label == "stored text":
+            self.say("📄 Full text preserved in stored file captain-input.txt; "
+                     "it was too large to mail inline.", reply_to=msg_id, quiet=True, notice_key=-2)
         self.welcome(result.get("returned"))
         ship = result.get("ship", "")
         mail_id = (result.get("mail") or {}).get("id")
@@ -572,16 +762,31 @@ class Door:
             tg.write_state(OUTGOING, outgoing)
             # Replying to your own message follows up with the same ship.
             tg.remember_target(msg_id, {"ship": ship, "mail": mail_id, "kind": "sent", "from": ship})
+        message_ids = [msg_id]
+        if self.update_id is not None:
+            members = self.spool.joined(self.update_id)
+            if members:
+                message_ids = [json.loads(r["data"])["message"]["message_id"] for r in members]
         tg.log("captain outcome=mail_committed")
-        if not self.react(msg_id):
-            self.say(f"➡️ {ship}", reply_to=msg_id, quiet=True)
+        for message_id in message_ids:
+            if mail_id and message_id:
+                tg.remember_target(message_id, {"ship": ship, "mail": mail_id, "kind": "sent", "from": ship})
+            if not self.react(message_id):
+                _, err = self.say(f"➡️ {ship}", reply_to=message_id, quiet=True,
+                                  notice_key=-1000 - int(message_id or 0))
+                if self.update_id is None:
+                    tg.log("telegram outcome=confirmation_failed" if err else "telegram outcome=confirmation_sent")
 
     def react(self, msg_id) -> bool:
         if not msg_id or not self.cfg.get("confirm_with_reaction", True):
             return False
-        _, err = tg.api(self.cfg, "setMessageReaction", {
-            "chat_id": tg.chat_id(self.cfg), "message_id": msg_id,
-            "reaction": json.dumps([{"type": "emoji", "emoji": "👍"}])}, retries=1)
+        try:
+            _, err = tg.api(self.cfg, "setMessageReaction", {
+                "chat_id": tg.chat_id(self.cfg), "message_id": msg_id,
+                "reaction": json.dumps([{"type": "emoji", "emoji": "👍"}])}, retries=1)
+        except Exception:
+            err = "reaction exception"
+        tg.log("telegram outcome=reaction_failed" if err else "telegram outcome=reaction_set")
         return not err
 
     def route(self, text: str, msg_id, reply_to) -> dict | None:
@@ -624,16 +829,20 @@ class Door:
         self.sender = user
         msg_id = msg.get("message_id")
         reply_to = (msg.get("reply_to_message") or {}).get("message_id")
-        raw = msg.get("text") or ""
-        if raw.strip().startswith("/"):
+        raw = self.ingress(msg.get("text") or "", msg_id)
+        if raw is None:
+            return
+        if text_input.command(raw, msg.get("entities"), {c["command"] for c in COMMANDS} | {"start"},
+                              self.cfg.get("bot_username", "")):
             return self.command(raw.strip(), msg_id)
-        text = struck(raw, msg.get("entities")).strip()
+        text = struck(raw, msg.get("entities"))
         if msg.get("voice"):
             return self.handle_voice(msg, msg_id, reply_to)
         if attachment(msg)[0]:
             return self.handle_attachment(msg, msg_id, reply_to)
-        if not text:
+        if not text.strip():
             self.outcome = "terminal_unsupported"
+            self.say("⚠️ This update has no supported text or attachment to forward.", reply_to=msg_id)
             return
         args = self.route(text, msg_id, reply_to)
         if args:
@@ -661,12 +870,17 @@ class Door:
         # A stored file's caption is its reply body. Re-check its formatting
         # just like text; missing words (including a voice transcript we no
         # longer have) fail closed instead of leaving an old yes standing.
-        if "text" in msg:
-            body = struck(msg.get("text") or "", msg.get("entities"))
-        else:
-            body = struck(msg.get("caption") or "", msg.get("caption_entities"))
+        raw = text_input.normalize(msg.get("text") if "text" in msg else msg.get("caption") or "")
+        body = struck(raw, msg.get("entities") if "text" in msg else msg.get("caption_entities"))
+        bad = text_input.rejected_control(raw)
+        if bad:
+            # Still re-check (and fail closed), rather than leave an old
+            # approval standing because the replacement contains a control.
+            body = "~Edited answer contains a rejected control; no inline approval.~"
+            self.say(f"⚠️ Edited answer contains control U+{bad[1]:04X} at character {bad[0]} "
+                     "(1-based); re-checking without treating it as approval.", reply_to=msg_id)
         args = {"ship": target.get("from") or target.get("ship"), "id": target.get("mail"),
-                "body": body.strip()}
+                "body": body}
         # Name the reply this door sent when it still remembers it, so the
         # runtime judges that exact answer; without it the runtime re-checks
         # the ask's approval rather than leave one standing.
@@ -795,7 +1009,8 @@ class Door:
                 "reply_markup": json.dumps({"inline_keyboard": []})}, retries=1)
 
     def command(self, text: str, msg_id) -> None:
-        head, _, rest = text.partition(" ")
+        words = text.split(maxsplit=1)
+        head, rest = words[0], words[1] if len(words) > 1 else ""
         name = head[1:].split("@")[0].lower()
         rest = rest.strip()
         if name == "upgrade" and not self.listed(self.sender):
@@ -871,7 +1086,7 @@ class Door:
                 import tts
                 self.say(tts.voice_reply(self.cfg, rest))
             else:
-                self.say(f"❓ unknown command /{name} — try /help", reply_to=msg_id)
+                self.say("❓ unknown command — try /help", reply_to=msg_id)
         except RuntimeError as e:
             self.say(f"⚠️ {e}", reply_to=msg_id)
 
@@ -1122,7 +1337,10 @@ class Door:
         file_id, name, size = attachment(msg)
         if self.too_big(size, msg_id):
             return
-        caption = struck(msg.get("caption") or "", msg.get("caption_entities")).strip()
+        raw_caption = self.ingress(msg.get("caption") or "", msg_id)
+        if raw_caption is None:
+            return
+        caption = struck(raw_caption, msg.get("caption_entities"))
         args = self.route(caption or "(file)", msg_id, reply_to)
         if not args:
             return
@@ -1139,12 +1357,10 @@ class Door:
                 stored = self.runtime.call(
                     "file.put", {"to": ship, "name": saved, "content_file": dest}, timeout=120)
             except RuntimeError as e:
-                # An older runtime has no file.put at all; that alone falls back
-                # quietly. Any other refusal loses the file for a ship on a
-                # linked machine, so the captain hears about it first.
-                if "unknown door command" not in str(e):
-                    self.say(f"⚠️ couldn't hand {saved} to {ship}: {e}; kept at {dest}",
-                             reply_to=msg_id)
+                # Even an older runtime's missing file.put is visible: the
+                # fallback path may be unreadable on a linked machine.
+                self.say(f"⚠️ couldn't hand {saved} to {ship}: {e}; kept at {dest}",
+                         reply_to=msg_id)
                 tg.log("telegram outcome=file_put_failed")
         if stored and stored.get("file_id"):
             # The runtime fills the path when the mail lands, and the mail must
@@ -1156,15 +1372,47 @@ class Door:
                 args["payload"] = payload
             payload["files"] = [{"file_id": stored["file_id"]}]
             args["body"] = caption or f"The captain sent a file: {saved}"
-            try:
-                os.unlink(dest)
-            except OSError:
-                tg.log("telegram outcome=inbox_cleanup_failed")
         else:
             # No file.put (an older runtime, an unknown command or a refusal):
             # the ship on this machine can still be told where the file is.
             note = f"The captain sent a file: {dest}"
             args["body"] = f"{caption}\n\n{note}" if caption else note
+        doc = msg.get("document") or {}
+        extension = os.path.splitext(name or "")[1].lower()
+        mime = (doc.get("mime_type") or "").split(";", 1)[0].lower()
+        readable = extension in (".txt", ".md", ".markdown") or mime in ("text/plain", "text/markdown", "text/x-markdown")
+        reason = "not a plain-text or Markdown document" if doc else ""
+        if readable:
+            if args.get("kind") == "reply":
+                # Only the captain's caption may answer an ask. File contents
+                # and adapter diagnostics must never change its approval meaning.
+                reason = "attachments to asks are reference-only; only the caption answers"
+            elif os.path.getsize(dest) > text_input.MAIL_BYTES:
+                reason = "text is too large for the mail envelope"
+            else:
+                try:
+                    with open(dest, encoding="utf-8", newline="") as f:
+                        contents = text_input.normalize(f.read())
+                    bad = text_input.rejected_control(contents)
+                    if bad:
+                        reason = f"text contains control U+{bad[1]:04X} at character {bad[0]}"
+                    else:
+                        candidate = dict(args, body=args["body"] +
+                                         "\n\n~Attached file text (reference only; no inline approval):~\n" + contents)
+                        if text_input.fits(candidate):
+                            args = candidate
+                            reason = ""
+                        else:
+                            reason = "text is too large for the mail envelope"
+                except UnicodeDecodeError:
+                    reason = "document is not valid UTF-8"
+        if reason:
+            self.say(f"📎 File kept as a reference: {reason}.", reply_to=msg_id, quiet=True)
+        if stored and stored.get("file_id"):
+            try:
+                os.unlink(dest)
+            except OSError:
+                tg.log("telegram outcome=inbox_cleanup_failed")
         self.send(args, msg_id, f"file {saved}")
 
     def handle_voice(self, msg: dict, msg_id, reply_to) -> None:
@@ -1195,14 +1443,15 @@ class Door:
             self.say("🎙️ your voice note came through empty, please re-record", reply_to=msg_id)
             return
         body = stt.prompt_for(transcript)
-        caption = struck(msg.get("caption") or "", msg.get("caption_entities")).strip()
+        raw_caption = self.ingress(msg.get("caption") or "", msg_id)
+        if raw_caption is None:
+            return
+        caption = struck(raw_caption, msg.get("caption_entities"))
         args["body"] = f"{caption}\n{body}" if caption else body
         if "answer" in args.get("payload", {}):
             # A typed answer carries the captain's words, not the "(voice)" placeholder.
-            spoken = transcript.strip()
-            text = f"{caption}\n{spoken}" if caption else spoken
-            # The runtime caps an answer at 4096 characters; the body keeps it all.
-            args["payload"]["answer"]["text"] = text if len(text) <= 4096 else text[:4095].rstrip() + "…"
+            text = f"{caption}\n{transcript}" if caption else transcript
+            args["payload"]["answer"]["text"] = text
         if transcript.strip() and stt.stt_config(self.cfg).get("echo_transcript", True):
             shown = transcript.strip()
             shown = shown if len(shown) <= 400 else shown[:400].rstrip() + "…"
@@ -1229,11 +1478,18 @@ def struck(text: str, entities) -> str:
     if not marks:
         return text
     units = text.encode("utf-16-le")
-    end = len(units) // 2
     tilde = "~".encode("utf-16-le")
-    for at in sorted((min(max(m, 0), end) for m in marks), reverse=True):
+    boundaries = {0}
+    offset = 0
+    for char in text:
+        offset += text_input.units(char)
+        boundaries.add(offset)
+    if any(m not in boundaries for m in marks):
+        # Invalid entity offsets must neither lose emoji nor erase a strike.
+        return "~" + text + "~"
+    for at in sorted(marks, reverse=True):
         units = units[:2 * at] + tilde + units[2 * at:]
-    return units.decode("utf-16-le", errors="replace")
+    return units.decode("utf-16-le")
 
 
 def download_name(dest: str) -> str:
@@ -1388,6 +1644,8 @@ def poll_telegram(cfg: dict, events: queue.Queue, stop: threading.Event) -> None
                 tg.log("telegram outcome=spool_full")
                 stop.wait(RETRY_SECONDS)
                 continue
+            if updates and events is not None:
+                events.put(("inbound", None))
             tg.write_state(OFFSET, {"offset": spool.offset()})
             failures = 0
         except Exception:
@@ -1416,6 +1674,10 @@ def main() -> int:
     problem = tg.config_problem(cfg)
     if problem:
         print(f"Telegram door config: {problem}", file=sys.stderr)
+        return 2
+    # A Telegram token's numeric prefix is its bot id. Never log the token;
+    # getMe is only needed for the optional @username command spelling.
+    if not bot_identity(cfg):
         return 2
     kind = chat_kind(cfg)
     if kind != "private" and not cfg.get("allowed_user_ids"):
@@ -1450,7 +1712,8 @@ def main() -> int:
                 door.on_mail(item)
             elif source == "runtime":
                 tg.log(f"ignoring runtime message {item.get('type')!r}")
-            door.process_inbound()
+            while door.process_inbound():
+                pass
             door.retry_notices()
         except BrokenPipeError:
             break

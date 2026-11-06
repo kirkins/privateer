@@ -51,6 +51,15 @@ class FakeTelegram:
 
             def do_GET(self):
                 path = self.path.split("?")[0]
+                if path.startswith(f"/bot{TOKEN}/"):
+                    result = fake.handle(path.rsplit("/", 1)[1], {})
+                    body = json.dumps({"ok": True, "result": result}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 prefix = f"/file/bot{TOKEN}/"
                 assert path.startswith(prefix), path
                 data = fake.files.get(path[len(prefix):])
@@ -98,6 +107,8 @@ class FakeTelegram:
             if method == "getFile":
                 remote = self.file_paths.get(form.get("file_id"))
                 return {"file_path": remote} if remote else None
+            if method == "getMe":
+                return {"id": 123, "username": "fictional_bot"}
             if method == "getChat":
                 return {"id": int(form.get("chat_id", 0)), "type": self.chat_type}
             if method == "sendMessage":
@@ -117,7 +128,7 @@ class FakeTelegram:
             self.updates.append(update)
 
     def message(self, text: str, reply_to: int | None = None, chat: int = CHAT,
-                user: int = CAPTAIN) -> int:
+                user: int = CAPTAIN, entities: list | None = None) -> int:
         with self.lock:
             self.next_message += 1
             ident = self.next_message
@@ -125,6 +136,8 @@ class FakeTelegram:
                    "text": text}
         if reply_to:
             message["reply_to_message"] = {"message_id": reply_to}
+        if entities is not None:
+            message["entities"] = entities
         self.update(message)
         return ident
 
@@ -250,7 +263,7 @@ import door, tg
 tg.STATE_DIR = tempfile.mkdtemp()
 said = []
 d = door.Door({"door": "t"}, {"tts": {}}, None)
-d.say = lambda text, reply_to=None, html=False, markup=None, quiet=False: (
+d.say = lambda text, reply_to=None, html=False, markup=None, quiet=False, durable=True: (
     said.append({"text": text, "quiet": quiet}) or (len(said), ""))
 unknown = {"id": "m1", "from": "ops", "kind": "notice", "urgency": "normal",
            "body": "joins an ask shown before cards were kept", "payload": {"attached_to": "gone"}}
@@ -330,7 +343,8 @@ def check_voice_transcripts() -> None:
     assert got["sent"] == [], got
     short, long = got["typed"]
     assert short["payload"]["answer"]["text"] == "go with b" and short["body"] == '"go with b"', got
-    assert len(long["payload"]["answer"]["text"]) <= 4096 and len(long["body"]) > 4096, long["body"][:80]
+    assert long["payload"]["answer"]["text"] == "word " * 1200, long
+    assert len(long["body"]) > 4096, long["body"][:80]
 
 
 ATTACHMENT_PROBE = """
@@ -412,10 +426,11 @@ def check_attachment_put_and_fallback() -> None:
     got = json.loads(out.stdout)
     fallback = got["fallback"]
     assert "The captain sent a file:" in fallback["body"], fallback
-    assert os.path.basename(fallback["body"].rsplit(": ", 1)[1]) == "kept.bin", fallback
+    assert fallback["body"].splitlines()[0].endswith("kept.bin"), fallback
     assert "files" not in (fallback.get("payload") or {}), fallback
     assert got["kept"], got
-    assert got["quiet"] == [], got["quiet"]
+    assert "unknown door command" in got["quiet"][0] and "couldn't hand" in got["quiet"][0], got["quiet"]
+    assert "File kept as a reference" in got["quiet"][-1], got["quiet"]
     refusal = got["refusal"]
     warned = "⚠️ couldn't hand notes.bin to ops: cannot reach ship macops"
     assert warned in got["warned"][0], got["warned"]
@@ -886,6 +901,40 @@ assert all(secret not in line and "fictional-name" not in line and "/hidden" not
 outcomes = [line for line in logs if line.startswith("inbound ")]
 assert outcomes and all("update_id=" in line and "type=" in line and "length=" in line and "outcome=" in line for line in outcomes), logs
 
+# A final warning uses a reserved slot, not a handler's already-sent slot 0.
+spool.admit([update(7)])
+for _ in range(inbound.ATTEMPTS):
+    d = adapter()
+    def warned_then_broke(u):
+        d.say("first warning")
+        raise ValueError(secret)
+    d.on_update = warned_then_broke
+    hurry(spool); d.process_inbound()
+hurry(spool); adapter().process_inbound()
+assert sent[-1]["text"].startswith("⚠️ Could not complete this update."), sent
+assert sum(s["text"] == "first warning" for s in sent) == 1
+
+# One loop turn drains a burst, with no per-update one-second sleeps.
+spool.admit([update(i) for i in range(8, 18)])
+d = adapter(); count = 0
+while d.process_inbound(): count += 1
+assert count == 10 and spool.ready() is None
+
+# /waiting uses the push retry owner, not the notice spool. A failure is
+# returned to that caller, and a successful retry records the reply mapping.
+spool.admit([update(18)])
+d = adapter(); d.update_id = 18
+mail = dict(id="ask", kind="request", body="Question", **{"from": "ops"})
+fail_notice = True
+assert d.push(dict(mail=mail, ship="ops", ref="ops:ask"))
+with spool.db() as db:
+    assert db.execute("SELECT count(*) FROM notices WHERE update_id=18").fetchone()[0] == 0
+fail_notice = False
+assert not d.push(dict(mail=mail, ship="ops", ref="ops:ask"))
+assert tg.target_for_reply(sent[-1].get("_id", 500 + len(sent)))["mail"] == "ask"
+d.update_id = None
+d.process_inbound()
+
 # Real process death after the fake mail store commits, before the adapter sees
 # a response/ack. The next process must reuse the exact submitted id and args.
 crash_state = root / "crash"
@@ -921,8 +970,313 @@ for phase, expected in (("crash", 73), ("recover", 0)):
 with sqlite3.connect(crash_state / "fake-mail.sqlite3") as db:
     assert db.execute("SELECT count(*) FROM mail").fetchone()[0] == 1
 assert inbound.Spool().ready() is None
+# Kill the real handler after a joined mail commits, before its receipt. All
+# three parts stay in spool custody; recovery sends the exact frozen group.
+parts = ["漢" * 3498 + "🚢", "e\u0301" * 1750, "尾🚢\n "]
+updates = [update(i) for i in (21, 22, 23)]
+for item, text in zip(updates, parts): item["message"]["text"] = text
+assert inbound.Spool().admit(updates)
+for phase, expected in (("crash", 73), ("recover", 0)):
+    result = subprocess.run([sys.executable, "-c", child, sys.argv[1], str(crash_state), phase], capture_output=True, text=True)
+    assert result.returncode == expected, result.stderr
+    if phase == "crash":
+        with inbound.Spool().db() as db:
+            assert db.execute("SELECT count(*) FROM pending WHERE outcome IS NULL").fetchone()[0] == 3
+with sqlite3.connect(crash_state / "fake-mail.sqlite3") as db:
+    rows = db.execute("SELECT args FROM mail").fetchall()
+    assert len(rows) == 2
+    assert any(json.loads(r[0])["body"] == "".join(parts) for r in rows)
+assert inbound.Spool().ready() is None
+# A changed automatic notice on a retry gets its own stable slot, while the
+# identical one is sent only once even after restart.
+spool = inbound.Spool(); spool.admit([update(24)])
+for attempt in range(inbound.ATTEMPTS):
+    d = adapter()
+    def changing_warning(u):
+        d.say("stable warning")
+        d.say("attempt warning " + str(attempt))
+        raise ValueError(secret)
+    d.on_update = changing_warning
+    hurry(spool); assert not d.process_inbound()
+assert sum(s["text"] == "stable warning" for s in sent) == 1
+assert all(any(s["text"] == "attempt warning " + str(i) for s in sent) for i in range(inbound.ATTEMPTS))
+hurry(spool); adapter().process_inbound()
+
+# Spool errors during paste discovery consume attempts and reach a visible
+# terminal notice instead of wedging this row forever before begin().
+spool.admit([update(25), update(26)])
+def broken_join(*a): raise OSError("injected spool read failure")
+for attempt in range(inbound.ATTEMPTS):
+    d = adapter(); d.spool.joined = broken_join
+    hurry(spool); assert not d.process_inbound()
+    assert spool.ready()["attempts"] == attempt + 1
+hurry(spool); assert adapter().process_inbound()
+assert sent[-1]["text"].startswith("⚠️ Could not complete this update.")
+assert adapter().process_inbound() and spool.ready() is None
+
+# Persistent writes on initial-skip/final-attempt rows must yield rather than
+# keep the main loop's drain spinning and starve runtime events.
+for ident, initial_skip in ((27, True), (28, False)):
+    spool.admit([update(ident)], initial_skip=initial_skip)
+    if not initial_skip:
+        with spool.db() as db: db.execute("UPDATE pending SET attempts=? WHERE id=?", (inbound.ATTEMPTS, ident))
+    d = adapter()
+    def broken_finish(*a): raise OSError("injected spool write failure")
+    d.spool.finish = broken_finish
+    assert not d.process_inbound() and spool.ready()["id"] == ident
+    assert "outcome=handler_retry" in logs[-1]
+    assert adapter().process_inbound()
+
+# Bad join configuration is rejected at door construction with a content-free
+# fallback warning. No incoming row is stuck behind a conversion exception.
+for invalid in ("not-a-number", [], None, float("nan"), float("inf"), -1, 31):
+    d = door.Door({"door":"phone", "recipient":"liaison"}, dict(cfg, paste_join_seconds=invalid), runtime)
+    assert d.cfg["paste_join_seconds"] == 3
+    assert logs[-1] == "telegram config=paste_join_seconds outcome=invalid_defaulting_to_3"
+spool.admit([update(29)])
+assert d.process_inbound() and spool.ready() is None
+# A transient getMe refusal cannot prevent stable bot-scoped mail identity.
+tg.api = lambda *a, **k: (None, "temporary refusal")
+identity_cfg = {"bot_token": "123:fictional-test-token"}
+assert door.bot_identity(identity_cfg) and identity_cfg["bot_id"] == 123
+assert identity_cfg["bot_username"] == ""
+assert all("fictional-test-token" not in line for line in logs)
 print("durable inbound spool, crash recovery, bounded retries and content-free outcomes passed")
 '''
+
+
+LONG_INPUT_PROBE = r'''
+import json, os, pathlib, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import door, inbound, stt, tg, text_input
+root = pathlib.Path(tempfile.mkdtemp())
+tg.STATE_DIR = str(root)
+logs, notices, stored = [], [], {}
+tg.log = logs.append
+reaction_error = warning_error = False
+reaction_calls = 0
+def api(cfg, method, params, **kwargs):
+    global reaction_calls
+    if method == "setMessageReaction":
+        reaction_calls += 1
+        return (None, "refused") if reaction_error else ({}, "")
+    if method == "sendMessage":
+        notices.append(params["text"])
+        assert text_input.units(params["text"]) <= 4096
+        return (None, "refused") if warning_error else ({"message_id": len(notices) + 500}, "")
+    return {}, ""
+tg.api = api
+class Runtime:
+    def __init__(self): self.mail = {}; self.calls = []; self.refuse = False; self.timeout = False
+    def call(self, command, args=None, **kwargs):
+        self.calls.append((command, args))
+        if command == "file.put":
+            ident = "file" + str(len(stored))
+            stored[ident] = pathlib.Path(args["content_file"]).read_bytes()
+            return {"file_id": ident}
+        assert command == "send", command
+        if self.refuse: raise RuntimeError("runtime refusal " + "x" * 9000)
+        assert len(json.dumps(args, ensure_ascii=False).encode()) < text_input.MAIL_BYTES
+        assert text_input.rejected_control(args["body"]) is None
+        ident = args.get("id") or str(len(self.mail))
+        key = (tg.STATE_DIR, ident)
+        if key in self.mail: assert self.mail[key] == args
+        self.mail[key] = args.copy()
+        if self.timeout: raise RuntimeError("Privateer did not answer send within 30s")
+        return {"ship": "liaison", "mail": {"id": ident}}
+runtime = Runtime()
+cfg = {"chat_id": "42", "allowed_user_ids": [7], "bot_id": 123}
+def adapter(): return door.Door({"door": "phone", "recipient": "liaison"}, cfg, runtime)
+def update(i, text, **extra):
+    return dict(update_id=i, message=dict(message_id=i, chat={"id": 42}, text=text,
+                                          **{"from": {"id": 7}}, **extra))
+def hurry():
+    with inbound.Spool().db() as db:
+        db.execute("UPDATE pending SET next_at=0,admitted_at=0")
+        db.execute("UPDATE notices SET next_at=0")
+def latest(): return list(runtime.mail.values())[-1]
+tg.remember_target(100, {"ship": "ops", "from": "ops", "kind": "decision", "typed": True, "mail": "ask"})
+# Unit boundaries are UTF-16, not Python code points or UTF-8 bytes. Both
+# ordinary mail and typed replies retain every word, including safety marks.
+for size in (4095, 4096, 4097):
+    for motif in ("x", "🚢", "e\u0301", "漢"):
+        text = motif * (size // text_input.units(motif))
+        text += "z" * (size - text_input.units(text))
+        assert text_input.units(text) == size
+        for typed in (False, True):
+            extra = {"reply_to_message": {"message_id": 100}} if typed else {}
+            adapter().on_update(update(1, text, **extra))
+            assert latest()["body"] == text
+            if typed: assert latest()["payload"]["answer"]["text"] == text
+            # Marker expansion is allowed to cross the platform cap.
+            extra["entities"] = [{"type": "strikethrough", "offset": 0, "length": text_input.units(motif)}]
+            adapter().on_update(update(2, text, **extra))
+            expected = "~" + motif + "~" + text[len(motif):]
+            assert latest()["body"] == expected
+            if typed: assert latest()["payload"]["answer"]["text"] == expected
+assert door.struck("🚢yes", [{"type": "strikethrough", "offset": 1, "length": 1}]) == "~🚢yes~"
+# Slash-leading text is mail unless a complete recognized token is present.
+for text in ("/" + "x" * 4095, "/status-not-a-command " + "漢" * 3600,
+             "/unknown < & _", "/status@other_bot"):
+    adapter().on_update(update(3, text))
+    assert latest()["body"] == text
+commands = []
+d = adapter(); d.command = lambda text, mid: commands.append(text)
+d.on_update(update(4, "/status", entities=[{"type": "bot_command", "offset": 0, "length": 7}]))
+d.on_update(update(4, " \t/yolo off", entities=[{"type": "bot_command", "offset": 2, "length": 5}]))
+d.on_update(update(4, " /status"))
+assert commands == ["/status", "/yolo off", "/status"]
+for layout in ("\v", "\f", "\x85"):
+    for text in (layout + "hello", "hello" + layout, "a" + layout + "b"):
+        adapter().on_update(update(5, text))
+        assert latest()["body"] == text.replace(layout, "\n")
+for text in ("\u2028a\u2029", "a\u2028b\u2029c", "< & _ 🚢 e\u0301 漢"):
+    adapter().on_update(update(6, text)); assert latest()["body"] == text
+for text, position in (("\x1bhello", 1), ("hello\x1b", 6), ("a\x1bb", 2)):
+    before = len(runtime.mail)
+    adapter().on_update(update(7, text))
+    assert len(runtime.mail) == before
+    assert "U+001B" in notices[-1] and f"character {position}" in notices[-1]
+    assert "hello" not in notices[-1]
+for point in list(range(32)) + list(range(127, 160)):
+    if point in (9, 10, 11, 12, 13, 133): continue
+    before = len(runtime.mail)
+    adapter().on_update(update(8, "a" + chr(point) + "b"))
+    assert len(runtime.mail) == before and f"U+{point:04X}" in notices[-1]
+# Joining is only for near-cap consecutive plain text. A short tail ends the
+# group without a delay; two short instructions are never coalesced.
+for parts in (["a" * 3500, " tail"], ["🚢" * 1750, "漢" * 3500, "e\u0301 "]):
+    d = adapter(); start = len(runtime.mail)
+    d.spool.admit([update(10 + i, t) for i, t in enumerate(parts)])
+    assert d.process_inbound() and not d.process_inbound()
+    assert len(runtime.mail) == start + 1 and latest()["body"] == "".join(parts)
+    # Isolate ids from the next case, like separate bot state directories.
+    tg.STATE_DIR = tempfile.mkdtemp(dir=root)
+    tg.remember_target(100, {"ship":"ops","from":"ops","kind":"decision","typed":True,"mail":"ask"})
+for extra in ({}, {"reply_to_message": {"message_id": 100}},
+              {"entities": [{"type":"bold","offset":0,"length":1}]},
+              {"message_thread_id": 9}):
+    tg.remember_target(100, {"ship":"ops","from":"ops","kind":"decision","typed":True,"mail":"ask"})
+    d = adapter(); start = len(runtime.mail)
+    first = "short" if not extra else "x" * 3500
+    d.spool.admit([update(20, first), update(21, "next", **extra)])
+    while d.process_inbound(): pass
+    assert len(runtime.mail) == start + 2
+    tg.STATE_DIR = tempfile.mkdtemp(dir=root)
+# A command part and an unknown slash-leading paste are never joined.
+for tail in ("/help", "/unknown paste"):
+    d = adapter(); before = len(runtime.mail)
+    d.spool.admit([update(30, "x" * 3500), update(31, tail)])
+    while d.process_inbound(): pass
+    assert len(runtime.mail) == before + (1 if tail == "/help" else 2)
+    assert list(runtime.mail.values())[before]["body"] == "x" * 3500
+    tg.STATE_DIR = tempfile.mkdtemp(dir=root)
+# A near-cap tail waits only for its configurable window. The exact original
+# text stays in durable custody throughout, including after a new Door starts.
+d = adapter(); d.spool.admit([update(40, "x" * 3500)])
+assert not d.process_inbound() and d.spool.ready()["attempts"] == 0
+hurry(); assert adapter().process_inbound()
+# Oversized transcript goes via file.put, whole, never via a >1 MiB line.
+transcript = "漢🚢 e\u0301 " * 20000
+stt.transcribe = lambda cfg, path: (transcript, "")
+cfg["stt"] = {"api_key": "fictional-key", "echo_transcript": False}
+d = adapter(); d.fetch = lambda *a: "unused.ogg"
+d.handle_voice({"voice": {"file_id":"voice", "duration":30}}, 50, None)
+assert "captain-input.txt" in latest()["body"]
+assert stored[latest()["payload"]["files"][0]["file_id"]].decode() == stt.prompt_for(transcript)
+# Oversized typed answers retain all strike markers in the file and use a
+# non-affirmative inline answer, never a truncated apparent approval.
+text = "~yes~ " * 20000
+d.send({"to":"ops","kind":"reply","correlation":"ask","body":text,
+        "payload":{"answer":{"text":text}}}, 51, "answer")
+assert latest()["payload"]["answer"]["text"].startswith("~See the full answer")
+assert stored[latest()["payload"]["files"][0]["file_id"]].decode() == text
+# Text documents inline while they fit; other files keep a reference and a
+# visible reason, regardless of MIME or extension mislabelling.
+for name, mime, data, inline, reason in (
+    ("notes.txt", "application/octet-stream", "hello 漢🚢".encode(), True, ""),
+    ("notes.md", "text/markdown", b"# heading\n< & _", True, ""),
+    ("notes.data", "text/plain", b"mime text", True, ""),
+    ("binary.bin", "application/octet-stream", b"\x00\xff", False, "not a plain-text"),
+    ("bad.txt", "text/plain", b"\xff", False, "not valid UTF-8"),
+    ("nul.md", "text/markdown", b"a\x00b", False, "control U+0000"),
+    ("huge.md", "text/markdown", b"z" * 70000, False, "too large"),
+):
+    path = root / name; path.write_bytes(data)
+    d = adapter(); d.fetch = lambda *a: str(path)
+    d.handle_attachment({"document":{"file_id":"doc","file_name":name,"mime_type":mime,
+                                      "file_size":len(data)}}, 60, None)
+    assert latest()["payload"]["files"]
+    if inline:
+        assert data.decode() in latest()["body"]
+        assert "~Attached file text (reference only; no inline approval):~" in latest()["body"]
+    else:
+        assert reason not in latest()["body"] and reason in notices[-1]
+# An ask is answered by the caption only, regardless of attached words or
+# diagnostics. A yes with a binary file still means yes; thanks plus ok is
+# never promoted into approval by inlining file contents.
+tg.remember_target(100, {"ship":"ops","from":"ops","kind":"request","mail":"ask"})
+for caption, contents, name in (("thanks", b"ok", "answer.txt"),
+                                ("thanks", b"Submit build 55", "answer.md"),
+                                ("yes", b"%PDF binary", "answer.pdf")):
+    path = root / name; path.write_bytes(contents)
+    d = adapter(); d.fetch = lambda *a: str(path)
+    d.handle_attachment({"caption":caption, "document":{"file_id":"doc","file_name":name}}, 61, 100)
+    assert latest()["body"] == caption and latest()["payload"]["files"]
+    assert "reference" in notices[-1]
+# Spill success is announced only after mail commit, not on runtime refusal.
+tg.STATE_DIR = tempfile.mkdtemp(dir=root)
+d = adapter(); d.spool.admit([update(65, "漢" * 30000)])
+runtime.refuse = True; before = len(notices)
+hurry(); assert d.process_inbound(); runtime.refuse = False
+assert not any("Full text preserved" in n for n in notices[before:])
+d.spool.admit([update(66, "漢" * 30000)])
+hurry(); assert adapter().process_inbound()
+assert any("Full text preserved" in n for n in notices[before:])
+# Reaction failure is distinct from insertion; fallback warning delivery is
+# checked and retried through the existing durable notice spool.
+tg.STATE_DIR = tempfile.mkdtemp(dir=root)
+d = adapter(); d.spool.admit([update(70, "reaction failure")])
+reaction_error = warning_error = True
+before = len(runtime.mail); d.process_inbound()
+assert len(runtime.mail) == before + 1 and latest()["body"] == "reaction failure"
+assert "telegram outcome=reaction_failed" in logs and any("outcome=confirmation_failed" in line for line in logs)
+assert sum("outcome=confirmation_failed" in line for line in logs) == 1
+warning_error = False; hurry(); adapter().retry_notices()
+assert any("outcome=notice_sent" in line for line in logs)
+# Runtime refusal is a checked, bounded notice, not an insertion.
+d = adapter(); runtime.refuse = True; d.spool.admit([update(71, "refused")])
+before = len(runtime.mail); d.process_inbound(); runtime.refuse = False
+assert len(runtime.mail) == before and "not sent" in notices[-1] and text_input.units(notices[-1]) <= 3000
+# An uncertain send may already have inserted. Replay uses the same id.
+d = adapter(); runtime.timeout = True; d.spool.admit([update(72, "uncertain")])
+before = len(runtime.mail); d.process_inbound()
+assert len(runtime.mail) == before + 1 and d.spool.ready()
+runtime.timeout = False; hurry(); adapter().process_inbound()
+assert len(runtime.mail) == before + 1
+# A state-write error after insertion is a confirmation/recovery failure,
+# never evidence of a failed insertion. Exhaustion reports the durable fact.
+d = adapter(); d.spool.admit([update(73, "state write failure")])
+write = tg.write_state
+def broken_write(name, value):
+    if name == door.OUTGOING: raise OSError("injected state write failure")
+    return write(name, value)
+tg.write_state = broken_write
+before = len(runtime.mail)
+for _ in range(inbound.ATTEMPTS): hurry(); adapter().process_inbound()
+assert len(runtime.mail) == before + 1
+hurry(); adapter().process_inbound()
+assert "mail committed" in notices[-1] and "not confirmed sent" not in notices[-1]
+tg.write_state = write
+assert all("reaction failure" not in line and "state write failure" not in line for line in logs)
+print("long input boundaries, joining, text files and failure outcomes passed")
+'''
+
+
+def check_long_input() -> None:
+    out = subprocess.run([sys.executable, "-c", LONG_INPUT_PROBE, str(ROOT / "plugins/telegram")],
+                         capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
 
 
 def check_inbound_spool() -> None:
@@ -943,7 +1297,7 @@ def check_struck_text() -> None:
     assert got["struck"] == ["~yes~", "\U0001F44D ~yes~ do it", "ok ~yes~ no", "yes", "yes",
                              "~yes do it~", "~go~"], got["struck"]
     [reply] = got["sent"]
-    assert reply["body"] == "~yes~" and reply["payload"]["answer"]["text"] == "~yes~", reply
+    assert reply["body"] == " ~yes~ " and reply["payload"]["answer"]["text"] == " ~yes~ ", reply
     assert got["commands"] == ["/status"], got
     assert got["routed"] == ["~yes~"], got
 
@@ -1019,6 +1373,7 @@ def main() -> int:
     check_struck_text()
     check_edited_replies()
     check_inbound_spool()
+    check_long_input()
     check_voice_transcripts()
     check_attachment_put_and_fallback()
     check_group_chat_guard(telegram)
@@ -1076,6 +1431,37 @@ def main() -> int:
             assert asked["from"] == "captain" and asked["kind"] == "request", asked
             wait_for("a 👍 confirmation", lambda: [
                 r for r in telegram.called("setMessageReaction") if r["message_id"] == str(question)])
+
+            # Actual adapter/protocol/runtime boundaries, not just mocked
+            # insertion: synthetic 4097-unit updates and expanded strikes go
+            # through intact, and both body and typed answer remain whole.
+            for size in (4095, 4096, 4097):
+                text = "🚢" + "漢" * (size - 2)
+                telegram.message(text)
+                wait_for(f"ordinary {size}-unit mail", lambda: [
+                    m for m in fleet.inbox("liaison", "liaison") if m["body"] == text])
+                ask_id = f"boundary-{size}"
+                fleet.call("ops", "mail.send", {
+                    "id": ask_id, "from": "ops", "to": "captain", "kind": "decision",
+                    "body": f"Boundary {size}?", "payload": {"decision": {
+                        "question": f"Boundary {size}?", "options": [
+                            {"id":"go","label":"Go","what_happens":"Continue"},
+                            {"id":"hold","label":"Hold","what_happens":"Wait"}]}}})
+                card = wait_for(f"boundary {size} card", lambda: [
+                    m for m in telegram.sent() if f"Boundary {size}?" in m["text"]])[0]
+                telegram.message(text, reply_to=card["_message_id"], entities=[
+                    {"type":"strikethrough","offset":0,"length":2}])
+                expected = "~🚢~" + text[1:]
+                reply = wait_for(f"typed {size}-unit mail", lambda: [
+                    m for m in fleet.inbox("ops", "ops") if m.get("correlation") == ask_id])[0]
+                assert reply["body"] == expected and reply["payload"]["answer"]["text"] == expected, reply
+            slash = "/not_a_command " + "< & _ 漢🚢" * 400
+            telegram.message(slash)
+            wait_for("literal slash-leading paste", lambda: [
+                m for m in fleet.inbox("liaison", "liaison") if m["body"] == slash])
+            telegram.message("\u000bnormalized\u000cinside\u0085end\u2028\u2029")
+            wait_for("normalized layout controls", lambda: [
+                m for m in fleet.inbox("liaison", "liaison") if m["body"] == "\nnormalized\ninside\nend\u2028\u2029"])
 
             # The liaison's answer threads under the captain's question.
             fleet.call("liaison", "mail.send", {"from": "liaison", "to": "captain", "kind": "reply",
@@ -1227,11 +1613,22 @@ def main() -> int:
             carried = elsewhere["payload"]["files"][0]
             assert pathlib.Path(carried["path"]).read_bytes() == letters, carried
             assert carried["name"] == "note.txt", carried
+            assert letters.decode() in elsewhere["body"], elsewhere
             assert not list(inbox.iterdir()), list(inbox.iterdir())
             telegram.message("/to default")
             wait_for("the liaison as the default ship again", lambda: [
                 m for m in telegram.sent()
                 if "plain messages go to liaison again" in m["text"]])
+
+            # A synthetic update larger than the protocol line still arrives
+            # whole via the real file.put boundary, never over stdout as text.
+            huge = "漢🚢boundary\n" * 100000
+            telegram.message(huge)
+            spilled = wait_for("oversized text stored by the runtime", lambda: [
+                m for m in fleet.inbox("liaison", "liaison")
+                if "captain-input.txt" in m["body"] and (m.get("payload") or {}).get("files")])[0]
+            assert len(spilled["body"]) < 500, spilled
+            assert pathlib.Path(spilled["payload"]["files"][0]["path"]).read_text() == huge
 
             # A stow names its machine. The Mac is linked (before the door
             # starts, so its calls can reach it), and its hold is its own: this
@@ -1427,6 +1824,38 @@ def main() -> int:
                         and "edited" in e["payload"].get("why", "")) for e in revoked_rows), audited
             assert any(e["kind"] == "permissions.approval_edit"
                        and e["payload"].get("state") == "revoked" for e in audited), audited
+
+            # A control-containing edit must reach re-check and revoke the
+            # approval, not get rejected by runtime validation leaving it live.
+            control_step, control_card = approving_request("Build 59 passed CI.", "Submit build 59")
+            control_yes = telegram.message("yes", reply_to=control_card["_message_id"])
+            wait_for("the control-edit approval recorded", lambda: [
+                r for r in approvals_of(control_step["id"]) if r["state"] == "live"])
+            telegram.edit(control_yes, "yes\x1b", reply_to=control_card["_message_id"])
+            wait_for("the control edit revoked", lambda: [
+                r for r in approvals_of(control_step["id"]) if r["state"] == "revoked"])
+            wait_for("the truthful control withdrawal notice", lambda: [
+                m for m in telegram.sent() if "no longer approves" in m["text"]
+                and "Submit build 59" in m["text"]])
+
+            # Text attachments cannot supplement a caption into an approval;
+            # binary-reference diagnostics cannot negate a yes either.
+            for build, caption, contents, name, approves in (
+                    (60, "thanks", b"ok", "answer.txt", False),
+                    (61, "thanks", b"Submit build 61", "answer.md", False),
+                    (62, "yes", b"%PDF binary", "answer.pdf", True)):
+                file_step, file_card = approving_request(
+                    f"Build {build} passed CI.", f"Submit build {build}")
+                telegram.send_file(contents, name, caption=caption, reply_to=file_card["_message_id"])
+                file_reply = wait_for("the caption-only file answer", lambda: [
+                    m for m in fleet.inbox("ops", "ops") if m["kind"] == "reply"
+                    and m["correlation"] == file_step["id"]])[0]
+                assert file_reply["body"] == caption and file_reply["payload"]["files"], file_reply
+                if approves:
+                    wait_for("the PDF caption approval", lambda: [
+                        r for r in approvals_of(file_step["id"]) if r["state"] == "live"])
+                else:
+                    assert not approvals_of(file_step["id"]), approvals_of(file_step["id"])
 
             # An edit that still approves changes nothing; a struck-through
             # yes no longer does.

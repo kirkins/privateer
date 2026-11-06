@@ -227,4 +227,4 @@ def prompt_for(transcript: str) -> str:
     above, never an empty prompt (the agent would answer nothing and could loop)."""
     if is_empty(transcript):
         return EMPTY_SENTINEL
-    return f'"{transcript.strip()}"'
+    return f'"{transcript}"'
