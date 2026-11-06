@@ -94,6 +94,103 @@ fn codex_delivery_grant_and_revoke_are_the_captains_alone() {
     );
 }
 
+// Hosted delivery uses Linux process identity/pidfds; folder() refuses on
+// macOS before starting the adapter. Test that explicit status separately.
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_delivery_status_exposes_durable_pre_spawn_refusal_without_spending_or_resetting() {
+    let mut f = Fixture::new();
+    let granted = f
+        .operator(
+            "attended.codex.grant",
+            json!({"ship": "alpha", "session": SESSION}),
+        )
+        .unwrap();
+    let context = json!({"generation": "launch", "callback_generation": "callback",
+        "session": SESSION, "holder": "host:alpha"});
+    let mut launch = context.clone();
+    launch["home"] = json!(f.store.home());
+    launch["ship"] = json!("alpha");
+    fs::write(f.dir.join("launch.json"), launch.to_string()).unwrap();
+    let refusal = json!({
+        "diagnostic": "codex-loaded-thread-fence-refused-before-invocation",
+        "at_ms": 123, "context": context,
+        "facts": {"loaded_count": 2, "threads_in_cwd": 2, "bound_uuid_loaded": true,
+            "cursor_state": "null", "cwd_thread_is_bound": false},
+        "clears_when": "a later pre-spawn fence passes, or a trusted rebind / hosted relaunch"
+    });
+    let ledger = json!({"version": 1, "home": f.store.home(), "ship": "alpha", "sessions": {},
+        "runner": {"possibly_unattended_spent": 0, "declines": 0, "accepted_through": 0,
+            "retry_after_ms": 0, "human_paused": false, "pre_spawn_fence": refusal}});
+    let path = f.dir.join("receipts.json");
+    fs::write(&path, ledger.to_string()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let original = fs::read(&path).unwrap();
+    let report = f
+        .agent("attended.codex.status", json!({"ship": "alpha"}))
+        .unwrap();
+    assert_eq!(report["grant"], granted["grant"]);
+    assert_eq!(report["grant"]["spent"], 0);
+    assert_eq!(report["runner"]["paused"], true, "{report}");
+    assert_eq!(report["runner"]["pre_spawn_fence"], refusal);
+    assert_eq!(report["runner"]["diagnostic"], refusal["diagnostic"]);
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn codex_delivery_status_explicitly_reports_unsupported_host() {
+    let mut f = Fixture::new();
+    let report = f
+        .agent("attended.codex.status", json!({"ship": "alpha"}))
+        .unwrap();
+    assert_eq!(report["runner"]["unavailable"], true, "{report}");
+    assert_eq!(
+        report["runner"]["reason"],
+        "hosted Codex delivery is Linux-only"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_delivery_status_reports_missing_launch_and_failed_adapter() {
+    let mut f = Fixture::new();
+    fs::remove_file(f.dir.join("launch.json")).unwrap();
+    let report = f
+        .agent("attended.codex.status", json!({"ship": "alpha"}))
+        .unwrap();
+    assert_eq!(report["runner"]["unavailable"], true, "{report}");
+    assert_eq!(report["runner"]["reason"], "no local attended Codex launch");
+
+    // An invalid launch makes the real adapter refuse (or, if Python is
+    // absent, its spawn fails). Neither failure may silently drop runner.
+    fs::write(f.dir.join("launch.json"), b"not JSON").unwrap();
+    let report = f
+        .agent("attended.codex.status", json!({"ship": "alpha"}))
+        .unwrap();
+    assert_eq!(report["runner"]["unavailable"], true, "{report}");
+    assert!(!report["runner"]["reason"].as_str().unwrap().is_empty());
+}
+
+#[test]
+fn codex_delivery_status_reports_non_local_ship() {
+    let mut f = Fixture::new();
+    fs::write(f.store.home().join("config.json"), br#"{"ship":"beta"}"#).unwrap();
+    let report = f
+        .agent("attended.codex.status", json!({"ship": "alpha"}))
+        .unwrap();
+    assert_eq!(report["runner"]["unavailable"], true, "{report}");
+    let reason = report["runner"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(if cfg!(target_os = "linux") {
+            "ship folder"
+        } else {
+            "Linux-only"
+        }),
+        "{report}"
+    );
+}
+
 #[test]
 fn codex_delivery_grant_names_the_configured_session_and_a_bounded_budget() {
     let mut f = Fixture::new();

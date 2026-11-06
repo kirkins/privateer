@@ -10,6 +10,49 @@ ACT1 (Linux) makes a hosted Codex first mate resume the captain-set
 It does not implement scheduled work, qualify native autonomy or claim ATTACHED.
 The main attended-support table is unchanged until live qualification (PR C).
 
+**Pre-spawn loaded-thread refusal.** An idle `/new`, an unloaded bound UUID,
+ambiguous cwd/UUID ownership, an incomplete loaded-list page (missing or non-null
+`nextCursor`), or more than 32 loaded threads withholds delivery **before a grant
+reservation or invocation**. The local receipt ledger records
+`runner.pre_spawn_fence`, named
+`codex-loaded-thread-fence-refused-before-invocation`, with `at_ms`, launch/callback
+context, and bounded facts: `loaded_count`, `threads_in_cwd`, `bound_uuid_loaded`,
+`cursor_state` (`missing` / `null` / `non-null`), and `cwd_thread_is_bound`.
+Unknown facts are null; incomplete/oversize pages are never followed. No message
+bodies, cursor values or credentials are recorded. The last 16 state changes are
+kept in `runner.pre_spawn_fence_events`; unchanged five-second refusals do not
+add events or refresh the diagnostic's timestamp.
+
+From the ship folder's own home, `attended.codex.status` includes this local
+state under `runner` (and reports `runner.unavailable` if it cannot read the
+adapter state). Its `pre_spawn_fence.clears_when` explains recovery: a later
+passing pre-spawn fence, or a trusted rebind / hosted relaunch. Ticks recheck the
+fence even while this diagnostic pauses mail; status itself is read-only and
+never contacts Codex. A refusal leaves the offer prepared, never uncertain,
+and never redirects it to another UUID. This is **non-sticky** and separate
+from `codex-loaded-thread-fence-lost-after-invocation`: post-spawn custody loss
+remains sticky, even after a later passing fence, rebind, or relaunch. This change
+adds no sticky-pause reset and closes no native atomic-admission race.
+
+The full runtime status lookup (including its local diagnostic adapter child)
+now runs **before** the dispatch fence. `reserve()` takes only that prefetched
+grant snapshot on this path; the Rust reservation still authorizes the current
+grant and charges exactly once per nonce. Stale snapshots cannot authorize an
+uncharged spawn. A failed refresh of an existing refusal (unreachable daemon or
+malformed response) retains it and still publishes observation/receipt progress.
+
+**Remaining non-atomic window:** after the loaded-list snapshot there are the
+bounded `thread/read` calls, queue check, lifecycle scan/ledger writes, the Rust
+reservation RPC (unless already pinned), presence RPC, lock acquisition, receipt
+scan, durable invoking write and local custody checks before `Popen`. There is no
+second loaded-thread RPC after charging: a refusal there could not honestly be
+called unreserved, because Rust never refunds a turn. An idle `/new` in this
+remaining window can still be detected only after spawn and become the existing
+sticky `codex-loaded-thread-fence-lost-after-invocation` pause. The full status
+child is no longer in that window; an idle `/new` during that lookup is caught
+before reservation. This reduces the reviewed regression without claiming an
+atomic Codex watched-thread admission fence or adding a sticky reset.
+
 ACT2 adds captain-only controls, each run from the ship folder's own home:
 `attended.codex.reconcile` and `attended.codex.resolve` (audited `abandon` or
 `mark_presented` with a reason) for one uncertain offer, and

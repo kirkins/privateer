@@ -92,7 +92,7 @@ pub(crate) fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<
     match command {
         "attended.codex.grant" => grant(store, &args),
         "attended.codex.revoke" => revoke(store, &args),
-        "attended.codex.status" => status(store.connection(), ship(&args)?),
+        "attended.codex.status" => delivery_status(store, ship(&args)?),
         "attended.codex.reserve" => reserve(store, &args),
         "attended.codex.reconcile" | "attended.codex.resolve" => settle(store, command, &args),
         "attended.codex.session" => session(store, &args),
@@ -116,6 +116,25 @@ fn folder(store: &Store, ship: &str) -> Result<PathBuf> {
         .parent()
         .context("ship folder")?
         .canonicalize()?)
+}
+
+/// The grant is runtime-owned; diagnostics are the adapter's local ledger.
+/// Keep fleet/non-hosted status usable without requiring a local launch.
+fn delivery_status(store: &Store, ship: &str) -> Result<Value> {
+    let mut result = status(store.connection(), ship)?;
+    // In particular, folder() refuses on macOS before Python is even started.
+    // An unsupported host, missing launch or failed child must be visible too.
+    let report = (|| -> Result<Value> {
+        let folder = folder(store, ship)?;
+        let launch = folder.join(".codex/privateer-attended/launch.json");
+        ensure!(launch.exists(), "no local attended Codex launch");
+        adapter(&folder, ["codex_runner.py", "status"], &launch, &json!({}))
+    })();
+    result["runner"] = match report {
+        Ok(report) => report,
+        Err(error) => json!({"unavailable": true, "reason": format!("{error:#}")}),
+    };
+    Ok(result)
 }
 
 const CONTROL_OUTPUT: u64 = 1 << 16;

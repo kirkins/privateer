@@ -215,7 +215,19 @@ class RunnerTests(unittest.TestCase):
         self.assert_not_invoked()
         self.assertEqual(self.registry.read_bytes(), original)
         self.assertEqual(poison_path.read_bytes(), poison)
-        self.assertEqual(self.runner.ledger.read(), ledger)
+        refused = self.runner.ledger.read()
+        self.assertEqual(refused["sessions"], ledger["sessions"])
+        self.assertEqual(refused["runner"]["possibly_unattended_spent"], 0)
+        refusal = refused["runner"]["pre_spawn_fence"]
+        self.assertEqual(refusal["diagnostic"], runner.PRE_SPAWN_FENCE_REFUSED)
+        self.assertEqual(refusal["facts"], {"loaded_count": 2, "threads_in_cwd": 2,
+            "bound_uuid_loaded": True, "cursor_state": "null", "cwd_thread_is_bound": False})
+        self.assertIsInstance(refusal["at_ms"], int)
+        self.assertEqual(refused["runner"]["sticky"], [])
+        result = runner.Runner(self.registry).observe()
+        self.assertTrue(result["paused"])
+        self.assertEqual(result["diagnostic"], runner.PRE_SPAWN_FENCE_REFUSED)
+        self.assertEqual(result["pre_spawn_fence"], refusal)
 
         # The first turn in the new UUID emits the trusted SessionStart. It
         # must revoke old custody, never silently rebind or transfer the offer.
@@ -268,7 +280,15 @@ class RunnerTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "thread not loaded"):
                         self.runner.dispatch()
                     spawn.assert_not_called()
-                self.assertEqual(self.runner.ledger.read(), ledger)
+                refused = self.runner.ledger.read()
+                self.assertEqual(refused["sessions"], ledger["sessions"])
+                self.assertEqual(refused["runner"]["possibly_unattended_spent"], 0)
+                facts = refused["runner"]["pre_spawn_fence"]["facts"]
+                self.assertEqual(facts["loaded_count"], len(reply["data"]))
+                self.assertIsNone(facts["threads_in_cwd"])  # Incomplete/oversize page: not guessed.
+                self.assertTrue(facts["bound_uuid_loaded"])
+                self.assertEqual(facts["cursor_state"], "missing" if "nextCursor" not in reply else (
+                    "null" if reply["nextCursor"] is None else "non-null"))
                 self.assert_not_invoked()
 
     def test_new_between_first_fence_and_spawn_sticks_across_recovery(self):
@@ -488,12 +508,15 @@ class RunnerTests(unittest.TestCase):
         # captain-grant reservation for this exact offer is.
         self.runner.ledger.reconcile(self.session, self.nonce, {"data": [], "nextCursor": None}, 1)
         self.prepare(1, reserve=False)
+        grant = self.grant
+        self.grant = None
         with self.assertRaisesRegex(ValueError, "not granted"):
             self.runner.dispatch()
         self.assert_not_invoked()
         with self.assertRaisesRegex(ValueError, "not granted"):
             self.runner._spawn(self.record, self.custody, self.daemon_class(None))
         self.assert_not_invoked()
+        self.grant = grant
         self.runner.reserve(self.record)
         self.record["binding"].pop("fence_version")
         binding.atomic(self.registry, self.record)
@@ -599,8 +622,8 @@ class RunnerTests(unittest.TestCase):
             self.runner = runner.Runner(self.registry)
         with self.assertRaisesRegex(ValueError, "refused"):
             self.prepare(3)
-        with self.assertRaisesRegex(ValueError, "not granted"):
-            self.runner.dispatch()
+        with self.assertRaisesRegex(ValueError, "refused"):
+            self.runner.dispatch()  # Reservation is retried only after the passing pre-spawn fence.
         self.assertEqual(self.runner.report(self.session)["diagnostic"], "codex-turn-budget-exhausted")
         self.assertTrue(self.runner.report(self.session)["paused"])
         self.assert_grant_floor_holds_against_a_reset_runtime()
@@ -1177,6 +1200,268 @@ class RunnerTests(unittest.TestCase):
 
     def commands(self, name):
         return [args for command, args in self.calls if command == name]
+
+    def test_tick_pre_spawn_refusal_is_durable_deduplicated_and_clears_without_spending(self):
+        self.settle_setup_offer()
+        self.mail(2)
+        other = str(uuid.uuid4())
+        self.loaded_sessions.append(other)
+        self.other_threads[other] = {"id": other, "cwd": self.record["cwd"]}
+        spent = self.grant["spent"]
+        self.calls.clear()
+        with patch.object(runner.subprocess, "Popen") as spawn:
+            self.assertEqual(runner.tick(self.registry), {"tick": "held"})
+            value = self.runner.ledger.read()
+            refusal = value["runner"]["pre_spawn_fence"]
+            self.assertEqual(value["sessions"][self.session]["intent"]["state"], "prepared")
+            self.assertNotIn("reservation", value["sessions"][self.session]["intent"])
+            self.assertEqual(value["runner"]["possibly_unattended_spent"], 0)
+            for _ in range(3):
+                self.assertEqual(runner.tick(self.registry), {"tick": "held"})
+            spawn.assert_not_called()
+        self.assertEqual(self.grant["spent"], spent)
+        self.assertEqual(self.commands("attended.codex.reserve"), [])
+        a = self.runner.ledger.read()["runner"]
+        self.assertEqual(a["pre_spawn_fence"], refusal)
+        self.assertEqual(a["pre_spawn_fence_events"], [refusal])
+        self.assertEqual(load(self.registry), self.record)
+        delivery = [a for a in self.commands("wake.hosted") if a["trigger"] == "delivery"][-1]
+        self.assertTrue(delivery["paused"])
+
+        # A later passing snapshot clears even without actionable mail; no
+        # operator, reservation, replay or UUID change is needed for recovery.
+        self.loaded_sessions = [self.session]
+        self.runner.refresh_pre_spawn_fence(self.record)
+        self.assertNotIn("pre_spawn_fence", self.runner.ledger.read()["runner"])
+        self.assertEqual(len(self.runner.ledger.read()["runner"]["pre_spawn_fence_events"]), 2)
+        self.assertIsNone(self.runner.report(self.session)["diagnostic"])
+        self.assertEqual(self.grant["spent"], spent)
+        self.assertEqual(runner.tick(self.registry), {"tick": "invoked"})
+        self.assertEqual(self.grant["spent"], spent + 1)
+        invoked = json.loads((self.root / "invoked.json").read_text())["argv"]
+        self.assertEqual(invoked[invoked.index("--thread") + 1], self.session)
+
+    def test_tick_rechecks_a_refusal_before_pause_gate_and_resumes(self):
+        self.settle_setup_offer()
+        self.mail(2)
+        self.loaded_sessions = []
+        spent = self.grant["spent"]
+        self.assertEqual(runner.tick(self.registry), {"tick": "held"})
+        refusal = self.runner.ledger.read()["runner"]["pre_spawn_fence"]
+        self.assertFalse(refusal["facts"]["bound_uuid_loaded"])
+        self.assertEqual(self.grant["spent"], spent)
+        self.loaded_sessions = [self.session]
+        self.assertEqual(runner.tick(self.registry), {"tick": "invoked"})
+        self.assertNotIn("pre_spawn_fence", self.runner.ledger.read()["runner"])
+        self.assertEqual(self.grant["spent"], spent + 1)
+
+    def test_tick_refresh_failure_keeps_refusal_and_publishes_receipts(self):
+        self.loaded_sessions = []
+        with self.assertRaises(runner.LoadedThreadRefused):
+            self.runner.dispatch()
+        refusal = self.runner.ledger.read()["runner"]["pre_spawn_fence"]
+        self.loaded_sessions = [self.session]
+        self.promoted()
+        original_call = self.daemon_class.call
+        for failure in ("unreachable", "missing thread", "null thread", "list thread"):
+            with self.subTest(failure=failure):
+                self.mutate(lambda v: v["sessions"][self.session]["intent"].pop("wake_reported", None))
+                self.calls.clear()
+                enters = 0
+                reads = 0
+                def enter(daemon):
+                    nonlocal enters
+                    enters += 1
+                    if enters == 2 and failure == "unreachable":
+                        raise ConnectionError("fixture daemon unreachable")
+                    return daemon
+                def call(daemon, method, params):
+                    nonlocal reads
+                    if method == "thread/read":
+                        reads += 1
+                        if reads == 2:
+                            return {"missing thread": {}, "null thread": {"thread": None},
+                                    "list thread": {"thread": []}}[failure]
+                    return original_call(daemon, method, params)
+                with patch.object(self.daemon_class, "__enter__", new=enter), \
+                        patch.object(self.daemon_class, "call", new=call), \
+                        patch.object(runner.subprocess, "Popen") as spawn:
+                    self.assertEqual(runner.tick(self.registry), {"tick": "held"})
+                    spawn.assert_not_called()
+                a = self.runner.ledger.read()["runner"]
+                self.assertEqual(a["pre_spawn_fence"], refusal)
+                self.assertEqual(a["pre_spawn_fence_events"], [refusal])
+                self.assertEqual(a["sticky"], [])
+                wakes = self.commands("wake.hosted")
+                self.assertEqual([w["trigger"] for w in wakes], ["mail", "delivery"])
+                self.assertTrue(wakes[-1]["paused"])
+                self.assertEqual(wakes[-1]["accepted_through"], 1)
+
+    def test_status_lookup_precedes_fence_and_refusal_spends_nothing(self):
+        self.settle_setup_offer()
+        self.prepare(1, reserve=False)
+        self.calls.clear()
+        spent = self.grant["spent"]
+        other = str(uuid.uuid4())
+        original = runner.control
+        def control(record, command, args):
+            result = original(record, command, args)
+            if command == "attended.codex.status":
+                # This full adapter lookup used to be AFTER the last fence.
+                self.loaded_sessions.append(other)
+                self.other_threads[other] = {"id": other, "cwd": self.record["cwd"]}
+            return result
+        with patch.object(runner, "control", side_effect=control), \
+                patch.object(runner.subprocess, "Popen") as spawn:
+            with self.assertRaises(runner.LoadedThreadRefused):
+                self.runner.dispatch()
+            spawn.assert_not_called()
+        value = self.runner.ledger.read()
+        self.assertNotIn("reservation", value["sessions"][self.session]["intent"])
+        self.assertEqual(value["runner"]["possibly_unattended_spent"], 0)
+        self.assertEqual(value["runner"]["sticky"], [])
+        self.assertEqual(self.grant["spent"], spent)
+        self.assertEqual(self.commands("attended.codex.reserve"), [])
+        self.assertEqual(len(self.commands("attended.codex.status")), 1)
+        self.assertEqual(runner.status_control(self.registry)["diagnostic"], runner.PRE_SPAWN_FENCE_REFUSED)
+
+    def test_reserve_uses_prefetched_grant_but_rust_still_authorizes_nonce(self):
+        self.settle_setup_offer()
+        self.prepare(1, reserve=False)
+        original_call = self.daemon_class.call
+        original_control = runner.control
+        fenced = False
+        def call(daemon, method, params):
+            nonlocal fenced
+            if method == "thread/loaded/list":
+                fenced = True
+            return original_call(daemon, method, params)
+        def control(record, command, args):
+            if command == "attended.codex.status":
+                self.assertFalse(fenced, "full status child between native fence and spawn")
+                result = original_control(record, command, args)
+                self.grant = {**self.grant, "grant_id": str(uuid.uuid4())}
+                return result  # Stale snapshots are not authority to spawn.
+            return original_control(record, command, args)
+        with patch.object(self.daemon_class, "call", new=call), \
+                patch.object(runner, "control", side_effect=control), \
+                patch.object(runner.subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(ValueError, "refused"):
+                self.runner.dispatch()
+            spawn.assert_not_called()
+        self.assertNotIn("reservation", self.runner.ledger.read()["sessions"][self.session]["intent"])
+
+    def test_malformed_pre_spawn_diagnostic_is_absent_and_does_not_crash_tick(self):
+        self.loaded_sessions = []
+        with self.assertRaises(runner.LoadedThreadRefused):
+            self.runner.dispatch()
+        valid = self.runner.ledger.read()["runner"]["pre_spawn_fence"]
+        self.loaded_sessions = [self.session]
+        self.settle_setup_offer()
+        malformed = [[], "bad", 1, {}, {**valid, "context": []},
+                     {**valid, "context": {"untrusted": "key"}},
+                     {**valid, "facts": None}, {**valid, "facts": {}},
+                     {**valid, "at_ms": "yesterday"}, {**valid, "diagnostic": "unknown"}]
+        for entry in malformed:
+            with self.subTest(entry=entry):
+                self.mutate(lambda v: v["runner"].update(pre_spawn_fence=entry))
+                self.assertIsNone(runner.status_control(self.registry)["pre_spawn_fence"])
+                self.assertFalse(self.runner.refresh_pre_spawn_fence(self.record))
+                self.assertEqual(runner.tick(self.registry), {"tick": "idle"})
+        self.assert_not_invoked()
+
+    def test_malformed_pre_spawn_events_do_not_block_refusal_or_recovery(self):
+        self.settle_setup_offer()
+        self.prepare(after=1, reserve=False)
+        spent = self.grant["spent"]
+        self.loaded_sessions = []
+        with self.assertRaises(runner.LoadedThreadRefused):
+            self.runner.dispatch()
+        refusal = self.runner.ledger.read()["runner"]["pre_spawn_fence"]
+        cleared = {"diagnostic": runner.PRE_SPAWN_FENCE_REFUSED, "state": "cleared", "at_ms": 1}
+        malformed = [None, {}, "bad", 1, [None], ["bad"], [{}],
+                     [{**refusal, "context": []}], [{**refusal, "at_ms": True}],
+                     [{**cleared, "state": "unknown"}], [{**cleared, "at_ms": -1}],
+                     [cleared, {**cleared, "unexpected": "field"}]]
+        for entry in malformed:
+            with self.subTest(entry=entry):
+                self.mutate(lambda v: v["runner"].update(pre_spawn_fence_events=entry))
+                a = runner.accounting(self.runner.ledger.read())
+                self.assertEqual(a["pre_spawn_fence_events"], [])
+                self.assertEqual(a["pre_spawn_fence"], refusal)
+                self.loaded_sessions = [self.session]
+                self.runner.refresh_pre_spawn_fence(self.record)
+                a = self.runner.ledger.read()["runner"]
+                self.assertNotIn("pre_spawn_fence", a)
+                self.assertEqual([e["state"] for e in a["pre_spawn_fence_events"]], ["cleared"])
+                self.loaded_sessions = []
+                with self.assertRaises(runner.LoadedThreadRefused):
+                    self.runner.dispatch()
+                a = runner.accounting(self.runner.ledger.read())
+                refusal = a["pre_spawn_fence"]
+                self.assertEqual(a["pre_spawn_fence_events"][1], refusal)
+                self.assertEqual(a["possibly_unattended_spent"], 0)
+                self.assertEqual(self.grant["spent"], spent)
+                self.assertNotIn("reservation", self.runner.ledger.read()["sessions"][self.session]["intent"])
+        self.assert_not_invoked()
+
+    def test_sticky_pause_never_advertises_transient_recovery(self):
+        self.loaded_sessions = []
+        with self.assertRaises(runner.LoadedThreadRefused):
+            self.runner.dispatch()
+        for sticky in runner.STICKY:
+            with self.subTest(sticky=sticky):
+                self.mutate(lambda v: v["runner"].update(sticky=[sticky]))
+                for report in (self.runner.report(self.session), runner.status_control(self.registry)):
+                    self.assertEqual(report["diagnostics"], [sticky])
+                    self.assertNotEqual(report["pause_reason"], runner.FENCE_CLEARS_WHEN)
+                    self.assertTrue(report["paused"])
+        self.assert_not_invoked()
+
+    def test_pre_spawn_events_log_changes_only_and_are_bounded(self):
+        self.loaded_sessions = []
+        for count in range(20):
+            refusal = runner.LoadedThreadRefused("not loaded", {"loaded_count": count,
+                "threads_in_cwd": None, "bound_uuid_loaded": False, "cursor_state": "null",
+                "cwd_thread_is_bound": None})
+            self.runner._record_pre_spawn_fence(self.record, refusal)
+            self.runner._record_pre_spawn_fence(self.record, refusal)
+        events = self.runner.ledger.read()["runner"]["pre_spawn_fence_events"]
+        self.assertEqual([e["facts"]["loaded_count"] for e in events], list(range(4, 20)))
+
+    def test_pre_spawn_clear_never_resets_sticky_and_rebind_clears_only_transient(self):
+        self.loaded_sessions = []
+        with self.assertRaises(runner.LoadedThreadRefused):
+            self.runner.dispatch()
+        self.mutate(lambda v: runner.accounting(v)["sticky"].append(runner.THREAD_FENCE_LOST))
+        self.record["callback_generation"] = str(uuid.uuid4())
+        binding.atomic(self.registry, self.record)
+        self.runner.refresh_pre_spawn_fence(self.record)
+        a = self.runner.ledger.read()["runner"]
+        self.assertNotIn("pre_spawn_fence", a)
+        self.assertEqual(a["sticky"], [runner.THREAD_FENCE_LOST])
+        self.loaded_sessions = [self.session]
+        with self.assertRaisesRegex(ValueError, "runner paused"):
+            self.runner.dispatch()
+        self.assertEqual(self.runner.report(self.session)["diagnostic"], runner.THREAD_FENCE_LOST)
+        self.assert_not_invoked()
+
+    def test_pre_spawn_status_is_local_read_only_and_survives_real_interpreter_restart(self):
+        self.loaded_sessions = []
+        with self.assertRaises(runner.LoadedThreadRefused):
+            self.runner.dispatch()
+        original = self.runner.ledger.path.read_bytes()
+        result = subprocess.run([sys.executable, "-I", "-B", str(Path(runner.__file__)),
+            "status", str(self.registry)], input="{}", capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["paused"])
+        self.assertEqual(report["diagnostic"], runner.PRE_SPAWN_FENCE_REFUSED)
+        self.assertEqual(report["pre_spawn_fence"]["clears_when"], runner.FENCE_CLEARS_WHEN)
+        self.assertEqual(report["pre_spawn_fence"]["facts"]["cursor_state"], "null")
+        self.assertNotIn(self.body, result.stdout)
+        self.assertNotIn(self.custody["token"], result.stdout)
+        self.assertEqual(self.runner.ledger.path.read_bytes(), original)
 
     def test_tick_offers_once_reports_receipt_as_mail_wake_and_settles(self):
         self.settle_setup_offer()

@@ -28,6 +28,8 @@ from codex_receipts import (FINAL, MAX_LEDGER, MAX_SESSIONS, Ledger, anchor, che
 from codex_socket import Daemon, LIMIT, load, process_identity, safe
 
 K = 3
+PRE_SPAWN_FENCE_REFUSED = "codex-loaded-thread-fence-refused-before-invocation"
+FENCE_CLEARS_WHEN = "a later pre-spawn fence passes, or a trusted rebind / hosted relaunch"
 THREAD_FENCE_LOST = "codex-loaded-thread-fence-lost-after-invocation"
 STICKY = ("codex-custody-lost-after-invocation", "codex-queue-cleanup-unproven", THREAD_FENCE_LOST)
 
@@ -120,21 +122,39 @@ def daemon_check(daemon, record, custody):
     require((info.st_dev, info.st_ino) == (native["device"], native["inode"]), "daemon socket replaced")
 
 
+class LoadedThreadRefused(ValueError):
+    def __init__(self, reason, facts):
+        super().__init__(reason)
+        self.facts = copy.deepcopy(facts)
+
+
 def loaded_thread(daemon, record):
     """Single-thread-in-cwd custody, not an atomic native admission fence."""
     session = record["session"]
     loaded = daemon.call("thread/loaded/list", {"limit": 32})
-    require("nextCursor" in loaded and loaded["nextCursor"] is None
-            and isinstance(loaded.get("data"), list)
-            and len(loaded["data"]) <= 32 and session in loaded["data"], "thread not loaded")
+    require(isinstance(loaded, dict), "invalid loaded-thread response")
+    data = loaded.get("data")
+    facts = {"loaded_count": len(data) if isinstance(data, list) else None,
+             "threads_in_cwd": None, "bound_uuid_loaded": session in data if isinstance(data, list) else None,
+             "cursor_state": "missing" if "nextCursor" not in loaded else (
+                 "null" if loaded["nextCursor"] is None else "non-null"),
+             "cwd_thread_is_bound": None}
+    def fence(condition, reason):
+        if not condition:
+            raise LoadedThreadRefused(reason, facts)
+    fence(facts["cursor_state"] == "null" and isinstance(data, list)
+          and len(data) <= 32 and session in data, "thread not loaded")
     # Idle /new has no SessionStart callback yet: the old UUID can remain
     # loaded while the attended pane watches another thread. Only a trusted
     # callback may rebind; never redirect the offer to a different UUID.
     threads = [daemon.call("thread/read", {"threadId": identity})["thread"]
                for identity in loaded["data"]]
+    require(all(isinstance(thread, dict) for thread in threads), "invalid thread/read response")
     matches = [thread for thread in threads if thread.get("cwd") == record["cwd"]]
-    require(len(matches) == 1, "concurrent Codex threads in this cwd are ambiguous")
-    require(matches[0].get("id") == session, "loaded thread for this cwd is not the bound UUID")
+    facts["threads_in_cwd"] = len(matches)
+    facts["cwd_thread_is_bound"] = len(matches) == 1 and matches[0].get("id") == session
+    fence(len(matches) == 1, "concurrent Codex threads in this cwd are ambiguous")
+    fence(matches[0].get("id") == session, "loaded thread for this cwd is not the bound UUID")
     return matches[0]
 
 
@@ -238,6 +258,25 @@ def presence_check(presence, record):
             "hosted presence changed or expired")
 
 
+def valid_pre_spawn_fence(refusal):
+    context = refusal.get("context") if isinstance(refusal, dict) else None
+    facts = refusal.get("facts") if isinstance(refusal, dict) else None
+    return (isinstance(context, dict)
+            and set(context) == {"generation", "callback_generation", "session", "holder"}
+            and all(isinstance(v, str) and v for v in context.values())
+            and isinstance(facts, dict)
+            and set(facts) == {"loaded_count", "threads_in_cwd", "bound_uuid_loaded",
+                               "cursor_state", "cwd_thread_is_bound"}
+            and all(facts[k] is None or type(facts[k]) is int and facts[k] >= 0
+                    for k in ("loaded_count", "threads_in_cwd"))
+            and all(facts[k] is None or type(facts[k]) is bool
+                    for k in ("bound_uuid_loaded", "cwd_thread_is_bound"))
+            and facts["cursor_state"] in ("missing", "null", "non-null")
+            and refusal.get("diagnostic") == PRE_SPAWN_FENCE_REFUSED
+            and refusal.get("clears_when") == FENCE_CLEARS_WHEN
+            and type(refusal.get("at_ms")) is int and refusal["at_ms"] >= 0)
+
+
 def accounting(value):
     result = value.setdefault("runner", {"possibly_unattended_spent": 0, "declines": 0,
                                          "accepted_through": 0, "retry_after_ms": 0,
@@ -261,15 +300,31 @@ def accounting(value):
         name = result.pop("diagnostic")
         if name not in sticky:
             sticky.append(name)
+    refusal = result.get("pre_spawn_fence")
+    if refusal is not None:
+        # A corrupt optional diagnostic is absent, not an exception that kills
+        # every tick/status. It never authorizes a spawn: dispatch fences anew.
+        if not valid_pre_spawn_fence(refusal):
+            result.pop("pre_spawn_fence", None)
+    events = result.setdefault("pre_spawn_fence_events", [])
+    if not (isinstance(events, list) and all(
+            valid_pre_spawn_fence(event) or (
+                isinstance(event, dict) and set(event) == {"diagnostic", "state", "at_ms"}
+                and event["diagnostic"] == PRE_SPAWN_FENCE_REFUSED and event["state"] == "cleared"
+                and type(event["at_ms"]) is int and event["at_ms"] >= 0)
+            for event in events)):
+        # Optional history cannot break recording the next refusal/recovery.
+        result["pre_spawn_fence_events"] = []
     return result
 
 
 def diagnostic(a):
-    return a["sticky"][0] if a["sticky"] else a.get("diagnostic")
+    return a["sticky"][0] if a["sticky"] else (
+        PRE_SPAWN_FENCE_REFUSED if a.get("pre_spawn_fence") else a.get("diagnostic"))
 
 
 def diagnostics_pause(a):
-    return bool(a["sticky"]) or "diagnostic" in a
+    return bool(a["sticky"]) or "diagnostic" in a or bool(a.get("pre_spawn_fence"))
 
 
 def reserved(intent, record):
@@ -346,20 +401,24 @@ class Runner:
             return value["sessions"][session]
         return self.ledger.transaction(change)
 
-    def reserve(self, record):
+    def reserve(self, record, *, grant=None):
         """Spend one grant turn for the prepared offer, before any flock.
 
         The Rust reservation is idempotent per nonce: a lost response retried
         next tick never spends twice. It is pinned in the intent and re-read
         under the lock; a revoke poisons custody, which the final fence reads.
+        Dispatch supplies a grant-only snapshot fetched BEFORE its native fence,
+        avoiding a full status adapter child in the fence-to-spawn window. The
+        snapshot is not authority: Rust still validates the grant and nonce.
         """
         session = exact_uuid(record["session"])
         intent = self.ledger.read()["sessions"][session]["intent"]
         if intent.get("reservation"):
             return reserved(intent, record)
         require(intent["state"] == "prepared", "only a prepared offer reserves a turn")
-        status = control(record, "attended.codex.status", {"ship": record["ship"]})
-        grant = status.get("grant") if isinstance(status, dict) else None
+        if grant is None:
+            status = control(record, "attended.codex.status", {"ship": record["ship"]})
+            grant = status.get("grant") if isinstance(status, dict) else None
         require(isinstance(grant, dict) and grant.get("session") == session, "Codex delivery not granted")
         try:
             result = control(record, "attended.codex.reserve", {
@@ -471,7 +530,10 @@ class Runner:
                     "diagnostic": ("codex-uncertain-" + intent["nonce"]) if uncertain else (
                         diagnostic(a) or ("codex-turn-budget-exhausted" if "budget_exhausted" in a else None)),
                     "diagnostics": list(a["sticky"]),
-                    "pause_reason": a.get("thread_fence_reason") or intent.get("pause_reason")}
+                    "pre_spawn_fence": copy.deepcopy(a.get("pre_spawn_fence")),
+                    "pause_reason": a.get("thread_fence_reason") or (
+                        FENCE_CLEARS_WHEN if a.get("pre_spawn_fence") and not a["sticky"]
+                        else intent.get("pause_reason"))}
 
     def observe(self, acknowledged_through=0):
         """Read-only native evidence; no queue mutation and no enable path."""
@@ -492,7 +554,7 @@ class Runner:
         try:
             with Daemon(record["codex_home"]) as daemon:
                 thread = daemon.call("thread/read", {"threadId": session})["thread"]
-                require(thread.get("id") == session and thread.get("cwd") == record["cwd"]
+                require(isinstance(thread, dict) and thread.get("id") == session and thread.get("cwd") == record["cwd"]
                         and isinstance(thread.get("status"), dict), "observer thread/status mismatch")
                 queue = daemon.call("thread/queue/list", {"threadId": session, "limit": 128})
                 value = self.ledger.read()
@@ -538,6 +600,53 @@ class Runner:
             progress(value)
             save(self.ledger, value)
 
+    def _record_pre_spawn_fence(self, record, refusal=None):
+        # Observations/RPCs precede flock. Never attach an old snapshot to a
+        # replacement binding, and never modify the post-invocation sticky set.
+        with locked(self.registry.parent):
+            require(load(self.registry) == record, "binding changed during loaded-thread fence")
+            value = self.ledger.read()
+            a = accounting(value)
+            previous = a.get("pre_spawn_fence")
+            context = {key: record[key] for key in ("generation", "callback_generation", "session", "holder")}
+            current = ({"diagnostic": PRE_SPAWN_FENCE_REFUSED, "facts": refusal.facts,
+                        "context": context, "clears_when": FENCE_CLEARS_WHEN} if refusal else None)
+            if (previous and {k: v for k, v in previous.items() if k != "at_ms"} == current
+                    or previous is None and current is None):
+                return  # One bounded ledger event per state change, not per tick.
+            at_ms = time.time_ns() // 1_000_000
+            if current:
+                current["at_ms"] = at_ms
+                a["pre_spawn_fence"] = current
+            else:
+                a.pop("pre_spawn_fence", None)
+            events = a.setdefault("pre_spawn_fence_events", [])
+            events.append(copy.deepcopy(current) if current else {
+                "diagnostic": PRE_SPAWN_FENCE_REFUSED, "state": "cleared", "at_ms": at_ms})
+            del events[:-16]
+            save(self.ledger, value)
+
+    def pre_spawn_thread(self, daemon, record):
+        try:
+            thread = loaded_thread(daemon, record)
+        except LoadedThreadRefused as refusal:
+            self._record_pre_spawn_fence(record, refusal)
+            raise
+        self._record_pre_spawn_fence(record)
+        return thread
+
+    def refresh_pre_spawn_fence(self, record):
+        a = accounting(self.ledger.read())
+        previous = a.get("pre_spawn_fence")
+        if not previous:
+            return False
+        if previous["context"] != {key: record[key] for key in previous["context"]}:
+            self._record_pre_spawn_fence(record)  # Trusted rebind/relaunch, not a sticky reset.
+            return True
+        with Daemon(record["codex_home"]) as daemon:
+            self.pre_spawn_thread(daemon, record)
+        return True
+
     def dispatch(self):
         """One dormant invocation. Production records always fail enabled check.
 
@@ -546,11 +655,16 @@ class Runner:
         """
         record = load(self.registry)
         session = exact_uuid(record["session"])
-        reserved(self.ledger.read()["sessions"].get(session, {}).get("intent", {}), record)
         custody = load(self.registry.with_name("custody.json"))
+        grant = {}  # Missing/invalid grant fails closed in reserve(), without another status RPC.
+        intent = self.ledger.read()["sessions"][session]["intent"]
+        if not intent.get("reservation"):
+            status = control(record, "attended.codex.status", {"ship": record["ship"]})
+            if isinstance(status, dict) and isinstance(status.get("grant"), dict):
+                grant = status["grant"]
         with Daemon(record["codex_home"]) as daemon:
             # RPCs outside flock. Native queue serializes an idle->busy race.
-            thread = loaded_thread(daemon, record)
+            thread = self.pre_spawn_thread(daemon, record)
             require(thread.get("cwd") == record["cwd"]
                     and thread.get("historyMode") == "legacy" and not thread.get("ephemeral")
                     and thread.get("status") == {"type": "idle"}, "native thread not qualified idle")
@@ -558,6 +672,7 @@ class Runner:
             require(queue.get("data") == [] and queue.get("nextCursor") is None,
                     "pending or unsupported native queue")
             self._observe_lifecycle(record, thread["status"])
+            self.reserve(record, grant=grant)  # A refused fence never spends a reservation.
             return self._spawn(record, custody, daemon)
 
     def _spawn(self, record, custody, daemon):
@@ -716,6 +831,17 @@ def tick(path):
     pending = codex_mail.snapshot(control(record, "mail.pending", {"address": record["ship"], "after_seq": seen}),
                                   record["ship"])
     result = runner.observe(acknowledged_through=pending["acknowledged_through"])
+    try:
+        if runner.refresh_pre_spawn_fence(record):
+            result = runner.report(session, record)
+    except LoadedThreadRefused:
+        runner.publish(record, runner.report(session, record))
+        return {"tick": "held"}
+    except (OSError, ValueError, KeyError, TypeError):
+        # Failed refresh is not a passing fence. Keep the refusal, but publish
+        # observation/receipt progress rather than losing all reports this tick.
+        runner.publish(record, result)
+        return {"tick": "held"}
     runner.publish(record, result)
     value = runner.ledger.read()
     intent = value["sessions"][session].get("intent")
@@ -735,8 +861,12 @@ def tick(path):
         return {"tick": "outstanding"}
     elif result["paused"] or result["busy"] or not result["report_eligible"]:
         return {"tick": "held"}  # A prepared offer waits; nothing is spent.
-    runner.reserve(record)
-    runner.publish(record, runner.dispatch())
+    try:
+        result = runner.dispatch()
+    except LoadedThreadRefused:
+        runner.publish(record, runner.report(session, record))
+        return {"tick": "held"}
+    runner.publish(record, result)
     return {"tick": "invoked"}
 
 
@@ -835,6 +965,29 @@ def resolve_control(path, request):
             "warning": LATE}
 
 
+def status_control(path):
+    """Local durable diagnostics only: no daemon, presence, reservation or reset."""
+    runner = Runner(path)
+    with locked(runner.registry.parent):
+        record = load(runner.registry)
+        value = runner.ledger.read()
+        a = accounting(value)
+        refusal = a.get("pre_spawn_fence")
+        if refusal and refusal["context"] != {key: record.get(key) for key in refusal["context"]}:
+            a.pop("pre_spawn_fence")  # Read-only view of a superseded diagnostic.
+        state = value["sessions"].get(record.get("session"), {})
+        intent = state.get("intent", {})
+        uncertain = intent.get("state") in ("invoking", "uncertain")
+        return {"diagnostic": ("codex-uncertain-" + intent["nonce"]) if uncertain else (
+                    diagnostic(a) or ("codex-turn-budget-exhausted" if "budget_exhausted" in a else None)),
+                "paused": uncertain or state.get("native_stop", False) or a["human_paused"]
+                          or a["declines"] >= K or diagnostics_pause(a) or "budget_exhausted" in a,
+                "diagnostics": list(a["sticky"]), "pre_spawn_fence": a.get("pre_spawn_fence"),
+                "pause_reason": a.get("thread_fence_reason") or (
+                    FENCE_CLEARS_WHEN if a.get("pre_spawn_fence") and not a["sticky"]
+                    else intent.get("pause_reason"))}
+
+
 def main(argv):
     if len(argv) == 3 and argv[1] == "tick":
         try:
@@ -842,18 +995,22 @@ def main(argv):
         except Exception:  # Bounded pass: diagnostics live in the ledger, not the pane.
             return 1
         return 0
-    if len(argv) == 3 and argv[1] in ("reconcile", "resolve"):
+    if len(argv) == 3 and argv[1] in ("status", "reconcile", "resolve"):
         # The Rust operator control's child: a bounded JSON request on stdin,
         # one JSON answer on stdout. No diagnostic reaches a pane.
         try:
             request = json.loads(sys.stdin.read(LIMIT))
-            handler = reconcile_control if argv[1] == "reconcile" else resolve_control
-            print(encode(handler(argv[2], request)))
+            if argv[1] == "status":
+                result = status_control(argv[2])
+            else:
+                handler = reconcile_control if argv[1] == "reconcile" else resolve_control
+                result = handler(argv[2], request)
+            print(encode(result))
         except Exception as error:
             print(encode({"error": str(error)[:512] or type(error).__name__}))
             return 1
         return 0
-    print("usage: codex_runner.py tick|reconcile|resolve <launch.json>", file=sys.stderr)
+    print("usage: codex_runner.py tick|status|reconcile|resolve <launch.json>", file=sys.stderr)
     return 2
 
 
