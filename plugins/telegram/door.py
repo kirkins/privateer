@@ -300,7 +300,11 @@ class Door:
         except Exception:
             result, err = None, "send exception"
         self.spool.notice_result(row, (result or {}).get("message_id"), err)
-        tg.log("telegram outcome=notice_failed" if err else "telegram outcome=notice_sent")
+        outcome = "notice_failed" if err else "notice_sent"
+        tg.log(f"telegram update_id={row['update_id']} outcome={outcome}")
+        if row["slot"] <= -1000:
+            outcome = "confirmation_failed" if err else "confirmation_sent"
+            tg.log(f"telegram update_id={row['update_id']} outcome={outcome}")
         return (result or {}).get("message_id"), err
 
     # --- sending to Telegram ---------------------------------------------
@@ -1344,7 +1348,7 @@ class Door:
         extension = os.path.splitext(name or "")[1].lower()
         mime = (doc.get("mime_type") or "").split(";", 1)[0].lower()
         readable = extension in (".txt", ".md", ".markdown") or mime in ("text/plain", "text/markdown", "text/x-markdown")
-        reason = "not a plain-text or Markdown document"
+        reason = "not a plain-text or Markdown document" if doc else ""
         if readable:
             if os.path.getsize(dest) > text_input.MAIL_BYTES:
                 reason = "text is too large for the mail envelope"

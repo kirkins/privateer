@@ -1154,7 +1154,7 @@ before = len(runtime.mail); d.process_inbound()
 assert len(runtime.mail) == before + 1 and latest()["body"] == "reaction failure"
 assert "telegram outcome=reaction_failed" in logs and "telegram outcome=confirmation_failed" in logs
 warning_error = False; hurry(); adapter().retry_notices()
-assert "telegram outcome=notice_sent" in logs
+assert any("outcome=notice_sent" in line for line in logs)
 # Runtime refusal is a checked, bounded notice, not an insertion.
 d = adapter(); runtime.refuse = True; d.spool.admit([update(71, "refused")])
 before = len(runtime.mail); d.process_inbound(); runtime.refuse = False
@@ -1524,11 +1524,22 @@ def main() -> int:
             carried = elsewhere["payload"]["files"][0]
             assert pathlib.Path(carried["path"]).read_bytes() == letters, carried
             assert carried["name"] == "note.txt", carried
+            assert letters.decode() in elsewhere["body"], elsewhere
             assert not list(inbox.iterdir()), list(inbox.iterdir())
             telegram.message("/to default")
             wait_for("the liaison as the default ship again", lambda: [
                 m for m in telegram.sent()
                 if "plain messages go to liaison again" in m["text"]])
+
+            # A synthetic update larger than the protocol line still arrives
+            # whole via the real file.put boundary, never over stdout as text.
+            huge = "漢🚢boundary\n" * 100000
+            telegram.message(huge)
+            spilled = wait_for("oversized text stored by the runtime", lambda: [
+                m for m in fleet.inbox("liaison", "liaison")
+                if "captain-input.txt" in m["body"] and (m.get("payload") or {}).get("files")])[0]
+            assert len(spilled["body"]) < 500, spilled
+            assert pathlib.Path(spilled["payload"]["files"][0]["path"]).read_text() == huge
 
             # A stow names its machine. The Mac is linked (before the door
             # starts, so its calls can reach it), and its hold is its own: this
