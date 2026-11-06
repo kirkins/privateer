@@ -1250,12 +1250,19 @@ fn coverage(
         Some(review) => {
             let id = review["id"].as_str().unwrap_or_default();
             let name = review["route_name"].as_str().unwrap_or_default();
-            if review["kind"] != "imported"
-                && let (Ok(authors), Some(policy)) = (&authors, &policy)
-            {
-                let order =
-                    crate::crew_routes::order_reviewers(&[name.to_owned()], policy, authors);
-                if let Some((_, why)) = order.excluded.first() {
+            if let Ok(authors) = &authors {
+                let why = if review["kind"] == "imported" {
+                    crate::crew_routes::reviewer_exclusion(review["route_model"].as_str(), authors)
+                } else {
+                    policy.as_ref().and_then(|policy| {
+                        crate::crew_routes::order_reviewers(&[name.to_owned()], policy, authors)
+                            .excluded
+                            .into_iter()
+                            .next()
+                            .map(|(_, why)| why)
+                    })
+                };
+                if let Some(why) = why {
                     notes.push(format!(
                         "review {id}'s route {name} is now excluded by the code's authors: {why}"
                     ));

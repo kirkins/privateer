@@ -20,11 +20,14 @@ filter as an errand review. An approval with a must-fix finding is refused.
 `head_sha` must be full lowercase hex. The brief or reply must name that full
 SHA exactly; missing or conflicting full SHAs are refused rather than guessed.
 Short SHAs in the evidence are not head evidence and are ignored, even if a
-matching full SHA also appears. Any `#N` or `pull request N` reference in the
-brief or reply must match `pr`. Repository references must match the selected
-clone: bare `owner/name` outside structured findings is treated conservatively
-as repository evidence, as are forge PR URLs; `FINDING` paths remain code paths.
-For example, the saved brief can say `Review acme/widget PR #42 at head <full sha>`.
+matching full SHA also appears. Explicit `PR N`, `PR #N`, `PR: N`,
+`pull request N` and `pull request #N` references (case-insensitive) in the
+brief or reply must match `pr`. Bare `#N` references are ignored so that
+`PR 774 (#772)` can cite an issue. Repository evidence must match the selected
+clone: only forge URLs, `repo owner/name`, `repository owner/name`, and
+`owner/name#N` bind. Bare two-segment tokens such as `src/review.rs`, `docs/x.md`
+and `and/or` are ignored, including outside `FINDING` lines.
+For example, the saved brief can say `Review repo acme/widget PR #42 at head <full sha>`.
 Failed, unfinished or resumed (non-fresh) errands and another ship's errands
 are refused.
 
@@ -39,7 +42,8 @@ and model, **never today's route definition**, to determine review strength:
 only saved tier exactly 1 with `review` among its uses covers a carried commit.
 Legacy imports with unknown tier and other weaker approvals are reported as
 approvals that do not cover. Non-imported reviews retain their current-route
-coverage rules.
+coverage rules. Imported approvals retain the author-exclusion warning: the
+saved reviewer model is compared with the crew authors, not today's route model.
 
 ## Historical setup kit
 

@@ -1167,13 +1167,94 @@ fn review_record_imports_locally_once_and_covers_the_exact_merge_head() {
 }
 
 #[test]
+fn review_record_binds_pr_wording_but_ignores_issue_numbers_and_file_paths() {
+    for (brief, reply) in [
+        ("Review PR 41 at head", "VERDICT: APPROVE"),
+        ("Review head", "Reviewed PR: 41\nVERDICT: APPROVE"),
+    ] {
+        let f = Fleet::new();
+        f.routes(opus_errands());
+        let head = f.commit("feature", &[], "Fix");
+        let id = finished_plain_errand(&f, &format!("{brief} {head}"), reply);
+        let error = f.refused(
+            Some("engineering"),
+            "review.record",
+            json!({"errand_id": id, "pr": 42, "head_sha": head}),
+        );
+        assert!(
+            error.contains("names PR #41, not requested PR #42"),
+            "{error}"
+        );
+        assert!(!f.root.join("adapter.log").exists());
+    }
+    let f = Fleet::new();
+    f.routes(opus_errands());
+    let head = f.commit("feature", &[], "Fix");
+    let id = finished_plain_errand(
+        &f,
+        &format!(
+            "Review PR 774 (#772) at head {head}. Inspect src/review.rs, docs/x.md and/or tests/review_gate.rs."
+        ),
+        "Checked src/review.rs, docs/x.md and/or tests/review_gate.rs. See issue #772.\nFINDING nit src/lib.rs:1 spelling\nVERDICT: APPROVE",
+    );
+    let row = f.json(
+        Some("engineering"),
+        "review.record",
+        json!({"errand_id": id, "pr": 774, "head_sha": head}),
+    );
+    assert_eq!(row["pr"], 774);
+    assert_eq!(row["verdict"], "approve");
+    assert_eq!(row["findings"][0]["severity"], "nit");
+    assert!(!f.root.join("adapter.log").exists());
+}
+
+#[test]
+fn imported_author_exclusion_uses_the_saved_model_not_todays_route() {
+    let f = Fleet::new();
+    let mut routes = opus_errands();
+    routes["routes"]["writer"] = tiered("claude-opus-5-5", 2, &["implement"]);
+    routes["crew"] = json!(["writer"]);
+    f.routes(routes.clone());
+    let head = f.commit("feature", &[], "Fix");
+    f.pr(78, &head, "feature");
+    let id = finished_plain_errand(
+        &f,
+        &format!("Review PR 78 at head {head}"),
+        "VERDICT: APPROVE",
+    );
+    f.crew("crew-writer", "writer");
+    routes["routes"]["opus"] = tiered("claude-sonnet-4-6", 2, &["implement"]);
+    f.routes(routes);
+    let row = f.json(
+        Some("engineering"),
+        "review.record",
+        json!({"errand_id": id, "pr": 78, "head_sha": head}),
+    );
+    assert!(!f.root.join("adapter.log").exists());
+    let merged = f.json(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "fix", "pr": 78}),
+    );
+    assert_eq!(merged["coverage"], "reviewed", "{merged}");
+    assert_eq!(merged["review"]["id"], row["id"]);
+    let notes = merged["notes"].to_string();
+    assert!(
+        notes.contains("now excluded by the code's authors"),
+        "{merged}"
+    );
+    assert!(notes.contains("crew-writer"), "{merged}");
+    assert!(notes.contains("claude-opus-5-5"), "{merged}");
+}
+
+#[test]
 fn review_record_selects_a_local_repository_without_forge_contact() {
     let f = Fleet::new();
     f.routes(opus_errands());
     let head = f.commit("feature", &[], "Fix");
     let id = finished_plain_errand(
         &f,
-        &format!("Review acme/widget PR #77 at head {head}"),
+        &format!("Review repo acme/widget PR #77 at head {head}"),
         "VERDICT: APPROVE",
     );
     let other = f.root.join("engineering/projects/gadget");
@@ -1197,7 +1278,7 @@ fn review_record_selects_a_local_repository_without_forge_contact() {
     selected["repo"] = json!("acme/widget");
     let db = rusqlite::Connection::open(f.home().join("privateer.sqlite")).unwrap();
     db.execute(
-        "UPDATE errands SET verdict='Reviewed acme/gadget\nVERDICT: APPROVE' WHERE id=?1",
+        "UPDATE errands SET verdict='Reviewed repository acme/gadget\nVERDICT: APPROVE' WHERE id=?1",
         [&id],
     )
     .unwrap();
@@ -1349,7 +1430,7 @@ fn review_record_refuses_untrusted_or_ambiguous_errand_evidence_without_forge_ca
         ),
         (
             format!("Review head {head}"),
-            "Reviewed #73\nVERDICT: APPROVE",
+            "Reviewed PR: 73\nVERDICT: APPROVE",
         ),
     ] {
         db.execute(
