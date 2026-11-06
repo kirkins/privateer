@@ -21,6 +21,9 @@
 //! Door to runtime:
 //! - `{"type":"delivered","ref":REF}`: the captain has it; it is not sent again;
 //! - `{"type":"request","id":ID,"command":"send|ships|status|waiting|file.put|approval|reply.edit","args":{...}}`.
+//!   `send {to?, kind?, body, correlation?, ...}` uses a local ship's own home;
+//!   for remote ships, a retained captain conversation selects its holding
+//!   local mailbox. Multiple matching mailboxes are refused as ambiguous.
 //!   `approval {id, action: "grant"|"deny", hash?}` answers a privileged
 //!   command held in a home on this machine, as the captain, while its hash
 //!   starts with `hash` (what the phone showed); nothing else.
@@ -52,6 +55,7 @@ mod handoff;
 mod idempotency;
 mod identity;
 pub(crate) mod inspection;
+mod legacy_mail;
 mod oauth;
 pub(crate) mod reader;
 pub(crate) mod reader_link;
@@ -1397,7 +1401,7 @@ impl<'a> Session<'a> {
                 mail[key] = value.clone();
             }
         }
-        let home = self.home(&to)?;
+        let home = self.send_home(&to, &mail)?;
         let control = crate::machines::desk_placement::control_reply(self.store(&home)?, &mail)?;
         let returned = if control { None } else { crate::away::back()? };
         if returned.is_some() {
