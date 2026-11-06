@@ -902,6 +902,167 @@ class RunnerTests(unittest.TestCase):
         return {"ship": "alpha", "holder": "host:alpha", "session": self.session,
                 "notification_id": self.nonce, **fields}
 
+    def clear_request(self, **fields):
+        return {"ship": "alpha", "holder": "host:alpha", "session": self.session,
+                "diagnostic": runner.THREAD_FENCE_LOST, "reason": "operator restored the watched UUID", **fields}
+
+    def sticky(self, *names):
+        self.mutate(lambda value: runner.accounting(value).update(sticky=list(names)))
+
+    def test_clear_sticky_revalidates_audits_preserves_attempt_and_resumes_without_replay(self):
+        original = subprocess.Popen
+        other = str(uuid.uuid4())
+        def spawn(*args, **kwargs):
+            self.loaded_sessions.append(other)
+            self.other_threads[other] = {"id": other, "cwd": self.record["cwd"]}
+            return original(*args, **kwargs)
+        with patch.object(runner.subprocess, "Popen", side_effect=spawn):
+            self.runner.dispatch()
+        before = self.runner.ledger.read()
+        self.assertIn(runner.THREAD_FENCE_LOST, before["runner"]["sticky"])
+        self.assertEqual(before["sessions"][self.session]["intent"]["state"], "uncertain")
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            runner.clear_pause_control(self.registry, self.clear_request())
+        self.assertEqual(self.runner.ledger.read(), before)
+        self.loaded_sessions = [self.session]
+        restarted = runner.Runner(self.registry)
+        restarted.observe()
+        self.assertFalse(restarted.report(self.session)["report_eligible"])
+        before = restarted.ledger.read()
+        status = runner.status_control(self.registry)
+        command = status["clear_pause"][0]
+        self.assertEqual(command["argv"][:5], [self.record["control"], "--home", self.record["home"],
+                                              "attended.codex.clear_pause", "--json"])
+        request = json.loads(command["argv"][5])
+        request["reason"] = "operator restored the watched UUID"
+        result = runner.clear_pause_control(self.registry, request)
+        after = restarted.ledger.read()
+        self.assertEqual(after["sessions"], before["sessions"])
+        for key in ("grants", "possibly_unattended_spent", "declines", "retry_after_ms", "accepted_through"):
+            self.assertEqual(after["runner"][key], before["runner"][key])
+        self.assertEqual(after["runner"]["sticky"], [])
+        audit = after["runner"]["sticky_clear_audits"][0]
+        self.assertEqual(result["audit"], audit)
+        self.assertEqual((audit["actor"], audit["uid"], audit["diagnostic"], audit["reason"]),
+                         ("operator", os.getuid(), runner.THREAD_FENCE_LOST, request["reason"]))
+        self.assertEqual(audit["context"]["session"], self.session)
+        self.assertGreater(audit["at_ms"], 0)
+        self.assertIn("ambiguous", audit["previous_reason"])
+        self.assertTrue(restarted.report(self.session)["paused"])  # Still uncertain, not replayable.
+        self.assertEqual(runner.tick(self.registry), {"tick": "outstanding"})
+        runner.resolve_control(self.registry, self.control_request(operation="abandon", reason="retire uncertain offer"))
+        self.prepare(1)  # Only newer mail; old range remains suppressed and charged.
+        restarted.dispatch()
+        final = runner.Runner(self.registry).ledger.read()
+        self.assertEqual(final["runner"]["possibly_unattended_spent"], 2)
+        self.assertEqual(final["runner"]["sticky_clear_audits"], [audit])
+        self.assertEqual(final["sessions"][self.session]["suppressed_through"], 1)
+
+    def test_clear_named_custody_pause_only_and_no_success_with_other_sticky(self):
+        self.sticky("codex-custody-lost-after-invocation", runner.THREAD_FENCE_LOST)
+        runner.clear_pause_control(self.registry, self.clear_request(diagnostic="codex-custody-lost-after-invocation"))
+        self.assertEqual(self.runner.ledger.read()["runner"]["sticky"], [runner.THREAD_FENCE_LOST])
+        self.assertFalse(self.runner.report(self.session)["report_eligible"])
+        runner.clear_pause_control(self.registry, self.clear_request())
+        self.assertFalse(self.runner.report(self.session)["paused"])
+        self.runner.dispatch()
+        self.assertTrue((self.root / "invoked.json").exists())
+
+    def test_clear_refuses_cleanup_without_process_proof(self):
+        self.sticky("codex-queue-cleanup-unproven")
+        before = self.runner.ledger.read()
+        with self.assertRaisesRegex(ValueError, "no saved process identities"):
+            runner.clear_pause_control(self.registry, self.clear_request(diagnostic="codex-queue-cleanup-unproven"))
+        command = runner.status_control(self.registry)["clear_pause"][0]
+        self.assertFalse(command["supported"])
+        self.assertIn("no stray Codex process", command["refusal"])
+        self.assertEqual(self.runner.ledger.read(), before)
+        self.assertFalse(self.runner.report(self.session)["report_eligible"])
+
+    def test_clear_refuses_stale_context_bad_reason_inflight_and_poison(self):
+        self.sticky(runner.THREAD_FENCE_LOST)
+        before = self.runner.ledger.read()
+        for bad in ({"ship": "beta"}, {"holder": "host:beta"}, {"session": str(uuid.uuid4())},
+                    {"diagnostic": "unknown"}, {"reason": " "}, {"reason": "é" * 257}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                runner.clear_pause_control(self.registry, self.clear_request(**bad))
+        self.assertEqual(self.runner.ledger.read(), before)
+        self.mutate(lambda value: value["sessions"][self.session]["intent"].update(state="invoking"))
+        with self.assertRaisesRegex(ValueError, "still in progress"):
+            runner.clear_pause_control(self.registry, self.clear_request())
+        self.mutate(lambda value: value["sessions"][self.session]["intent"].update(state="uncertain"))
+        binding.publish_request(self.registry, "custody-poison.json", generation=self.record["generation"],
+                                reason="holder_changed")
+        before = self.runner.ledger.read()
+        with self.assertRaisesRegex(ValueError, "poisoned"):
+            runner.clear_pause_control(self.registry, self.clear_request())
+        self.assertEqual(self.runner.ledger.read(), before)
+
+    def test_clear_refuses_busy_queue_expired_lease_dead_pane_and_changed_runner(self):
+        self.sticky(runner.THREAD_FENCE_LOST)
+        before = self.runner.ledger.read()
+        self.status = {"type": "active"}
+        with self.assertRaisesRegex(ValueError, "qualified idle"):
+            runner.clear_pause_control(self.registry, self.clear_request())
+        self.status = {"type": "idle"}
+        original = self.daemon_class.call
+        for queue in ({"data": [{"id": "pending"}], "nextCursor": None}, {"data": []},
+                      {"data": [], "nextCursor": "more"}):
+            def call(daemon, method, params):
+                return queue if method == "thread/queue/list" else original(daemon, method, params)
+            with patch.object(self.daemon_class, "call", new=call), self.assertRaisesRegex(ValueError, "native queue"):
+                runner.clear_pause_control(self.registry, self.clear_request())
+        with patch.object(runner, "control", return_value={"attended": True, "lease": {
+                "holder": self.record["holder"], "expires_ms": 1}}), self.assertRaisesRegex(ValueError, "expired"):
+            runner.clear_pause_control(self.registry, self.clear_request())
+        self.assertEqual(self.runner.ledger.read(), before)
+        def race(daemon, method, params):
+            if method == "thread/queue/list":
+                self.mutate(lambda value: runner.accounting(value).update(human_paused=True))
+            return original(daemon, method, params)
+        with patch.object(self.daemon_class, "call", new=race), self.assertRaisesRegex(ValueError, "runner changed"):
+            runner.clear_pause_control(self.registry, self.clear_request())
+        self.assertEqual(self.runner.ledger.read()["runner"]["sticky"], [runner.THREAD_FENCE_LOST])
+        self.pane.terminate()
+        self.pane.wait()
+        with self.assertRaises((ValueError, ProcessLookupError, FileNotFoundError)):
+            runner.clear_pause_control(self.registry, self.clear_request())
+
+    def test_clear_rechecks_binding_custody_and_invalidation_after_native_rpcs(self):
+        self.sticky(runner.THREAD_FENCE_LOST)
+        before = self.runner.ledger.read()
+        original = self.daemon_class.call
+        for change in ("binding", "custody", "invalidation"):
+            with self.subTest(change=change):
+                def call(daemon, method, params):
+                    if method == "thread/queue/list":
+                        if change == "binding":
+                            binding.atomic(self.registry, {**self.record, "callback_generation": str(uuid.uuid4())})
+                        elif change == "custody":
+                            binding.atomic(self.directory / "custody.json", {**self.custody, "epoch": str(uuid.uuid4())})
+                        else:
+                            binding.atomic(self.directory / "invalidate.json", {"token": str(uuid.uuid4())})
+                    return original(daemon, method, params)
+                with patch.object(self.daemon_class, "call", new=call), self.assertRaises(ValueError):
+                    runner.clear_pause_control(self.registry, self.clear_request())
+                self.assertEqual(self.runner.ledger.read(), before)
+                binding.atomic(self.registry, self.record)
+                binding.atomic(self.directory / "custody.json", self.custody)
+                binding.atomic(self.directory / "invalidate.json", {
+                    "token": self.record["binding"]["invalidation_token"]})
+
+    def test_clear_is_atomic_on_full_ledger_and_duplicate_clear_is_not_audited(self):
+        self.sticky(runner.THREAD_FENCE_LOST)
+        before = self.runner.ledger.read()
+        with patch.object(runner, "MAX_LEDGER", 1), self.assertRaisesRegex(ValueError, "ledger full"):
+            runner.clear_pause_control(self.registry, self.clear_request())
+        self.assertEqual(self.runner.ledger.read(), before)
+        runner.clear_pause_control(self.registry, self.clear_request())
+        after = self.runner.ledger.read()
+        with self.assertRaisesRegex(ValueError, "not active"):
+            runner.clear_pause_control(self.registry, self.clear_request())
+        self.assertEqual(self.runner.ledger.read(), after)
+
     def test_operator_reconcile_reports_uncertain_then_settles_only_on_evidence(self):
         self.runner.dispatch()
         result = runner.reconcile_control(self.registry, self.control_request())

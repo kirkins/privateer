@@ -40,6 +40,10 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
             "reason",
         ],
     ),
+    (
+        "attended.codex.clear_pause",
+        &["ship", "holder", "session", "diagnostic", "reason"],
+    ),
     ("attended.codex.session", &["ship"]),
 ];
 
@@ -95,6 +99,7 @@ pub(crate) fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<
         "attended.codex.status" => delivery_status(store, ship(&args)?),
         "attended.codex.reserve" => reserve(store, &args),
         "attended.codex.reconcile" | "attended.codex.resolve" => settle(store, command, &args),
+        "attended.codex.clear_pause" => clear_pause(store, &args),
         "attended.codex.session" => session(store, &args),
         _ => bail!("unknown command {command}"),
     }
@@ -236,6 +241,44 @@ fn settle(store: &Store, command: &str, args: &Value) -> Result<Value> {
                 "audit_id": answer["audit"]["id"]}),
         )?;
     }
+    Ok(answer)
+}
+
+/// Clear only a named runner pause, never an offer, receipt or charged turn.
+fn clear_pause(store: &Store, args: &Value) -> Result<Value> {
+    const COMMAND: &str = "attended.codex.clear_pause";
+    store.caller().require_operator(COMMAND)?;
+    let ship = ship(args)?;
+    let folder = folder(store, ship)?;
+    let diagnostic = args["diagnostic"].as_str().unwrap_or_default();
+    ensure!(
+        matches!(
+            diagnostic,
+            "codex-loaded-thread-fence-lost-after-invocation"
+                | "codex-custody-lost-after-invocation"
+                | "codex-queue-cleanup-unproven"
+        ),
+        "diagnostic must name a runner sticky pause"
+    );
+    let reason = args["reason"].as_str().unwrap_or_default();
+    ensure!(
+        !reason.trim().is_empty() && reason.len() <= 512,
+        "reason must be 1..512 bytes"
+    );
+    let request = json!({"ship": ship,
+        "holder": args["holder"].as_str().context("holder is required")?,
+        "session": canonical(args, "session")?, "diagnostic": diagnostic, "reason": reason});
+    let launch = folder.join(".codex/privateer-attended/launch.json");
+    let answer = adapter(
+        &folder,
+        ["codex_runner.py", "clear_pause"],
+        &launch,
+        &request,
+    )?;
+    store.audit(
+        COMMAND,
+        &json!({"ship": ship, "by": "operator", "audit": answer["audit"]}),
+    )?;
     Ok(answer)
 }
 

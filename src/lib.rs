@@ -157,6 +157,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "attended.codex.revoke",
     "attended.codex.reconcile",
     "attended.codex.resolve",
+    "attended.codex.clear_pause",
     "attended.codex.session",
 ];
 
