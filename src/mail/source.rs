@@ -215,7 +215,12 @@ pub(crate) struct HomeFact {
 /// when replay checks the current home row. Keep the premise itself: changing
 /// what an ask depends on is a content change. Its outcome is mutable lifecycle
 /// bookkeeping and must not invalidate the original digest, even when null.
+/// Omit an absent premise to preserve the exact projection (and digest) pinned
+/// by releases before premises existed.
 pub(crate) fn immutable_content(mut row: Value) -> Value {
+    if row["premise"].is_null() {
+        row.as_object_mut().unwrap().remove("premise");
+    }
     for key in [
         "seq",
         "state",
