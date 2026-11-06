@@ -95,6 +95,46 @@ fn codex_delivery_grant_and_revoke_are_the_captains_alone() {
 }
 
 #[test]
+fn codex_delivery_status_exposes_durable_pre_spawn_refusal_without_spending_or_resetting() {
+    let mut f = Fixture::new();
+    let granted = f
+        .operator(
+            "attended.codex.grant",
+            json!({"ship": "alpha", "session": SESSION}),
+        )
+        .unwrap();
+    let context = json!({"generation": "launch", "callback_generation": "callback",
+        "session": SESSION, "holder": "host:alpha"});
+    let mut launch = context.clone();
+    launch["home"] = json!(f.store.home());
+    launch["ship"] = json!("alpha");
+    fs::write(f.dir.join("launch.json"), launch.to_string()).unwrap();
+    let refusal = json!({
+        "diagnostic": "codex-loaded-thread-fence-refused-before-invocation",
+        "at_ms": 123, "context": context,
+        "facts": {"loaded_count": 2, "threads_in_cwd": 2, "bound_uuid_loaded": true,
+            "cursor_state": "null", "cwd_thread_is_bound": false},
+        "clears_when": "a later pre-spawn fence passes, or a trusted rebind / hosted relaunch"
+    });
+    let ledger = json!({"version": 1, "home": f.store.home(), "ship": "alpha", "sessions": {},
+        "runner": {"possibly_unattended_spent": 0, "declines": 0, "accepted_through": 0,
+            "retry_after_ms": 0, "human_paused": false, "pre_spawn_fence": refusal}});
+    let path = f.dir.join("receipts.json");
+    fs::write(&path, ledger.to_string()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let original = fs::read(&path).unwrap();
+    let report = f
+        .agent("attended.codex.status", json!({"ship": "alpha"}))
+        .unwrap();
+    assert_eq!(report["grant"], granted["grant"]);
+    assert_eq!(report["grant"]["spent"], 0);
+    assert_eq!(report["runner"]["paused"], true, "{report}");
+    assert_eq!(report["runner"]["pre_spawn_fence"], refusal);
+    assert_eq!(report["runner"]["diagnostic"], refusal["diagnostic"]);
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
 fn codex_delivery_grant_names_the_configured_session_and_a_bounded_budget() {
     let mut f = Fixture::new();
     let other = nonce();

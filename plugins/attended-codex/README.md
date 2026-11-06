@@ -10,6 +10,30 @@ ACT1 (Linux) makes a hosted Codex first mate resume the captain-set
 It does not implement scheduled work, qualify native autonomy or claim ATTACHED.
 The main attended-support table is unchanged until live qualification (PR C).
 
+**Pre-spawn loaded-thread refusal.** An idle `/new`, an unloaded bound UUID,
+ambiguous cwd/UUID ownership, an incomplete loaded-list page (missing or non-null
+`nextCursor`), or more than 32 loaded threads withholds delivery **before a grant
+reservation or invocation**. The local receipt ledger records
+`runner.pre_spawn_fence`, named
+`codex-loaded-thread-fence-refused-before-invocation`, with `at_ms`, launch/callback
+context, and bounded facts: `loaded_count`, `threads_in_cwd`, `bound_uuid_loaded`,
+`cursor_state` (`missing` / `null` / `non-null`), and `cwd_thread_is_bound`.
+Unknown facts are null; incomplete/oversize pages are never followed. No message
+bodies, cursor values or credentials are recorded. The last 16 state changes are
+kept in `runner.pre_spawn_fence_events`; unchanged five-second refusals do not
+add events or refresh the diagnostic's timestamp.
+
+From the ship folder's own home, `attended.codex.status` includes this local
+state under `runner` (and reports `runner.unavailable` if it cannot read the
+adapter state). Its `pre_spawn_fence.clears_when` explains recovery: a later
+passing pre-spawn fence, or a trusted rebind / hosted relaunch. Ticks recheck the
+fence even while this diagnostic pauses mail; status itself is read-only and
+never contacts Codex. A refusal leaves the offer prepared, never uncertain,
+and never redirects it to another UUID. This is **non-sticky** and separate
+from `codex-loaded-thread-fence-lost-after-invocation`: post-spawn custody loss
+remains sticky, even after a later passing fence, rebind, or relaunch. This change
+adds no sticky-pause reset and closes no native atomic-admission race.
+
 ACT2 adds captain-only controls, each run from the ship folder's own home:
 `attended.codex.reconcile` and `attended.codex.resolve` (audited `abandon` or
 `mark_presented` with a reason) for one uncertain offer, and
