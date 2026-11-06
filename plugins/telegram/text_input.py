@@ -35,8 +35,11 @@ def bounded(text, limit=3000):
 
 
 def command(text, entities, commands, username=""):
-    # Only a complete known command token at offset zero. If Telegram supplies
-    # entities, require its bot_command entity to match the whole token.
+    # Allow pasted leading whitespace while matching entities in the original
+    # UTF-16 coordinate system. Only complete known tokens dispatch.
+    stripped = text.lstrip()
+    offset = units(text[:len(text) - len(stripped)])
+    text = stripped
     match = re.match(r"^/([a-zA-Z0-9_]{1,32})(?:@([a-zA-Z0-9_]{1,32}))?(?=\s|$)", text)
     if not match or match[1].lower() not in commands:
         return False
@@ -44,7 +47,7 @@ def command(text, entities, commands, username=""):
         return False
     bot_entities = [e for e in entities or [] if isinstance(e, dict) and e.get("type") == "bot_command"]
     if bot_entities:
-        return any(e.get("offset") == 0 and e.get("length") == match.end() for e in bot_entities)
+        return any(e.get("offset") == offset and e.get("length") == match.end() for e in bot_entities)
     return True
 
 

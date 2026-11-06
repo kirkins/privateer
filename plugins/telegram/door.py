@@ -26,6 +26,7 @@ allowed_user_ids within it, is heard. Everything else is logged and dropped.
 
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -171,10 +172,33 @@ def chat_kind(cfg: dict) -> str:
         return "group"
 
 
+def bot_identity(cfg):
+    """Stable identity without depending on getMe availability or logging secrets."""
+    prefix = str(cfg.get("bot_token", "")).partition(":")[0]
+    if not prefix.isascii() or not prefix.isdecimal():
+        tg.log("telegram outcome=invalid_bot_identity")
+        return False
+    cfg["bot_id"] = int(prefix)
+    bot, err = tg.api(cfg, "getMe", {}, retries=2)
+    if err or not isinstance(bot, dict):
+        tg.log("telegram outcome=bot_username_unavailable")
+        bot = {}
+    cfg["bot_username"] = bot.get("username", "")
+    return True
+
+
 class Door:
     def __init__(self, hello: dict, cfg: dict, runtime: Runtime):
         self.hello = hello
-        self.cfg = cfg
+        self.cfg = dict(cfg)
+        try:
+            window = float(cfg.get("paste_join_seconds", 3))
+            if not math.isfinite(window) or not 0 <= window <= 30:
+                raise ValueError
+        except (TypeError, ValueError):
+            tg.log("telegram config=paste_join_seconds outcome=invalid_defaulting_to_3")
+            window = 3
+        self.cfg["paste_join_seconds"] = window
         self.runtime = runtime
         self.pending: list[dict] = []
         self.sent = tg.read_state(SENT, [])
@@ -185,7 +209,6 @@ class Door:
         self.sender = None
         self.spool = inbound.Spool()
         self.update_id = None
-        self.notice_slot = 0
         self.outcome = "terminal_ignored"
 
     def process_inbound(self) -> bool:
@@ -194,12 +217,7 @@ class Door:
         if row is None or row["next_at"] > time.time():
             return False
         update = json.loads(row["data"])
-        if not row["initial_skip"] and not row["submission"] and row["attempts"] < inbound.ATTEMPTS:
-            update = self.paste_update(row, update)
-            if update is None:
-                return False
         self.update_id = row["id"]
-        self.notice_slot = 0
         self.outcome = "terminal_ignored"
         try:
             if row["initial_skip"]:
@@ -211,16 +229,21 @@ class Door:
                 if self.authorized((msg.get("chat") or {}).get("id"),
                                    ((query or msg).get("from") or {}).get("id")):
                     # Never reuse a handler's notice slot from an earlier attempt.
-                    self.notice_slot = -1
                     committed = self.spool.result(self.update_id) is not None
                     if committed:
                         self.outcome = "mail_committed_confirmation_failed"
                     status = ("The mail committed, but confirmation failed." if committed else
                               "Delivery is uncertain; please check with the ship before resending.")
                     self.say(f"⚠️ Could not complete this update. {status}",
-                             reply_to=msg.get("message_id"))
+                             reply_to=msg.get("message_id"), notice_key=-1)
             else:
                 self.spool.begin(self.update_id)
+                if not row["submission"]:
+                    combined = self.paste_update(row, update)
+                    if combined is None:
+                        self.spool.defer(self.update_id)
+                        return False
+                    update = combined
                 if row["submission"]:
                     # The exact recipient/body/files were frozen before send.
                     self.send(*json.loads(row["submission"]))
@@ -232,6 +255,7 @@ class Door:
         except Exception:
             kind, length = inbound.metadata(update)
             tg.log(f"inbound update_id={self.update_id} type={kind} length={length} outcome=handler_retry")
+            return False  # Yield to runtime events even if a spool write keeps failing.
         finally:
             self.update_id = None
         return True
@@ -244,7 +268,7 @@ class Door:
             if not first or not self.authorized((first.get("chat") or {}).get("id"),
                                                 (first.get("from") or {}).get("id")):
                 return update
-            window = max(0, min(30, float(self.cfg.get("paste_join_seconds", 3))))
+            window = self.cfg["paste_join_seconds"]
             if not window:
                 return update
             rows = [row]
@@ -257,7 +281,8 @@ class Door:
                 if not nxt or candidate["initial_skip"] or candidate["submission"] or candidate["attempts"]:
                     break
                 if ((nxt.get("chat") or {}).get("id") != (first.get("chat") or {}).get("id") or
-                    (nxt.get("from") or {}).get("id") != (first.get("from") or {}).get("id")):
+                    (nxt.get("from") or {}).get("id") != (first.get("from") or {}).get("id") or
+                    nxt.get("message_thread_id") != first.get("message_thread_id")):
                     break
                 gap = nxt.get("date", candidate["admitted_at"]) - previous.get("date", rows[-1]["admitted_at"])
                 arrival_gap = candidate["admitted_at"] - rows[-1]["admitted_at"]
@@ -325,9 +350,12 @@ class Door:
         if quiet:
             params["disable_notification"] = "true"
         if durable and self.update_id is not None:
-            slot = self.notice_slot if notice_key is None else notice_key
-            if notice_key is None:
-                self.notice_slot += 1
+            # Content-stable positive slots cannot collide with reserved negative
+            # outcome slots or skip a different notice on a later attempt.
+            slot = notice_key
+            if slot is None:
+                identity = json.dumps(params, sort_keys=True, separators=(",", ":"))
+                slot = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], "big") >> 1
             row = self.spool.notice(self.update_id, slot, params)
             return self.deliver_notice(row)
         result, err = tg.api(self.cfg, "sendMessage", params)
@@ -619,8 +647,6 @@ class Door:
                 raise RuntimeError("non-text mail metadata exceeds the envelope")
             if self.update_id is not None:
                 self.spool.replace_submission(self.update_id, args, msg_id, "stored text")
-            self.say("📄 Full text preserved in stored file captain-input.txt; "
-                     "it was too large to mail inline.", reply_to=msg_id, quiet=True, notice_key=-2)
             return args
         finally:
             try:
@@ -664,7 +690,10 @@ class Door:
             payload["answer"] = answer
             args["payload"] = payload
         try:
+            original = args
             args = self.spill(args, msg_id)
+            if args is not original:
+                label = "stored text"
         except RuntimeError:
             self.outcome = "terminal_file_put_refused"
             self.say("⚠️ not sent: could not store the full text. Please retry or send it as a document.",
@@ -681,6 +710,7 @@ class Door:
                     # Runtime-added paths/topic fields may exceed our reserve.
                     # This refusal is transactional, so spill and retry safely.
                     args = self.spill(args, msg_id, force=True)
+                    label = "stored text"
                     result = self.runtime.call("send", args)
         except RuntimeError as e:
             if "Privateer did not answer" in str(e):
@@ -718,6 +748,9 @@ class Door:
         if self.update_id is not None:
             self.spool.result(self.update_id, result)
         self.outcome = "mail_committed"
+        if label == "stored text":
+            self.say("📄 Full text preserved in stored file captain-input.txt; "
+                     "it was too large to mail inline.", reply_to=msg_id, quiet=True, notice_key=-2)
         self.welcome(result.get("returned"))
         ship = result.get("ship", "")
         mail_id = (result.get("mail") or {}).get("id")
@@ -741,7 +774,8 @@ class Door:
             if not self.react(message_id):
                 _, err = self.say(f"➡️ {ship}", reply_to=message_id, quiet=True,
                                   notice_key=-1000 - int(message_id or 0))
-                tg.log("telegram outcome=confirmation_failed" if err else "telegram outcome=confirmation_sent")
+                if self.update_id is None:
+                    tg.log("telegram outcome=confirmation_failed" if err else "telegram outcome=confirmation_sent")
 
     def react(self, msg_id) -> bool:
         if not msg_id or not self.cfg.get("confirm_with_reaction", True):
@@ -842,6 +876,7 @@ class Door:
         if bad:
             # Still re-check (and fail closed), rather than leave an old
             # approval standing because the replacement contains a control.
+            body = "~Edited answer contains a rejected control; no inline approval.~"
             self.say(f"⚠️ Edited answer contains control U+{bad[1]:04X} at character {bad[0]} "
                      "(1-based); re-checking without treating it as approval.", reply_to=msg_id)
         args = {"ship": target.get("from") or target.get("ship"), "id": target.get("mail"),
@@ -1348,7 +1383,11 @@ class Door:
         readable = extension in (".txt", ".md", ".markdown") or mime in ("text/plain", "text/markdown", "text/x-markdown")
         reason = "not a plain-text or Markdown document" if doc else ""
         if readable:
-            if os.path.getsize(dest) > text_input.MAIL_BYTES:
+            if args.get("kind") == "reply":
+                # Only the captain's caption may answer an ask. File contents
+                # and adapter diagnostics must never change its approval meaning.
+                reason = "attachments to asks are reference-only; only the caption answers"
+            elif os.path.getsize(dest) > text_input.MAIL_BYTES:
                 reason = "text is too large for the mail envelope"
             else:
                 try:
@@ -1358,7 +1397,8 @@ class Door:
                     if bad:
                         reason = f"text contains control U+{bad[1]:04X} at character {bad[0]}"
                     else:
-                        candidate = dict(args, body=args["body"] + "\n\n" + contents)
+                        candidate = dict(args, body=args["body"] +
+                                         "\n\n~Attached file text (reference only; no inline approval):~\n" + contents)
                         if text_input.fits(candidate):
                             args = candidate
                             reason = ""
@@ -1367,7 +1407,6 @@ class Door:
                 except UnicodeDecodeError:
                     reason = "document is not valid UTF-8"
         if reason:
-            args["body"] += f"\n\nFile reference only: {reason}."
             self.say(f"📎 File kept as a reference: {reason}.", reply_to=msg_id, quiet=True)
         if stored and stored.get("file_id"):
             try:
@@ -1636,12 +1675,10 @@ def main() -> int:
     if problem:
         print(f"Telegram door config: {problem}", file=sys.stderr)
         return 2
-    bot, err = tg.api(cfg, "getMe", {}, retries=2)
-    if err or not (bot or {}).get("id"):
-        tg.log("telegram outcome=bot_identity_failed")
+    # A Telegram token's numeric prefix is its bot id. Never log the token;
+    # getMe is only needed for the optional @username command spelling.
+    if not bot_identity(cfg):
         return 2
-    cfg["bot_id"] = bot["id"]
-    cfg["bot_username"] = bot.get("username", "")
     kind = chat_kind(cfg)
     if kind != "private" and not cfg.get("allowed_user_ids"):
         print(f"Telegram door config: chat_id names a {kind}, and allowed_user_ids is not set; "

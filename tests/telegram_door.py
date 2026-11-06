@@ -446,7 +446,7 @@ def check_attachment_put_and_fallback() -> None:
     assert got["deleted"], got
     stored = got["stored"]
     assert stored["payload"] == {"files": [{"file_id": "file7"}]}, stored
-    assert stored["body"].startswith("The captain sent a file: notes.bin\n\nFile reference only:"), stored
+    assert stored["body"] == "The captain sent a file: notes.bin", stored
 
 
 class Fleet:
@@ -987,6 +987,60 @@ with sqlite3.connect(crash_state / "fake-mail.sqlite3") as db:
     assert len(rows) == 2
     assert any(json.loads(r[0])["body"] == "".join(parts) for r in rows)
 assert inbound.Spool().ready() is None
+# A changed automatic notice on a retry gets its own stable slot, while the
+# identical one is sent only once even after restart.
+spool = inbound.Spool(); spool.admit([update(24)])
+for attempt in range(inbound.ATTEMPTS):
+    d = adapter()
+    def changing_warning(u):
+        d.say("stable warning")
+        d.say("attempt warning " + str(attempt))
+        raise ValueError(secret)
+    d.on_update = changing_warning
+    hurry(spool); assert not d.process_inbound()
+assert sum(s["text"] == "stable warning" for s in sent) == 1
+assert all(any(s["text"] == "attempt warning " + str(i) for s in sent) for i in range(inbound.ATTEMPTS))
+hurry(spool); adapter().process_inbound()
+
+# Spool errors during paste discovery consume attempts and reach a visible
+# terminal notice instead of wedging this row forever before begin().
+spool.admit([update(25), update(26)])
+def broken_join(*a): raise OSError("injected spool read failure")
+for attempt in range(inbound.ATTEMPTS):
+    d = adapter(); d.spool.joined = broken_join
+    hurry(spool); assert not d.process_inbound()
+    assert spool.ready()["attempts"] == attempt + 1
+hurry(spool); assert adapter().process_inbound()
+assert sent[-1]["text"].startswith("⚠️ Could not complete this update.")
+assert adapter().process_inbound() and spool.ready() is None
+
+# Persistent writes on initial-skip/final-attempt rows must yield rather than
+# keep the main loop's drain spinning and starve runtime events.
+for ident, initial_skip in ((27, True), (28, False)):
+    spool.admit([update(ident)], initial_skip=initial_skip)
+    if not initial_skip:
+        with spool.db() as db: db.execute("UPDATE pending SET attempts=? WHERE id=?", (inbound.ATTEMPTS, ident))
+    d = adapter()
+    def broken_finish(*a): raise OSError("injected spool write failure")
+    d.spool.finish = broken_finish
+    assert not d.process_inbound() and spool.ready()["id"] == ident
+    assert "outcome=handler_retry" in logs[-1]
+    assert adapter().process_inbound()
+
+# Bad join configuration is rejected at door construction with a content-free
+# fallback warning. No incoming row is stuck behind a conversion exception.
+for invalid in ("not-a-number", [], None, float("nan"), float("inf"), -1, 31):
+    d = door.Door({"door":"phone", "recipient":"liaison"}, dict(cfg, paste_join_seconds=invalid), runtime)
+    assert d.cfg["paste_join_seconds"] == 3
+    assert logs[-1] == "telegram config=paste_join_seconds outcome=invalid_defaulting_to_3"
+spool.admit([update(29)])
+assert d.process_inbound() and spool.ready() is None
+# A transient getMe refusal cannot prevent stable bot-scoped mail identity.
+tg.api = lambda *a, **k: (None, "temporary refusal")
+identity_cfg = {"bot_token": "123:fictional-test-token"}
+assert door.bot_identity(identity_cfg) and identity_cfg["bot_id"] == 123
+assert identity_cfg["bot_username"] == ""
+assert all("fictional-test-token" not in line for line in logs)
 print("durable inbound spool, crash recovery, bounded retries and content-free outcomes passed")
 '''
 
@@ -1063,13 +1117,15 @@ for size in (4095, 4096, 4097):
 assert door.struck("🚢yes", [{"type": "strikethrough", "offset": 1, "length": 1}]) == "~🚢yes~"
 # Slash-leading text is mail unless a complete recognized token is present.
 for text in ("/" + "x" * 4095, "/status-not-a-command " + "漢" * 3600,
-             "/unknown < & _", " /status", "/status@other_bot"):
+             "/unknown < & _", "/status@other_bot"):
     adapter().on_update(update(3, text))
     assert latest()["body"] == text
 commands = []
 d = adapter(); d.command = lambda text, mid: commands.append(text)
 d.on_update(update(4, "/status", entities=[{"type": "bot_command", "offset": 0, "length": 7}]))
-assert commands == ["/status"]
+d.on_update(update(4, " \t/yolo off", entities=[{"type": "bot_command", "offset": 2, "length": 5}]))
+d.on_update(update(4, " /status"))
+assert commands == ["/status", "/yolo off", "/status"]
 for layout in ("\v", "\f", "\x85"):
     for text in (layout + "hello", "hello" + layout, "a" + layout + "b"):
         adapter().on_update(update(5, text))
@@ -1097,7 +1153,9 @@ for parts in (["a" * 3500, " tail"], ["🚢" * 1750, "漢" * 3500, "e\u0301 "]):
     # Isolate ids from the next case, like separate bot state directories.
     tg.STATE_DIR = tempfile.mkdtemp(dir=root)
     tg.remember_target(100, {"ship":"ops","from":"ops","kind":"decision","typed":True,"mail":"ask"})
-for extra in ({}, {"reply_to_message": {"message_id": 100}}, {"entities": [{"type":"bold","offset":0,"length":1}]}):
+for extra in ({}, {"reply_to_message": {"message_id": 100}},
+              {"entities": [{"type":"bold","offset":0,"length":1}]},
+              {"message_thread_id": 9}):
     tg.remember_target(100, {"ship":"ops","from":"ops","kind":"decision","typed":True,"mail":"ask"})
     d = adapter(); start = len(runtime.mail)
     first = "short" if not extra else "x" * 3500
@@ -1149,8 +1207,32 @@ for name, mime, data, inline, reason in (
     d.handle_attachment({"document":{"file_id":"doc","file_name":name,"mime_type":mime,
                                       "file_size":len(data)}}, 60, None)
     assert latest()["payload"]["files"]
-    if inline: assert data.decode() in latest()["body"]
-    else: assert reason in latest()["body"] and reason in notices[-1]
+    if inline:
+        assert data.decode() in latest()["body"]
+        assert "~Attached file text (reference only; no inline approval):~" in latest()["body"]
+    else:
+        assert reason not in latest()["body"] and reason in notices[-1]
+# An ask is answered by the caption only, regardless of attached words or
+# diagnostics. A yes with a binary file still means yes; thanks plus ok is
+# never promoted into approval by inlining file contents.
+tg.remember_target(100, {"ship":"ops","from":"ops","kind":"request","mail":"ask"})
+for caption, contents, name in (("thanks", b"ok", "answer.txt"),
+                                ("thanks", b"Submit build 55", "answer.md"),
+                                ("yes", b"%PDF binary", "answer.pdf")):
+    path = root / name; path.write_bytes(contents)
+    d = adapter(); d.fetch = lambda *a: str(path)
+    d.handle_attachment({"caption":caption, "document":{"file_id":"doc","file_name":name}}, 61, 100)
+    assert latest()["body"] == caption and latest()["payload"]["files"]
+    assert "reference" in notices[-1]
+# Spill success is announced only after mail commit, not on runtime refusal.
+tg.STATE_DIR = tempfile.mkdtemp(dir=root)
+d = adapter(); d.spool.admit([update(65, "漢" * 30000)])
+runtime.refuse = True; before = len(notices)
+hurry(); assert d.process_inbound(); runtime.refuse = False
+assert not any("Full text preserved" in n for n in notices[before:])
+d.spool.admit([update(66, "漢" * 30000)])
+hurry(); assert adapter().process_inbound()
+assert any("Full text preserved" in n for n in notices[before:])
 # Reaction failure is distinct from insertion; fallback warning delivery is
 # checked and retried through the existing durable notice spool.
 tg.STATE_DIR = tempfile.mkdtemp(dir=root)
@@ -1158,7 +1240,8 @@ d = adapter(); d.spool.admit([update(70, "reaction failure")])
 reaction_error = warning_error = True
 before = len(runtime.mail); d.process_inbound()
 assert len(runtime.mail) == before + 1 and latest()["body"] == "reaction failure"
-assert "telegram outcome=reaction_failed" in logs and "telegram outcome=confirmation_failed" in logs
+assert "telegram outcome=reaction_failed" in logs and any("outcome=confirmation_failed" in line for line in logs)
+assert sum("outcome=confirmation_failed" in line for line in logs) == 1
 warning_error = False; hurry(); adapter().retry_notices()
 assert any("outcome=notice_sent" in line for line in logs)
 # Runtime refusal is a checked, bounded notice, not an insertion.
@@ -1741,6 +1824,38 @@ def main() -> int:
                         and "edited" in e["payload"].get("why", "")) for e in revoked_rows), audited
             assert any(e["kind"] == "permissions.approval_edit"
                        and e["payload"].get("state") == "revoked" for e in audited), audited
+
+            # A control-containing edit must reach re-check and revoke the
+            # approval, not get rejected by runtime validation leaving it live.
+            control_step, control_card = approving_request("Build 59 passed CI.", "Submit build 59")
+            control_yes = telegram.message("yes", reply_to=control_card["_message_id"])
+            wait_for("the control-edit approval recorded", lambda: [
+                r for r in approvals_of(control_step["id"]) if r["state"] == "live"])
+            telegram.edit(control_yes, "yes\x1b", reply_to=control_card["_message_id"])
+            wait_for("the control edit revoked", lambda: [
+                r for r in approvals_of(control_step["id"]) if r["state"] == "revoked"])
+            wait_for("the truthful control withdrawal notice", lambda: [
+                m for m in telegram.sent() if "no longer approves" in m["text"]
+                and "Submit build 59" in m["text"]])
+
+            # Text attachments cannot supplement a caption into an approval;
+            # binary-reference diagnostics cannot negate a yes either.
+            for build, caption, contents, name, approves in (
+                    (60, "thanks", b"ok", "answer.txt", False),
+                    (61, "thanks", b"Submit build 61", "answer.md", False),
+                    (62, "yes", b"%PDF binary", "answer.pdf", True)):
+                file_step, file_card = approving_request(
+                    f"Build {build} passed CI.", f"Submit build {build}")
+                telegram.send_file(contents, name, caption=caption, reply_to=file_card["_message_id"])
+                file_reply = wait_for("the caption-only file answer", lambda: [
+                    m for m in fleet.inbox("ops", "ops") if m["kind"] == "reply"
+                    and m["correlation"] == file_step["id"]])[0]
+                assert file_reply["body"] == caption and file_reply["payload"]["files"], file_reply
+                if approves:
+                    wait_for("the PDF caption approval", lambda: [
+                        r for r in approvals_of(file_step["id"]) if r["state"] == "live"])
+                else:
+                    assert not approvals_of(file_step["id"]), approvals_of(file_step["id"])
 
             # An edit that still approves changes nothing; a struck-through
             # yes no longer does.

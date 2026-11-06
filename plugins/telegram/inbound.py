@@ -119,6 +119,11 @@ class Spool:
             db.execute("UPDATE pending SET attempts=attempts+1,next_at=? WHERE id=?",
                        (time.time() + RETRY_SECONDS, ident))
 
+    def defer(self, ident):
+        """A healthy paste wait is not a failed handling attempt."""
+        with self.db() as db:
+            db.execute("UPDATE pending SET attempts=attempts-1,next_at=0 WHERE id=?", (ident,))
+
     def submission(self, ident, args, msg_id, label):
         with self.db() as db:
             db.execute("UPDATE pending SET submission=coalesce(submission,?) WHERE id=?",

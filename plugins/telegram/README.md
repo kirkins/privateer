@@ -79,9 +79,10 @@ markers, including around emoji, so formatting cannot turn a struck approval
 into a plain yes. Ordinary synthetic updates above that platform cap also
 forward. Whitespace at text and paste boundaries is preserved.
 
-Consecutive **plain-text** parts from the same authorized chat **and user**
-join when the earlier part is at least 3500 UTF-16 units and the next arrives
-within `paste_join_seconds` (default 3, range 0–30; 0 disables). The threshold
+Consecutive **plain-text** parts from the same authorized chat, **user and
+forum topic** join when the earlier part is at least 3500 UTF-16 units and the next arrives
+within `paste_join_seconds` (default 3, range 0–30; 0 disables; invalid values
+log a warning and fall back to 3). The threshold
 leaves modest room below Telegram's 4096 cap for client splitting. Both update
 arrival and Telegram message timestamps (when present) determine eligibility.
 Replies, commands (including unknown slash-leading text), formatting, edits
@@ -106,16 +107,21 @@ bound and Telegram bot download limit (20 MB, optionally lower via
 
 UTF-8 documents with `.txt`, `.md`, `.markdown` or a plain-text/Markdown MIME
 type include their contents in the mail body alongside the stored reference
-while the envelope fits. Binary, invalid UTF-8, control-containing and oversized
-documents remain file references with a visible reason. At text ingress,
+while the envelope fits, behind a struck, non-affirmative reference-only header.
+Replies to asks never inline file text: only the captain's caption answers,
+so a file cannot supplement “thanks” into an approval. Binary, invalid UTF-8,
+control-containing and oversized documents remain file references with a visible
+reason sent separately to the captain, outside the approval-judged body. At text ingress,
 **VT (U+000B), FF (U+000C) and NEL (U+0085) normalize one-for-one to LF**;
 TAB, LF, CR and Unicode U+2028/U+2029 remain. Other Cc controls are refused
 with a bounded warning naming only the code point and its 1-based Unicode
 character position, never the rejected text. The runtime control policy is
-unchanged.
+unchanged. Edits containing rejected controls are re-checked with a safe,
+non-affirmative replacement, so a validation refusal cannot leave an earlier
+approval standing.
 
-Only complete recognized slash-command tokens at offset zero dispatch as
-commands (Telegram's `bot_command` entity is preferred when supplied). Other
+Only complete recognized slash-command tokens after optional leading whitespace
+dispatch as commands (Telegram's `bot_command` entity is preferred when supplied). Other
 slash-leading pastes, including literal `<`, `&` and `_`, are ordinary mail.
 Reaction and fallback-notice outcomes are logged without content; a missing
 reaction does not mean insertion failed. A send timeout is uncertain, retried
