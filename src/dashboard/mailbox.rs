@@ -191,7 +191,7 @@ impl Mailbox {
                             kind: m["kind"].as_str().unwrap_or("").into(),
                             from: m["from"].as_str().unwrap_or("").into(),
                             subject: subject_line(&preview),
-                            body: body.into(),
+                            body,
                             payload: m["payload"].clone(),
                             status: m["state"].as_str().unwrap_or("unread").into(),
                             home: Some(home.clone()),

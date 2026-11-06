@@ -2001,7 +2001,7 @@ fn send_with_bound(
             && existing["premise"]
                 == premise
                     .as_deref()
-                    .map(|p| serde_json::from_str::<Value>(p))
+                    .map(serde_json::from_str::<Value>)
                     .transpose()?
                     .unwrap_or(Value::Null)
             && existing["task_id"] == json!(task_id)
