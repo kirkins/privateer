@@ -207,7 +207,9 @@ fn child_status_times_track_real_edges_including_scheduler_writes() {
     );
 }
 
-/// The schedule record a dispatcher stores, as one JSON row.
+/// One schedule row a hand-written rendering test needs. Only the fields
+/// the child lines read are set: the dispatcher's real record format,
+/// including how a fault is stored, is covered in tests/scheduling.rs.
 fn schedule_row(s: &mut Store, record: &Value) {
     s.connection()
         .execute(
@@ -217,46 +219,68 @@ fn schedule_row(s: &mut Store, record: &Value) {
         .unwrap();
 }
 
-/// A child whose scheduled execution sits in a live fault is marked beside
-/// its task status with the fault's reason as a JSON fact, and a schedule
-/// that left the fault (re-deferred here) or never faulted reads plain.
+/// How the fault mark renders from a schedule row: a row in state 'fault'
+/// marks an open or running child with the fault's reason as a JSON fact, a
+/// row that left the fault or never faulted does not, and a closed child
+/// never carries the mark, whatever its row still holds. A fault with no
+/// reason still marks, a reason that is not a string renders no reason
+/// without failing the read, and a long reason is capped.
 #[test]
-fn a_live_schedule_fault_marks_the_child_line_with_its_reason() {
+fn child_lines_render_a_live_schedule_fault_row() {
     let (temp, mut s) = fleet();
-    child(&mut s, "runner", "repair");
-    child(&mut s, "held", "repair");
-    child(&mut s, "plain", "repair");
-    dispatch(
-        &mut s,
-        "task.update",
-        json!({"id":"runner","actor":"infra","status":"running"}),
-    )
-    .unwrap();
-    dispatch(
-        &mut s,
-        "task.update",
-        json!({"id":"held","actor":"infra","status":"blocked"}),
-    )
-    .unwrap();
-    let base = |id: &str, state: &str, reason: &str| {
-        json!({"task_id":id,"owner":"infra","revision":2,"brief":"Run the isolated fixture",
-            "state":state,"not_before_ms":0,"offer_id":null,"holder":null,"job_id":null,
-            "profile":null,"charter_hash":null,"attempts":1,"created_ms":1,
-            "last_checked_ms":2,"lease_until_ms":0,"reason":reason})
+    for (id, status) in [
+        ("runner", "running"),
+        ("held", "blocked"),
+        ("plain", "open"),
+        ("closed", "done"),
+        ("silent", "open"),
+        ("odd", "open"),
+        ("long", "open"),
+    ] {
+        child(&mut s, id, "repair");
+        dispatch(
+            &mut s,
+            "task.update",
+            json!({"id":id,"actor":"infra","status":status}),
+        )
+        .unwrap();
+    }
+    let row = |id: &str, extra: Value| {
+        let mut record = json!({"task_id":id,"state":"fault"});
+        if let Value::Object(fields) = extra {
+            for (key, value) in fields {
+                record[key] = value;
+            }
+        }
+        record
     };
-    // One live fault, one wait that resolved a fault (re-deferred).
-    let mut faulted = base(
-        "runner",
-        "fault",
-        "Coordinator ended without completion, live child work or a typed wait",
+    schedule_row(
+        &mut s,
+        &row(
+            "runner",
+            json!({"faulted_ms":2,
+            "reason":"Coordinator ended without completion, live child work or a typed wait"}),
+        ),
     );
-    faulted["faults"] = json!(1);
-    faulted["faulted_ms"] = json!(2);
-    schedule_row(&mut s, &faulted);
-    let mut waiting = base("held", "waiting", "The owner holds it");
-    waiting["wait"] =
-        json!({"kind":"time","reason":"The owner holds it","until_ms":9_000_000_000_000i64});
-    schedule_row(&mut s, &waiting);
+    schedule_row(&mut s, &json!({"task_id":"held","state":"waiting"}));
+    schedule_row(
+        &mut s,
+        &row(
+            "closed",
+            json!({"faulted_ms":3,
+            "reason":"Execution claim expired without proven completion or a typed wait"}),
+        ),
+    );
+    schedule_row(&mut s, &row("silent", json!({"faulted_ms":4})));
+    schedule_row(&mut s, &row("odd", json!({"faulted_ms":5,"reason":7})));
+    schedule_row(
+        &mut s,
+        &row(
+            "long",
+            json!({"faulted_ms":6,
+            "reason":"Coordinator ended without completion. ".repeat(30)}),
+        ),
+    );
     let read = read_parent(&mut s);
     let lines = read["child_status"]["children"]
         .as_array()
@@ -269,8 +293,23 @@ fn a_live_schedule_fault_marks_the_child_line_with_its_reason() {
         json!({"reason":"Coordinator ended without completion, live child work or a typed wait",
             "faulted_ms":2})
     );
+    // A fault with no reason, or one that is not a string, still marks.
+    assert_eq!(
+        lines["silent"]["scheduling_fault"],
+        json!({"reason":null,"faulted_ms":4})
+    );
+    assert_eq!(
+        lines["odd"]["scheduling_fault"],
+        json!({"reason":null,"faulted_ms":5})
+    );
+    let capped = lines["long"]["scheduling_fault"]["reason"]
+        .as_str()
+        .unwrap();
+    assert_eq!(capped.chars().count(), 1000);
+    assert!(capped.starts_with("Coordinator ended without completion."));
     assert_eq!(lines["held"]["scheduling_fault"], Value::Null);
     assert_eq!(lines["plain"]["scheduling_fault"], Value::Null);
+    assert_eq!(lines["closed"]["scheduling_fault"], Value::Null);
     let digest = dispatch(
         &mut s,
         "focus.digest",
@@ -284,9 +323,20 @@ fn a_live_schedule_fault_marks_the_child_line_with_its_reason() {
         read["child_status"]
     );
     let text = bearings["text"].as_str().unwrap();
-    assert!(text.contains("- runner [running, sched fault]"), "{text}");
-    assert!(text.contains("- held [blocked]"), "{text}");
-    assert!(text.contains("- plain [open]"), "{text}");
+    let line = |id: &str| {
+        text.lines()
+            .find(|l| l.starts_with(&format!("- {id} ")))
+            .unwrap_or_else(|| panic!("{id} line missing: {text}"))
+            .to_owned()
+    };
+    assert!(line("runner").starts_with("- runner [running, sched fault] "));
+    assert!(line("silent").starts_with("- silent [open, sched fault] "));
+    assert!(line("odd").starts_with("- odd [open, sched fault] "));
+    assert!(line("long").starts_with("- long [open, sched fault] "));
+    assert!(line("held").starts_with("- held [blocked] "));
+    assert!(line("plain").starts_with("- plain [open] "));
+    // A closed child never carries the mark, whatever its row still holds.
+    assert!(line("closed").starts_with("- closed [done] "));
     // The mark is durable fact, not a derived hint: it survives a restart.
     drop(s);
     let mut s = Store::open(&temp.path().join("home")).unwrap();

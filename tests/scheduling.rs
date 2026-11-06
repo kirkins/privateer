@@ -868,6 +868,65 @@ fn a_faulted_child_is_marked_on_its_parents_lines_until_resolved() {
     );
 }
 
+/// A child that closes while its fault was never cleared must not carry
+/// the mark: a live job in its tree keeps its claim, so the closing status
+/// cannot supersede the fault, and the line drops the mark through its own
+/// closing-status check anyway, like the needs observation.
+#[test]
+fn a_closed_child_keeps_no_fault_mark_even_where_the_record_holds_it() {
+    let mut fleet = Fleet::new(json!({}));
+    for (id, parent) in [("plan", None), ("mark", Some("plan"))] {
+        call(
+            &mut fleet,
+            "task.create",
+            json!({"id":id,"parent":parent,"charter_id":"fleet","owner":"infra",
+                "title":"Fault-marked repair work"}),
+        );
+    }
+    attend(&mut fleet);
+    call(
+        &mut fleet,
+        "task.enqueue",
+        json!({"id":"mark","brief":"Run the isolated fixture and verify it."}),
+    );
+    assert!(poll(&mut fleet, true)["offer"].is_object());
+    expire_to_fault(&mut fleet, "mark");
+    // A live job in the child's tree keeps its claim, so the closing status
+    // below cannot supersede the fault out of the schedule record.
+    fleet
+        .store
+        .connection()
+        .execute(
+            "INSERT INTO jobs(id,record) VALUES('live',?1)",
+            [json!({"task_id":"mark","status":"running"}).to_string()],
+        )
+        .unwrap();
+    call(
+        &mut fleet,
+        "task.update",
+        json!({"id":"mark","actor":"infra","status":"done"}),
+    );
+    assert_eq!(
+        schedule_record(&mut fleet, "mark")["state"],
+        "fault",
+        "the live job kept the fault in the record"
+    );
+    let read = call(
+        &mut fleet,
+        "note.get",
+        json!({"ship":"infra","focus":"task:plan"}),
+    );
+    assert_eq!(
+        read["child_status"]["children"][0]["scheduling_fault"],
+        json!(null),
+        "{read}"
+    );
+    let bearings = call(&mut fleet, "ship.bearings", json!({"ship":"infra"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(text.contains("- mark [done]"), "{text}");
+    assert!(!text.contains("sched fault"), "{text}");
+}
+
 /// The stored schedule record, as one JSON value.
 fn schedule_record(fleet: &mut Fleet, id: &str) -> Value {
     serde_json::from_str(
