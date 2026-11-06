@@ -540,6 +540,8 @@ struct Session<'a> {
     upgrade_confirm: Option<(String, Value, Instant)>,
     /// Visible routing hint for this response only, never execution authority.
     reply_recipient: Option<String>,
+    /// Member homes skipped during the current remote correlated send lookup.
+    legacy_skipped_homes: Vec<String>,
 }
 
 impl<'a> Session<'a> {
@@ -663,6 +665,7 @@ impl<'a> Session<'a> {
             emitted: HashSet::new(),
             upgrade_confirm: None,
             reply_recipient: None,
+            legacy_skipped_homes: Vec::new(),
             digest_check: None,
             digest_now: false,
         };
@@ -1408,11 +1411,13 @@ impl<'a> Session<'a> {
             self.sent.clear();
         }
         let door = self.door.name.clone();
+        let skipped_homes = self.legacy_skipped_homes.clone();
         let store = self.store(&home)?;
         let sent = crate::mail::dispatch(store, "mail.send", mail)?;
         store.audit(
             "door.send",
-            &json!({"door": door, "to": to, "mail": sent["id"], "kind": kind}),
+            &json!({"door": door, "to": to, "mail": sent["id"], "kind": kind,
+                "skipped_homes": skipped_homes}),
         )?;
         Ok(json!({"ship": to, "mail": sent, "returned": returned}))
     }

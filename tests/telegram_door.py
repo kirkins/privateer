@@ -297,7 +297,7 @@ class Runtime:
 runtime = Runtime()
 d = door.Door({"door":"t"}, {"chat_id":"42", "allowed_user_ids":[7]}, runtime)
 d.say = lambda text, **kwargs: (said.append(text) or (99, ""))
-tg.api = lambda cfg, method, params, **kwargs: (calls.append(method) or ({}, ""))
+tg.api = lambda cfg, method, params, **kwargs: (calls.append((method, params)) or ({}, ""))
 tg.write_state(door.DECISIONS, {"key":{"mail":"ask", "from":"remote",
     "options":["East"], "ids":["east"]}})
 markup = {"inline_keyboard":[[{"text":"East", "callback_data":"d:key:0"}]]}
@@ -306,18 +306,39 @@ query = {"id":"q", "data":"d:key:0", "from":{"id":7},
     "message":{"message_id":10, "chat":{"id":42}}}
 for failure in ["unknown correlated message ask", "Privateer did not answer send within 30s"]:
     runtime.failure = failure
+    calls.clear()
     try:
         d.on_callback(query)
     except RuntimeError:
         assert failure.startswith("Privateer did not answer")
     assert tg.read_state(door.CARDS, {})["ask"]["markup"] == markup
-    assert "editMessageReplyMarkup" not in calls
+    assert not any(method == "editMessageReplyMarkup" for method, _ in calls)
+    assert not any(method == "answerCallbackQuery" and params.get("text")
+                   for method, params in calls), calls
 assert any("not sent" in text for text in said)
+runtime.failure = "mail already answered"
+calls.clear()
+before = len(submissions)
+d.on_callback(query)
+assert len(submissions) == before + 1, submissions[before:]
+assert "Already answered" in [params.get("text") for method, params in calls
+                               if method == "answerCallbackQuery"], calls
+assert tg.read_state(door.CARDS, {})["ask"]["markup"] == markup
 runtime.failure = None
 d.on_callback(query)
 assert tg.read_state(door.CARDS, {})["ask"]["markup"] is None
-assert calls.count("editMessageReplyMarkup") == 1
+assert sum(method == "editMessageReplyMarkup" for method, _ in calls) == 1
 assert submissions[-1][1]["payload"]["answer"] == {"option_id":"east"}
+tg.write_state(door.DECISIONS, {})
+calls.clear()
+d.on_callback(query)
+unknown_toast = [params.get("text") for method, params in calls
+                 if method == "answerCallbackQuery"]
+assert unknown_toast == ["Decision details are unavailable; reply to its message instead"], calls
+query["data"] = "d:malformed"
+calls.clear()
+d.on_callback(query)
+assert any(method == "answerCallbackQuery" for method, _ in calls), calls
 '''
     out = subprocess.run([sys.executable, "-c", probe, str(ROOT / "plugins" / "telegram")],
                          capture_output=True, text=True, cwd=ROOT)
@@ -425,10 +446,10 @@ class Put:
         self.seen.append(args)
         return {"file_id": "file7", "name": args["name"]}
 
-def phone(runtime, path, msg_id, spoken=None):
+def phone(runtime, path, msg_id, spoken=None, send_result=True):
     d = door.Door({"door": "t", "recipient": "ops"}, {"tts": {}}, runtime)
     d.say = lambda text, *a, **k: (spoken.append(text) if spoken is not None else None, "")
-    d.send = lambda args, msg_id, label: sent.append(args)
+    d.send = lambda args, msg_id, label: (sent.append(args), send_result)[1]
     d.route = lambda text, msg_id, reply_to: {"to": "ops", "kind": "request", "body": text}
     d.fetch = lambda file_id, name, msg_id: path
     msg = {"message_id": msg_id, "document": {
@@ -445,6 +466,11 @@ refused = os.path.join(tg.inbox_dir(), "refused.bin")
 open(refused, "wb").write(b"refused bytes")
 phone(Refuse(), refused, 5, warned)
 out["refusal"], out["warned"] = sent[-1], warned
+not_committed = os.path.join(tg.inbox_dir(), "not-committed.bin")
+open(not_committed, "wb").write(b"not committed")
+not_committed_notice = []
+phone(NoPut(), not_committed, 7, not_committed_notice, send_result=False)
+out["not_committed_notice"] = not_committed_notice
 seen = []
 stored = os.path.join(tg.inbox_dir(), "stored.bin")
 open(stored, "wb").write(b"stored bytes")
@@ -477,6 +503,7 @@ def check_attachment_put_and_fallback() -> None:
     assert got["kept"], got
     assert "unknown door command" in got["quiet"][0] and "couldn't hand" in got["quiet"][0], got["quiet"]
     assert "File kept as a reference" in got["quiet"][-1], got["quiet"]
+    assert not any("File kept as a reference" in line for line in got["not_committed_notice"]), got
     refusal = got["refusal"]
     warned = "⚠️ couldn't hand notes.bin to ops: cannot reach ship macops"
     assert warned in got["warned"][0], got["warned"]
@@ -1081,11 +1108,20 @@ for invalid in ("not-a-number", [], None, float("nan"), float("inf"), -1, 31):
     assert logs[-1] == "telegram config=paste_join_seconds outcome=invalid_defaulting_to_3"
 spool.admit([update(29)])
 assert d.process_inbound() and spool.ready() is None
-# A transient getMe refusal cannot prevent stable bot-scoped mail identity.
-tg.api = lambda *a, **k: (None, "temporary refusal")
+# A transient getMe refusal cannot prevent stable bot-scoped mail identity,
+# and a background refresh retries until Telegram returns the username.
 identity_cfg = {"bot_token": "123:fictional-test-token"}
 assert door.bot_identity(identity_cfg) and identity_cfg["bot_id"] == 123
 assert identity_cfg["bot_username"] == ""
+responses = [(None, "temporary refusal"), ({"username": "test_bot"}, "")]
+tg.api = lambda *a, **k: responses.pop(0)
+class FastStop:
+    def __init__(self): self.waits = []
+    def is_set(self): return False
+    def wait(self, seconds): self.waits.append(seconds); return False
+stop = FastStop()
+door.refresh_bot_username(identity_cfg, stop)
+assert identity_cfg["bot_username"] == "test_bot" and stop.waits == [1]
 assert all("fictional-test-token" not in line for line in logs)
 print("durable inbound spool, crash recovery, bounded retries and content-free outcomes passed")
 '''
