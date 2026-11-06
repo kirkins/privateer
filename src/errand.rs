@@ -57,6 +57,14 @@ pub fn init(store: &Store) -> Result<()> {
     if !has_model_route {
         tx.execute_batch("ALTER TABLE errands ADD COLUMN model_route TEXT;")?;
     }
+    let has_route_info: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('errands') WHERE name='route_info')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_route_info {
+        tx.execute_batch("ALTER TABLE errands ADD COLUMN route_info TEXT;")?;
+    }
     tx.commit()?;
     crate::herdr::errands::init(store)?;
     Ok(())
@@ -326,9 +334,9 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
     // Recorded before its job exists, so launch planning treats it as the
     // first mate's own headless session rather than crew.
     store.connection().execute(
-        "INSERT INTO errands(id, ship, focus, task_id, brief, mode, status, created_ms, harness, session_id, route, route_why, model_route)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![id, ship, focus, task_id, brief, mode, Store::now_ms(), harness, resume, route_name, route_why, model_route],
+        "INSERT INTO errands(id, ship, focus, task_id, brief, mode, status, created_ms, harness, session_id, route, route_why, model_route, route_info)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![id, ship, focus, task_id, brief, mode, Store::now_ms(), harness, resume, route_name, route_why, model_route, route_info.to_string()],
     )?;
     let mut launch = json!({"id": id, "task_id": task_id, "manifest": manifest,
         "options": options, "wake": text});

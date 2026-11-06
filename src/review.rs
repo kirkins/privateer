@@ -37,6 +37,7 @@
 
 pub mod authors;
 mod filter;
+mod import;
 mod pr;
 mod prompt;
 mod publish;
@@ -89,6 +90,14 @@ pub fn init(store: &Store) -> Result<()> {
     )?;
     if !has_kind {
         tx.execute_batch("ALTER TABLE reviews ADD COLUMN kind TEXT NOT NULL DEFAULT 'gate';")?;
+    }
+    let has_imported_ms: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('reviews') WHERE name='imported_ms')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_imported_ms {
+        tx.execute_batch("ALTER TABLE reviews ADD COLUMN imported_ms INTEGER;")?;
     }
     tx.commit()?;
     Ok(())
@@ -866,7 +875,8 @@ fn summary(review: &Value) -> String {
 const COLUMNS: &str = "id, ship, task_id, forge, repo, pr, base_ref, base_sha, head_ref, head_sha,
     errand_id, route_name, route_identity, route_model, route_tier, route_uses, route_why, overlap,
     fresh, authors, declared, verdict, findings, refusal, post_state, created_ms, finished_ms,
-    cleaned_ms, clone, kind, forge_review_id, post_error, posted_ms, merged_ms, merge_sha";
+    cleaned_ms, clone, kind, forge_review_id, post_error, posted_ms, merged_ms, merge_sha,
+    imported_ms";
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     let parsed = |at: usize| -> rusqlite::Result<Value> {
@@ -892,6 +902,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "kind": r.get::<_, String>(29)?, "forge_comment": r.get::<_, Option<String>>(30)?,
         "post_error": r.get::<_, Option<String>>(31)?, "posted_ms": r.get::<_, Option<i64>>(32)?,
         "merged_ms": r.get::<_, Option<i64>>(33)?, "merge_sha": r.get::<_, Option<String>>(34)?,
+        "imported_ms": r.get::<_, Option<i64>>(35)?,
     }))
 }
 
@@ -1365,6 +1376,7 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
 /// The argument keys of each command here; see `crate::Accepted`.
 pub(crate) const ACCEPTED: crate::Accepted = &[
     ("review.list", &["ship", "pr", "repo"]),
+    ("review.record", &["errand_id", "pr", "head_sha"]),
     (
         "review.start",
         &["task_id", "pr", "repo", "notes", "author_routes"],
@@ -1379,6 +1391,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
     match command {
         "review.start" => start(store, &args),
         "review.list" => list(store, &args),
+        "review.record" => import::record(store, &args),
         "pr.merge" => merge(store, &args),
         _ => bail!("unknown review command {command}"),
     }

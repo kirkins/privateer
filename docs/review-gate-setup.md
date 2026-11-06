@@ -2,6 +2,35 @@
 
 > **Superseded on 2026-10-21.** The captain dropped the review gate (PR #333 closed unmerged). The merge rule is now: a ship merges its own pull request once CI is green and Opus 5.5 wrote the change or approved its current head. Nothing here gates a merge. `pr.merge` merges for real: a plain merge (`gh pr merge --merge --match-head-commit`) at exactly the head it read, once the PR is open into the protected branch and green, and it records the coverage (the tier-1 review route's approval that covered the head, approvals that do not cover, changes requested since, and who wrote the commits no review covered), merging either way. Reviews, `review.start` or `errand.start` with `review`, are recorded in `review.list` and, with `publish_review`, posted to the PR as a comment built from the record. The branch-protection setup steps below are not needed.
 
+## Import a finished errand locally (current)
+
+`review.record {"errand_id":"errand-…","pr":42,"head_sha":"<full 40-character sha>"}`
+imports an ordinary, successfully finished errand into `review.list`. This is a
+first-mate command, bound to the caller's ship. It does **not** read the live PR,
+fetch commits, call a forge adapter, start another review, or post a comment.
+Use `review.start` or `errand.start` with `review` when a new review is needed.
+
+Only these three arguments are accepted. The runtime reads the errand's saved
+route name, identity, model, strength, reply and confirmed verdict mail. The
+reply must end with exactly one `VERDICT: APPROVE` or
+`VERDICT: CHANGES_REQUESTED` line; findings use the same `FINDING` parser and
+filter as an errand review. An approval with a must-fix finding is refused.
+The brief or reply must name the full head SHA exactly as passed; missing,
+short, conflicting or multiple different SHAs are refused rather than guessed.
+For example, the saved brief can say `Review PR #42 at head <full sha>`.
+Failed or unfinished errands and another ship's errands are refused.
+
+The record has `kind: "imported"`, `errand_id`, `imported_ms`, the original
+`finished_ms`, and `post_state: "none"` (not posted). Repeating the command for
+an already recorded errand returns its existing record, without retargeting it
+or posting anything. New errands snapshot tier and uses at launch; legacy
+errands lacking that snapshot retain unknown tier and empty uses, rather than
+inventing historical strength from today's routes. `pr.merge` considers an
+imported approval on the matching head exactly as any other recorded approval,
+under its existing current-route coverage rules.
+
+## Historical setup kit
+
 This kit sets up the top-tier review gate and routes for GitHub and Forgejo repositories, as specified in the [review gate design](design/review-gate-and-route-strength.md).
 
 Every step requiring direct manual operator execution is marked **[hands]**. Non-[hands] steps are performed by the runtime or crew PRs.

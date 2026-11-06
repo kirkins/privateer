@@ -74,7 +74,8 @@ else:
     if caller.exists():
         env = dict(os.environ, BIN={bin:?}, H={home:?}, LOG=str(root / "calls.log"))
         subprocess.run(["sh", str(caller)], env=env)
-    text = "done"
+    plain_reply = root / "plain-reply.txt"
+    text = plain_reply.read_text() if plain_reply.exists() else "done"
 (launches / (job + ".json")).write_text(json.dumps(record))
 session = "session-" + job
 print(json.dumps({{"type": "system", "subtype": "init", "session_id": session}}))
@@ -1069,6 +1070,216 @@ fn a_declared_route_is_trusted_recorded_and_shown() {
 /// Routes where Opus reviews and runs errands.
 fn opus_errands() -> Value {
     json!({"routes": {"opus": opus()}, "review": ["opus"], "errand": ["opus"]})
+}
+
+/// An ordinary errand: no review purpose, hence no forge request at launch
+/// or settlement. Import its runtime-owned reply only after it is settled.
+fn finished_plain_errand(f: &Fleet, brief: &str, reply: &str) -> String {
+    fs::write(f.root.join("plain-reply.txt"), reply).unwrap();
+    let started = f.json(
+        Some("engineering"),
+        "errand.start",
+        json!({"focus": "task:fix", "brief": brief, "route": "opus"}),
+    );
+    let id = started["errand"].as_str().unwrap();
+    f.settled(id);
+    f.tick();
+    id.to_owned()
+}
+
+#[test]
+fn review_record_imports_locally_once_and_covers_the_exact_merge_head() {
+    let f = Fleet::new();
+    f.routes(opus_errands());
+    let head = f.commit("feature", &[], "Fix");
+    f.pr(72, &head, "feature");
+    let id = finished_plain_errand(
+        &f,
+        &format!("Review PR #72 at head {head}."),
+        "FINDING nit src/lib.rs:1 spelling\nVERDICT: APPROVE",
+    );
+    // Prove the snapshot is historical, not reconstructed at import time.
+    f.routes(
+        json!({"routes": {"opus": tiered("claude-sonnet-4-6", 2, &["implement"])},
+        "errand": ["opus"]}),
+    );
+    let args = json!({"errand_id": id, "pr": 72, "head_sha": head});
+    // Race real CLI importers: both must return the same one durable row.
+    let first = f
+        .command(
+            Some("engineering"),
+            &["review.record", "--json", &args.to_string()],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let row = f.json(Some("engineering"), "review.record", args.clone());
+    let output = first.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        row
+    );
+    assert_eq!(row["kind"], "imported");
+    assert_eq!(row["errand_id"], id);
+    assert_eq!(row["head_sha"], head);
+    assert_eq!(row["route_name"], "opus");
+    assert_eq!(row["route_identity"], "claude/-/claude-opus-5-5");
+    assert_eq!(row["route_model"], "claude-opus-5-5");
+    assert_eq!(row["route_tier"], 1);
+    assert_eq!(row["route_uses"], json!(["review", "implement"]));
+    assert_eq!(row["verdict"], "approve");
+    assert_eq!(row["findings"][0]["severity"], "nit");
+    assert_eq!(row["post_state"], "none");
+    assert!(row["imported_ms"].is_i64());
+    assert!(row["posted_ms"].is_null());
+    // Retry cannot retarget an already imported errand to another PR/head.
+    assert_eq!(
+        f.json(
+            Some("engineering"),
+            "review.record",
+            json!({"errand_id": id, "pr": 73, "head_sha": "b".repeat(40)})
+        ),
+        row
+    );
+    let listed = f.json(Some("engineering"), "review.list", json!({"pr": 72}));
+    assert_eq!(listed["reviews"], json!([row.clone()]));
+    assert!(
+        !f.root.join("adapter.log").exists(),
+        "import contacted the forge"
+    );
+    // Coverage follows the existing merge rule (current tier-1 routes).
+    f.routes(opus_errands());
+    let merged = f.json(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "fix", "pr": 72}),
+    );
+    assert_eq!(merged["coverage"], "reviewed", "{merged}");
+    assert_eq!(merged["review"]["id"], row["id"]);
+    assert_eq!(merged["review"]["kind"], "imported");
+    assert_eq!(f.row(row["id"].as_str().unwrap())["post_state"], "none");
+}
+
+#[test]
+fn review_record_accepts_a_head_in_the_verdict_and_preserves_legacy_unknown_strength() {
+    let f = Fleet::new();
+    f.routes(opus_errands());
+    let head = f.commit("feature", &[], "Fix");
+    let id = finished_plain_errand(
+        &f,
+        "Review the widget",
+        &format!(
+            "Reviewed head {head}\nFINDING must-fix src/lib.rs:1 incorrect result\nVERDICT: CHANGES_REQUESTED"
+        ),
+    );
+    let db = rusqlite::Connection::open(f.home().join("privateer.sqlite")).unwrap();
+    db.execute("UPDATE errands SET route_info=NULL WHERE id=?1", [&id])
+        .unwrap();
+    let row = f.json(
+        Some("engineering"),
+        "review.record",
+        json!({"errand_id": id, "pr": 75, "head_sha": head}),
+    );
+    assert_eq!(row["verdict"], "changes_requested");
+    assert_eq!(row["findings"][0]["severity"], "must-fix");
+    assert_eq!(row["route_name"], "opus");
+    assert_eq!(row["route_model"], "claude-opus-5-5");
+    assert!(row["route_tier"].is_null());
+    assert_eq!(row["route_uses"], json!([]));
+    assert!(!f.root.join("adapter.log").exists());
+}
+
+#[test]
+fn review_record_refuses_untrusted_or_ambiguous_errand_evidence_without_forge_calls() {
+    let f = Fleet::new();
+    f.routes(opus_errands());
+    let head = f.commit("feature", &[], "Fix");
+    let id = finished_plain_errand(&f, &format!("Review head {head}"), "VERDICT: APPROVE");
+    let args = json!({"errand_id": id, "pr": 74, "head_sha": head});
+    let refuse = |args: Value, why: &str| {
+        let error = f.refused(Some("engineering"), "review.record", args);
+        assert!(error.contains(why), "{error}");
+    };
+    let mut spoofed = args.clone();
+    spoofed["route_tier"] = json!(1);
+    refuse(spoofed, "route_tier");
+    refuse(
+        json!({"errand_id": id, "pr": 74, "head_sha": "b".repeat(40)}),
+        "does not exactly match",
+    );
+    refuse(
+        json!({"errand_id": id, "pr": 74, "head_sha": &head[..7]}),
+        "full 40-character",
+    );
+    // Mutate only the isolated fixture to exercise failed, incomplete and
+    // foreign records without timing-dependent races against a supervisor.
+    let db = rusqlite::Connection::open(f.home().join("privateer.sqlite")).unwrap();
+    db.execute("UPDATE errands SET ship='navigation' WHERE id=?1", [&id])
+        .unwrap();
+    refuse(args.clone(), "is not engineering's");
+    db.execute(
+        "UPDATE errands SET ship='engineering', status='running' WHERE id=?1",
+        [&id],
+    )
+    .unwrap();
+    refuse(args.clone(), "has not finished successfully");
+    db.execute("UPDATE errands SET status='failed' WHERE id=?1", [&id])
+        .unwrap();
+    refuse(args.clone(), "has not finished successfully");
+    db.execute(
+        "UPDATE errands SET status='succeeded', verdict='Looks fine' WHERE id=?1",
+        [&id],
+    )
+    .unwrap();
+    refuse(args.clone(), "single VERDICT line");
+    db.execute(
+        "UPDATE errands SET verdict='VERDICT: APPROVE\nVERDICT: APPROVE' WHERE id=?1",
+        [&id],
+    )
+    .unwrap();
+    refuse(args.clone(), "single VERDICT line");
+    db.execute(
+        "UPDATE errands SET verdict='VERDICT: APPROVE\nmore text' WHERE id=?1",
+        [&id],
+    )
+    .unwrap();
+    refuse(args.clone(), "no final VERDICT line");
+    db.execute(
+        "UPDATE errands SET verdict=?2 WHERE id=?1",
+        rusqlite::params![
+            id,
+            format!("Reviewed head {}\nVERDICT: APPROVE", "b".repeat(40))
+        ],
+    )
+    .unwrap();
+    refuse(args.clone(), "does not exactly match");
+    db.execute("UPDATE errands SET verdict='FINDING must-fix src/lib.rs:1 wrong\nVERDICT: APPROVE' WHERE id=?1", [&id]).unwrap();
+    refuse(args.clone(), "must-fix finding");
+    db.execute(
+        "UPDATE errands SET verdict='VERDICT: APPROVE', brief='Review it' WHERE id=?1",
+        [&id],
+    )
+    .unwrap();
+    refuse(args.clone(), "must name one full head sha");
+    db.execute(
+        "UPDATE errands SET brief=?2 WHERE id=?1",
+        rusqlite::params![id, format!("Review {head}")],
+    )
+    .unwrap();
+    db.execute("DELETE FROM mail WHERE id=?1", [format!("{id}-verdict")])
+        .unwrap();
+    refuse(args, "no confirmed verdict mail");
+    assert_eq!(f.json(None, "review.list", json!({}))["reviews"], json!([]));
+    assert!(
+        !f.root.join("adapter.log").exists(),
+        "refusal contacted the forge"
+    );
 }
 
 #[test]
