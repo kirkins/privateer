@@ -2,6 +2,56 @@
 
 > **Superseded on 2026-10-21.** The captain dropped the review gate (PR #333 closed unmerged). The merge rule is now: a ship merges its own pull request once CI is green and Opus 5.5 wrote the change or approved its current head. Nothing here gates a merge. `pr.merge` merges for real: a plain merge (`gh pr merge --merge --match-head-commit`) at exactly the head it read, once the PR is open into the protected branch and green, and it records the coverage (the tier-1 review route's approval that covered the head, approvals that do not cover, changes requested since, and who wrote the commits no review covered), merging either way. Reviews, `review.start` or `errand.start` with `review`, are recorded in `review.list` and, with `publish_review`, posted to the PR as a comment built from the record. The branch-protection setup steps below are not needed.
 
+## Import a finished errand locally (current)
+
+`review.record {"errand_id":"errand-…","pr":42,"head_sha":"<full 40-character sha>"}`
+imports an ordinary, successfully finished errand into `review.list`. This is a
+first-mate command, bound to the caller's ship. It does **not** read the live PR,
+fetch commits, call a forge adapter, start another review, or post a comment.
+Use `review.start` or `errand.start` with `review` when a new review is needed.
+
+These three arguments plus optional `repo: "owner/name"` are accepted. `repo`
+only selects an existing local clone; pass it when the ship has multiple clones.
+Without it, exactly one clone must exist. The runtime reads the errand's saved
+route name, identity, model, strength, reply and confirmed verdict mail. The
+reply must end with exactly one `VERDICT: APPROVE` or
+`VERDICT: CHANGES_REQUESTED` line; findings use the same `FINDING` parser and
+filter as an errand review. An approval with a must-fix finding is refused.
+`head_sha` must be full lowercase hex. The brief or reply must name that full
+SHA exactly; missing or conflicting full SHAs are refused rather than guessed.
+Short SHAs in the evidence are not head evidence and are ignored, even if a
+matching full SHA also appears. Explicit `PR N`, `PR #N`, `PR: N`,
+`pull request N` and `pull request #N` references (case-insensitive), and
+forge URLs containing `/pull/N` or `/pulls/N`, in the brief or reply must match
+`pr`. Bare `#N` references are ignored so that `PR 774 (#772)` can cite an issue.
+Repository evidence must match the selected clone: URLs on the clone's forge
+host or with `/pull/`, `/pulls/` or `/issues/` paths, `repo owner/name`,
+`repository owner/name`, and `owner/name#N` bind. In `owner/name#N`, N is not
+compared with `pr` because it may name an issue. Other URLs (such as docs.rs
+and doc.rust-lang.org) and bare two-segment tokens such as `src/review.rs`,
+`docs/x.md` and `and/or` are ignored, including outside `FINDING` lines.
+For example, the saved brief can say `Review repo acme/widget PR #42 at head <full sha>`.
+Failed, unfinished or resumed (non-fresh) errands and another ship's errands
+are refused.
+
+The record has `kind: "imported"`, `errand_id`, `imported_ms`, the original
+`finished_ms`, and `post_state: "none"` (not posted). Repeating the command for
+an already recorded errand returns its existing record only for the same PR,
+head and (if supplied) repository; a conflicting retry refuses and names the
+existing binding. It never retargets or posts anything. New errands snapshot
+tier and uses at launch; legacy errands lacking that snapshot retain unknown
+tier and empty uses. `pr.merge` uses an imported approval's saved tier, uses
+and model, **never today's route definition**, to determine review strength:
+only saved tier exactly 1 with `review` among its uses covers a carried commit.
+Legacy imports with unknown tier and other weaker approvals are reported as
+approvals that do not cover. Non-imported reviews retain their current-route
+coverage rules. Imported approvals retain the author-exclusion warning: the
+saved reviewer model is compared with the crew authors, not today's route model.
+An unknown or bare-alias model retains the same "its model cannot be named"
+exclusion warning as a live review.
+
+## Historical setup kit
+
 This kit sets up the top-tier review gate and routes for GitHub and Forgejo repositories, as specified in the [review gate design](design/review-gate-and-route-strength.md).
 
 Every step requiring direct manual operator execution is marked **[hands]**. Non-[hands] steps are performed by the runtime or crew PRs.

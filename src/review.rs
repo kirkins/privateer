@@ -37,6 +37,7 @@
 
 pub mod authors;
 mod filter;
+mod import;
 mod pr;
 mod prompt;
 mod publish;
@@ -89,6 +90,14 @@ pub fn init(store: &Store) -> Result<()> {
     )?;
     if !has_kind {
         tx.execute_batch("ALTER TABLE reviews ADD COLUMN kind TEXT NOT NULL DEFAULT 'gate';")?;
+    }
+    let has_imported_ms: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('reviews') WHERE name='imported_ms')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_imported_ms {
+        tx.execute_batch("ALTER TABLE reviews ADD COLUMN imported_ms INTEGER;")?;
     }
     tx.commit()?;
     Ok(())
@@ -866,7 +875,8 @@ fn summary(review: &Value) -> String {
 const COLUMNS: &str = "id, ship, task_id, forge, repo, pr, base_ref, base_sha, head_ref, head_sha,
     errand_id, route_name, route_identity, route_model, route_tier, route_uses, route_why, overlap,
     fresh, authors, declared, verdict, findings, refusal, post_state, created_ms, finished_ms,
-    cleaned_ms, clone, kind, forge_review_id, post_error, posted_ms, merged_ms, merge_sha";
+    cleaned_ms, clone, kind, forge_review_id, post_error, posted_ms, merged_ms, merge_sha,
+    imported_ms";
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     let parsed = |at: usize| -> rusqlite::Result<Value> {
@@ -892,6 +902,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "kind": r.get::<_, String>(29)?, "forge_comment": r.get::<_, Option<String>>(30)?,
         "post_error": r.get::<_, Option<String>>(31)?, "posted_ms": r.get::<_, Option<i64>>(32)?,
         "merged_ms": r.get::<_, Option<i64>>(33)?, "merge_sha": r.get::<_, Option<String>>(34)?,
+        "imported_ms": r.get::<_, Option<i64>>(35)?,
     }))
 }
 
@@ -1039,9 +1050,10 @@ fn review_brief(review: &Value) -> Value {
 
 /// What a merge at the live head carries, and the coverage that makes.
 ///
-/// Only an APPROVE by a route that is a tier-1 review route in the routes
-/// file now covers the head or the commit it approved; any other approval
-/// of a carried commit is recorded as not covering, with why. A
+/// Only an APPROVE by a tier-1 review route covers the head or the commit
+/// it approved: imported reviews use their saved route strength and model,
+/// other reviews use the routes file now. Any other approval of a carried
+/// commit is recorded as not covering, with why. A
 /// CHANGES_REQUESTED at the merged head, or at a commit after the covering
 /// approval, is recorded and makes the coverage `changes_requested`; one
 /// the covering approval of the same commit finished after is superseded.
@@ -1086,21 +1098,35 @@ fn coverage(
             continue;
         }
         let name = review["route_name"].as_str().unwrap_or_default();
-        let route = policy
-            .as_ref()
-            .map(|p| &p["routes"][name])
-            .filter(|r| !name.is_empty() && r.is_object());
-        let why = match route {
-            None if name.is_empty() => {
-                Some("it ran on the first mate's own route, which is no review route".to_owned())
+        let why = if review["kind"] == "imported" {
+            let uses_review = review["route_uses"]
+                .as_array()
+                .is_some_and(|uses| uses.iter().any(|u| u == "review"));
+            if review["route_tier"].as_i64() == Some(1) && uses_review {
+                None
+            } else {
+                Some(format!(
+                    "imported route {name} (model {}) does not have saved tier 1 with review use: tier {}, uses {}",
+                    review["route_model"], review["route_tier"], review["route_uses"]
+                ))
             }
-            None => Some(format!("route {name} is not in the routes file now")),
-            Some(route) if !crate::crew_routes::meets(route, Some(&require)) => Some(format!(
-                "route {name} does not meet {} now: it is {}",
-                require.summary(),
-                crate::crew_routes::describe_strength(route)
-            )),
-            Some(_) => None,
+        } else {
+            let route = policy
+                .as_ref()
+                .map(|p| &p["routes"][name])
+                .filter(|r| !name.is_empty() && r.is_object());
+            match route {
+                None if name.is_empty() => Some(
+                    "it ran on the first mate's own route, which is no review route".to_owned(),
+                ),
+                None => Some(format!("route {name} is not in the routes file now")),
+                Some(route) if !crate::crew_routes::meets(route, Some(&require)) => Some(format!(
+                    "route {name} does not meet {} now: it is {}",
+                    require.summary(),
+                    crate::crew_routes::describe_strength(route)
+                )),
+                Some(_) => None,
+            }
         };
         match why {
             None => {
@@ -1224,10 +1250,22 @@ fn coverage(
         Some(review) => {
             let id = review["id"].as_str().unwrap_or_default();
             let name = review["route_name"].as_str().unwrap_or_default();
-            if let (Ok(authors), Some(policy)) = (&authors, &policy) {
-                let order =
-                    crate::crew_routes::order_reviewers(&[name.to_owned()], policy, authors);
-                if let Some((_, why)) = order.excluded.first() {
+            if let Ok(authors) = &authors {
+                let why = if review["kind"] == "imported" {
+                    let model = review["route_model"]
+                        .as_str()
+                        .and_then(|model| crate::routes::model_key(&format!("-/-/{model}")));
+                    crate::crew_routes::reviewer_exclusion(model.as_deref(), authors)
+                } else {
+                    policy.as_ref().and_then(|policy| {
+                        crate::crew_routes::order_reviewers(&[name.to_owned()], policy, authors)
+                            .excluded
+                            .into_iter()
+                            .next()
+                            .map(|(_, why)| why)
+                    })
+                };
+                if let Some(why) = why {
                     notes.push(format!(
                         "review {id}'s route {name} is now excluded by the code's authors: {why}"
                     ));
@@ -1365,6 +1403,7 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
 /// The argument keys of each command here; see `crate::Accepted`.
 pub(crate) const ACCEPTED: crate::Accepted = &[
     ("review.list", &["ship", "pr", "repo"]),
+    ("review.record", &["errand_id", "pr", "head_sha", "repo"]),
     (
         "review.start",
         &["task_id", "pr", "repo", "notes", "author_routes"],
@@ -1379,6 +1418,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
     match command {
         "review.start" => start(store, &args),
         "review.list" => list(store, &args),
+        "review.record" => import::record(store, &args),
         "pr.merge" => merge(store, &args),
         _ => bail!("unknown review command {command}"),
     }

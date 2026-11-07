@@ -1177,6 +1177,38 @@ pub(crate) struct ReviewOrder {
     pub(crate) excluded: Vec<(String, String)>,
 }
 
+/// Why a reviewer's model is excluded by the crew authors. Imported reviews
+/// use this same check with their saved model, independent of today's routes.
+pub(crate) fn reviewer_exclusion(
+    model: Option<&str>,
+    authors: &crate::review::authors::Authors,
+) -> Option<String> {
+    let Some(model) = model else {
+        return Some(
+            "its model cannot be named (no model, or a bare alias such as opus)".to_owned(),
+        );
+    };
+    if let Some(jobs) = authors.crew_jobs.get(model) {
+        return Some(format!(
+            "crew job(s) {} ran on its model {model}",
+            jobs.join(", ")
+        ));
+    }
+    // A bare declared alias names no version: exclude every model carrying it.
+    let aliases: Vec<_> = authors
+        .crew_aliases
+        .iter()
+        .filter(|(alias, _)| model.contains(alias.as_str()))
+        .map(|(alias, jobs)| {
+            format!(
+                "crew job(s) {} ran on the alias {alias} its model {model} carries",
+                jobs.join(", ")
+            )
+        })
+        .collect();
+    (!aliases.is_empty()).then(|| aliases.join("; "))
+}
+
 /// Order review candidates: routes whose model wrote none of the code first,
 /// then routes that overlap only the first mate's models; within each group
 /// `ranked`'s order (cheapest first). A route whose model a crew job wrote is
@@ -1197,47 +1229,15 @@ pub(crate) fn order_reviewers(
         let model = identity(route)
             .as_deref()
             .and_then(crate::routes::model_key);
-        // The aliases a declared job ran on, as carried by this model. A
-        // declaration cannot prove which version its job's alias resolved
-        // to, so every model that carries the alias is excluded; the
-        // exclusion outranks a first-mate overlap, since the job is crew.
-        let carried_aliases = |model: &str| {
-            authors
-                .crew_aliases
-                .iter()
-                .filter(|(alias, _)| model.contains(alias.as_str()))
-                .collect::<Vec<_>>()
-        };
-        match model {
-            Some(model) if authors.crew_jobs.contains_key(&model) => {
-                let jobs = authors.crew_jobs[&model].join(", ");
-                excluded.push((
-                    name.clone(),
-                    format!("crew job(s) {jobs} ran on its model {model}"),
-                ));
-            }
-            Some(model) if !carried_aliases(&model).is_empty() => {
-                let why = carried_aliases(&model)
-                    .into_iter()
-                    .map(|(alias, jobs)| {
-                        format!(
-                            "crew job(s) {} ran on the alias {alias} its model \
-                             {model} carries",
-                            jobs.join(", ")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                excluded.push((name.clone(), why));
-            }
-            Some(model) if authors.first_mate_models.contains(&model) => {
-                overlap.push((name.clone(), Some(model)));
-            }
-            Some(_) => clean.push((name.clone(), None)),
-            None => excluded.push((
-                name.clone(),
-                "its model cannot be named (no model, or a bare alias such as opus)".to_owned(),
-            )),
+        if let Some(why) = reviewer_exclusion(model.as_deref(), authors) {
+            excluded.push((name.clone(), why));
+        } else if model
+            .as_ref()
+            .is_some_and(|m| authors.first_mate_models.contains(m))
+        {
+            overlap.push((name.clone(), model));
+        } else {
+            clean.push((name.clone(), None));
         }
     }
     clean.extend(overlap);
