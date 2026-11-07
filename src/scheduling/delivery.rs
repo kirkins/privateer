@@ -284,6 +284,21 @@ pub(super) fn poll(store: &Store, args: &Value) -> Result<Value> {
     let tx = store.write_transaction()?;
     let (ship, holder) = lease(store, args)?;
     let idle = args["idle"].as_bool().context("idle must be boolean")?;
+    // A poll measures this holder even with no ready work, or while busy.
+    // Invalid adapter usage is not a measurement and must not block delivery.
+    let attention = if args["attention"].is_object()
+        && args["attention"]["tokens"].as_i64().is_some_and(|n| n >= 0)
+        && args["attention"]["window"].as_i64().is_some_and(|n| n > 0)
+    {
+        crate::attention::dispatch(
+            store,
+            "attention.report",
+            json!({"ship":ship,"holder":holder,"kind":"sample",
+            "tokens":args["attention"]["tokens"],"window":args["attention"]["window"]}),
+        )?
+    } else {
+        json!({"pressure":"unknown"})
+    };
     let now = Store::now_ms();
     // An idle spell lasts while this session keeps reporting idle without a
     // gap; a busy report, a new session or a silent adapter starts it afresh.
@@ -315,16 +330,6 @@ pub(super) fn poll(store: &Store, args: &Value) -> Result<Value> {
     if ready_ids(store, &ship)?.is_empty() {
         return Ok(json!({"offer":null,"state":"idle"}));
     }
-    let attention = if args["attention"].is_object() {
-        crate::attention::dispatch(
-            store,
-            "attention.report",
-            json!({"ship":ship,"holder":holder,"kind":"sample",
-            "tokens":args["attention"]["tokens"],"window":args["attention"]["window"]}),
-        )?
-    } else {
-        json!({"pressure":"unknown"})
-    };
     let mode = if attention["pressure"] == "normal" {
         "hosted"
     } else {
@@ -418,6 +423,24 @@ pub(super) fn native_event(store: &Store, command: &str, args: &Value) -> Result
     Ok(view(&work))
 }
 
+/// Refused before job admission: the old offer cannot follow a new holder.
+#[derive(Debug)]
+enum LeaseChanged {
+    Replaced,
+    Acquired,
+}
+
+impl std::fmt::Display for LeaseChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Replaced => "hosted handoff lease was replaced",
+            Self::Acquired => "a hosted session acquired the ship before launch",
+        })
+    }
+}
+
+impl std::error::Error for LeaseChanged {}
+
 fn start_headless(store: &mut Store, work: &mut Scheduled) -> Result<()> {
     let id = work.offer_id.clone().context("offer id missing")?;
     let mut profile = work.profile.clone().context("offer profile missing")?;
@@ -438,16 +461,14 @@ fn start_headless(store: &mut Store, work: &mut Scheduled) -> Result<()> {
             "work authority changed after offer"
         );
         let presence = crate::presence::presence(store, &work.owner)?;
-        if let Some(holder) = &work.holder {
-            ensure!(
-                presence["attended"] != true || presence["lease"]["holder"] == *holder,
-                "hosted handoff lease was replaced"
-            );
-        } else {
-            ensure!(
-                presence["attended"] != true,
-                "a hosted session acquired the ship before launch"
-            );
+        if presence["attended"] == true {
+            match &work.holder {
+                Some(holder) if presence["lease"]["holder"] != *holder => {
+                    return Err(LeaseChanged::Replaced.into());
+                }
+                None => return Err(LeaseChanged::Acquired.into()),
+                _ => {}
+            }
         }
         if let Some(fallback) =
             crate::crew_routes::first_mate_fallback(store, &work.owner, &work.task_id, &profile)?
@@ -493,12 +514,38 @@ fn launch_failed(store: &Store, work: &mut Scheduled, error: &anyhow::Error) -> 
         load(store, &work.task_id)?.context("schedule vanished during launch failure")?;
     if current.offer_id == work.offer_id && matches!(current.state.as_str(), "offered" | "claimed")
     {
-        fault(
-            store,
-            &mut current,
-            format!("Scheduled launch failed: {error}"),
-            Store::now_ms(),
+        let now = Store::now_ms();
+        let job_exists: bool = store.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1)",
+            [&current.job_id],
+            |r| r.get(0),
         )?;
+        if error.is::<LeaseChanged>() && !job_exists {
+            current.reason = Some(format!("Scheduled launch retired: {error}"));
+            finish_wake(store, &current, "failed", now)?;
+            ready_again(&mut current);
+            current.lease_until_ms = 0;
+            current.attempts += 1;
+            current.not_before_ms = now + 60_000;
+            current.woke_by = Some(json!({"kind": "retry"}));
+            current.reason = Some("Presence changed before launch; retry after cooldown".into());
+            // Share the delivery retry budget; actual progress resets it.
+            if current.attempts >= MAX_ATTEMPTS {
+                fault(
+                    store,
+                    &mut current,
+                    "Scheduling delivery retry budget exhausted after presence changes",
+                    now,
+                )?;
+            }
+        } else {
+            fault(
+                store,
+                &mut current,
+                format!("Scheduled launch failed: {error}"),
+                now,
+            )?;
+        }
         save(store, &current)?;
     }
     *work = current;
@@ -614,6 +661,43 @@ mod tests {
             .unwrap();
         crate::presence::attend(&store, SHIP, PANE, 90, None).unwrap();
         (temp, store)
+    }
+
+    #[test]
+    fn a_hosted_session_acquiring_a_headless_offer_retires_it_before_admission() {
+        let (_temp, mut store) = hosted();
+        store
+            .connection()
+            .execute("DELETE FROM presence", [])
+            .unwrap();
+        fixture::schedule(&store, "ready", None);
+        let mut offered = claim(&store, SHIP, None, "fresh").unwrap().unwrap();
+        let offer_id = offered.offer_id.clone().unwrap();
+        crate::presence::attend(&store, SHIP, PANE, 90, None).unwrap();
+        let error = start_headless(&mut store, &mut offered).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<LeaseChanged>(),
+            Some(LeaseChanged::Acquired)
+        ));
+        launch_failed(&store, &mut offered, &error).unwrap();
+        assert_eq!(offered.state, "ready");
+        assert_eq!(offered.attempts, 1);
+        assert!(offered.offer_id.is_none());
+        assert!(offered.holder.is_none());
+        assert!(offered.job_id.is_none());
+        assert!(offered.not_before_ms > Store::now_ms());
+        let jobs: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(jobs, 0);
+        let status: String = store
+            .connection()
+            .query_row("SELECT status FROM wakes WHERE id=?1", [offer_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "failed");
     }
 
     /// `work-1` enqueued days ago, and ready since then.

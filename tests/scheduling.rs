@@ -429,6 +429,76 @@ fn stale_or_replaced_attention_never_silently_becomes_healthy() {
 }
 
 #[test]
+fn idle_and_busy_polls_sample_the_current_holder_without_ready_work() {
+    for idle in [true, false] {
+        let mut fleet = Fleet::new(json!({}));
+        attend(&mut fleet);
+        poll(&mut fleet, true);
+        call(
+            &mut fleet,
+            "ship.attend",
+            json!({"ship":"infra","holder":"host:new-session","ttl_secs":90}),
+        );
+        let before = call(&mut fleet, "ship.bearings", json!({"ship":"infra"}));
+        assert_eq!(before["attention"]["fresh"], false, "{before}");
+        let response = call(
+            &mut fleet,
+            "work.poll",
+            json!({"ship":"infra","holder":"host:new-session","idle":idle,
+                "attention":{"tokens":12345,"window":100000}}),
+        );
+        assert_eq!(response["state"], if idle { "idle" } else { "busy" });
+        let bearings = call(&mut fleet, "ship.bearings", json!({"ship":"infra"}));
+        assert_eq!(bearings["attention"]["fresh"], true, "{bearings}");
+        assert_eq!(bearings["attention"]["tokens"], 12345);
+        assert_eq!(bearings["attention"]["window"], 100000);
+    }
+}
+
+#[test]
+fn stale_holder_polls_and_invalid_usage_never_record_attention() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    call(
+        &mut fleet,
+        "ship.attend",
+        json!({"ship":"infra","holder":"host:new-session","ttl_secs":90}),
+    );
+    let error = dispatch(
+        &mut fleet.store,
+        "work.poll",
+        json!({"ship":"infra","holder":"host:scheduler-test","idle":true,
+            "attention":{"tokens":12345,"window":100000}}),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("current hosted presence lease"));
+    for attention in [
+        Value::Null,
+        json!({}),
+        json!({"tokens":-1,"window":100000}),
+        json!({"tokens":1,"window":0}),
+        json!({"tokens":1.5,"window":100000}),
+        json!({"tokens":"1000","window":100000}),
+    ] {
+        let response = call(
+            &mut fleet,
+            "work.poll",
+            json!({"ship":"infra","holder":"host:new-session","idle":true,
+                "attention":attention}),
+        );
+        assert_eq!(response["state"], "idle");
+    }
+    let count: i64 = fleet
+        .store
+        .connection()
+        .query_row("SELECT count(*) FROM attention", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    let bearings = call(&mut fleet, "ship.bearings", json!({"ship":"infra"}));
+    assert_eq!(bearings["attention"]["fresh"], false, "{bearings}");
+}
+
+#[test]
 fn attention_wait_resumes_on_a_fresh_normal_reading_before_its_deadline() {
     let mut fleet = Fleet::new(json!({}));
     attend(&mut fleet);
@@ -616,6 +686,128 @@ fn a_recorded_launch_intent_recovers_after_a_dispatcher_outage() {
     fleet.settle();
     fleet.tick();
     assert_eq!(fleet.prompts().len(), 1);
+}
+
+#[test]
+fn replaced_handoff_leases_retire_without_jobs_and_retry_with_a_bound() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    let mut holder = "host:scheduler-test".to_owned();
+    // The existing delivery budget permits two retries, then faults on three.
+    for attempt in 1..=3 {
+        let offered = call(
+            &mut fleet,
+            "work.poll",
+            json!({"ship":"infra","holder":holder,"idle":true,"attention":null}),
+        );
+        assert_eq!(offered["state"], "focused_handoff", "{offered}");
+        holder = format!("host:replacement-{attempt}");
+        call(
+            &mut fleet,
+            "ship.attend",
+            json!({"ship":"infra","holder":holder,"ttl_secs":90}),
+        );
+        let before = privateer::store::Store::now_ms();
+        fleet.tick();
+        let work = status(&mut fleet, "infra-repair");
+        assert_eq!(work["attempts"], attempt, "{work}");
+        assert!(work["offer_id"].is_null(), "{work}");
+        let raw: String = fleet
+            .store
+            .connection()
+            .query_row(
+                "SELECT record FROM task_schedule WHERE task_id='infra-repair'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let record: Value = serde_json::from_str(&raw).unwrap();
+        assert!(record["holder"].is_null(), "{record}");
+        assert!(record["job_id"].is_null(), "{record}");
+        assert!(record["profile"].is_null(), "{record}");
+        assert!(record["charter_hash"].is_null(), "{record}");
+        assert_eq!(record["lease_until_ms"], 0);
+        let jobs: i64 = fleet
+            .store
+            .connection()
+            .query_row("SELECT count(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(jobs, 0);
+        assert!(fleet.prompts().is_empty());
+        let wake = fleet
+            .wakes()
+            .into_iter()
+            .find(|w| w["id"] == offered["offer_id"])
+            .unwrap();
+        assert_eq!(wake["status"], "failed", "{wake}");
+        if attempt < 3 {
+            assert_eq!(work["state"], "ready", "{work}");
+            assert_eq!(record["faults"], Value::Null);
+            assert!(work["next_check_ms"].as_i64().unwrap() >= before + 60_000);
+            let cooling = call(
+                &mut fleet,
+                "work.poll",
+                json!({"ship":"infra","holder":holder,"idle":true,"attention":null}),
+            );
+            assert_eq!(cooling["state"], "idle", "{cooling}");
+            fleet
+                .store
+                .connection()
+                .execute(
+                    "UPDATE task_schedule SET record=json_set(record,'$.not_before_ms',0)",
+                    [],
+                )
+                .unwrap();
+        } else {
+            assert_eq!(work["state"], "fault", "{work}");
+            assert!(
+                work["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("retry budget exhausted")
+            );
+            fleet.tick();
+            assert_eq!(status(&mut fleet, "infra-repair")["state"], "fault");
+        }
+    }
+}
+
+#[test]
+fn unrelated_handoff_launch_errors_still_fault() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    let offered = call(
+        &mut fleet,
+        "work.poll",
+        json!({"ship":"infra","holder":"host:scheduler-test","idle":true,"attention":null}),
+    );
+    assert_eq!(offered["state"], "focused_handoff");
+    fleet
+        .store
+        .connection()
+        .execute(
+            "UPDATE task_schedule SET record=json_set(record,'$.charter_hash','obsolete')",
+            [],
+        )
+        .unwrap();
+    fleet.tick();
+    let work = status(&mut fleet, "infra-repair");
+    assert_eq!(work["state"], "fault", "{work}");
+    assert!(
+        work["reason"]
+            .as_str()
+            .unwrap()
+            .contains("work authority changed after offer")
+    );
+    assert_eq!(work["offer_id"], offered["offer_id"]);
+    let jobs: i64 = fleet
+        .store
+        .connection()
+        .query_row("SELECT count(*) FROM jobs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(jobs, 0);
 }
 
 #[test]
