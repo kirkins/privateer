@@ -61,6 +61,37 @@ raise SystemExit(int(os.environ['PI_TEST_EXIT']))
         self.assertEqual(self.summary(run)["type"], "native.turn.failed")
         self.assertEqual(self.summary(run)["native_exit_code"], 0)
 
+    def test_provider_retry_without_assistant_tokens_is_classified_and_bounded(self):
+        run = self.run_stream([HEADER,
+            {"type":"auto_retry_start", "attempt":2, "maxAttempts":4, "delayMs":1250},
+            {"type":"auto_retry_end", "success":False}])
+        summary = self.summary(run)
+        self.assertEqual(run.returncode, 2)
+        self.assertEqual(summary["reason"], "provider-transport")
+        self.assertEqual(summary["transport"], {
+            "retries": 1, "attempt": 2, "max_attempts": 4, "delay_ms": 1250})
+        self.assertEqual(summary["native_exit_code"], 0)
+        self.assertNotIn("errorMessage", json.dumps(summary))
+
+    def test_tool_events_keep_existing_failure_reason(self):
+        run = self.run_stream([HEADER,
+            {"type":"tool_execution_start", "toolName":"bash", "args":{"command":"hidden"}},
+            {"type":"message_end", "message":{"role":"assistant", "stopReason":"error",
+                "errorMessage":"provider error", "usage":{}}}, SETTLED])
+        summary = self.summary(run)
+        self.assertEqual(run.returncode, 2)
+        self.assertEqual(summary["reason"], "assistant-did-not-stop")
+        self.assertNotIn("transport", summary)
+        self.assertNotIn("hidden", json.dumps(summary))
+
+    def test_normal_settled_turn_summary_is_unchanged(self):
+        run = self.run_stream([HEADER, assistant(), SETTLED])
+        summary = self.summary(run)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(summary["type"], "turn.completed")
+        self.assertNotIn("reason", summary)
+        self.assertNotIn("transport", summary)
+
     def test_recovery_waits_for_settled_and_counts_only_authoritative_usage(self):
         run = self.run_stream([HEADER, {"type":"agent_start"}, assistant("error", {"input":1}),
             {"type":"agent_end","willRetry":True}, {"type":"auto_retry_start"},
