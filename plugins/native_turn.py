@@ -21,12 +21,18 @@ class Turn:
         self.stop = None
         self.usage = {}
         self.last_tool = None
+        self.tool_events = False
+        self.assistant_has_tokens = False
+        self.retry_count = 0
+        self.last_retry = None
+        self.provider_error = False
 
     def observe(self, value):
         if not isinstance(value, dict):
             raise ValueError("invalid-event")
         kind = value.get("type")
         if kind in ("tool_execution_start", "tool_execution_end"):
+            self.tool_events = True
             name = value.get("toolName")
             if isinstance(name, str) and 0 < len(name) <= 80 and all(c.isascii() and (c.isalnum() or c in "_.:-") for c in name):
                 self.last_tool = {"name": name, "phase": "started" if kind.endswith("start") else "ended"}
@@ -41,6 +47,9 @@ class Turn:
             self.session = identity
         elif kind in ("agent_start", "turn_start", "auto_retry_start"):
             self.settled, self.stop = False, None
+            if kind == "auto_retry_start":
+                self.retry_count += 1
+                self.last_retry = value
         elif kind in ("tool_execution_start", "compaction_start"):
             self.settled = False
         elif kind == "message_end":
@@ -50,6 +59,16 @@ class Turn:
             if message.get("role") == "assistant":
                 self.settled = False
                 self.stop = message.get("stopReason")
+                usage = message.get("usage")
+                if isinstance(usage, dict) and any(
+                        isinstance(usage.get(key), int)
+                        and not isinstance(usage.get(key), bool)
+                        and usage[key] > 0 for key in TOKEN_FIELDS):
+                    self.assistant_has_tokens = True
+                if self.stop == "error" and isinstance(message.get("errorMessage"), str):
+                    self.provider_error = True
+            elif message.get("role") == "toolResult":
+                self.tool_events = True
             # Only authoritative completed messages count. Streaming deltas,
             # turn_end and agent_end repeat those same messages.
             if message.get("role") in ("assistant", "toolResult"):
@@ -60,6 +79,28 @@ class Turn:
                 self.add_usage(result.get("usage"))
         elif kind == "agent_settled":
             self.settled = value.get("aborted") is False
+        elif kind == "auto_retry_end" and value.get("success") is False:
+            self.provider_error = True
+            if self.last_retry is None:
+                self.last_retry = value
+
+    def transport_metadata(self):
+        if not self.retry_count and self.last_retry is None:
+            return None
+        metadata = {"retries": self.retry_count}
+        if isinstance(self.last_retry, dict):
+            for source, target in (("attempt", "attempt"),
+                                   ("maxAttempts", "max_attempts"),
+                                   ("delayMs", "delay_ms")):
+                number = self.last_retry.get(source)
+                if (isinstance(number, int) and not isinstance(number, bool)
+                        and 0 <= number <= 2**53 - 1):
+                    metadata[target] = number
+        return metadata
+
+    def provider_transport_failure(self):
+        return ((self.provider_error or self.retry_count > 0)
+                and not self.tool_events and not self.assistant_has_tokens)
 
     def add_usage(self, usage):
         if not isinstance(usage, dict):
@@ -401,13 +442,20 @@ def run(harness, argv):
         if reconciled:
             summary["completion_source"] = "native-session-projection"
         if not success:
-            summary["reason"] = (
+            reason = (
                 "native-session-projection-unconfirmed" if projection_failed else
                 "truncated-event" if pending else
                 "native-exit-nonzero" if native_status != 0 else
                 "missing-session" if turn.session is None else
                 "turn-not-settled" if not turn.settled else
                 "assistant-did-not-stop")
+            if (thin and reason in ("turn-not-settled", "assistant-did-not-stop")
+                    and turn.provider_transport_failure()):
+                reason = "provider-transport"
+                transport = turn.transport_metadata()
+                if transport is not None:
+                    summary["transport"] = transport
+            summary["reason"] = reason
             if turn.last_tool:
                 summary["last_tool"] = turn.last_tool
         if turn.usage:
